@@ -247,9 +247,9 @@ def _check_updates_available(install_dir: Path) -> int:
     current = _installed_version_label(install_dir)
     if behind == 0:
         if current:
-            _ok(f"Já está na versão mais recente — {current}")
+            _ok(f"Ector está na versão mais recente — {current}")
         else:
-            _ok("Já está na versão mais recente")
+            _ok("Ector está na versão mais recente")
         sys.exit(0)
 
     upstream = get_cached_update_upstream_label()
@@ -460,9 +460,9 @@ def cmd_update_check() -> None:
     current = _installed_version_label(install_dir)
     if behind == 0:
         if current:
-            _ok(f"Já está na versão mais recente — {current}")
+            _ok(f"Ector está na versão mais recente — {current}")
         else:
-            _ok("Já está na versão mais recente")
+            _ok("Ector está na versão mais recente")
         return
 
     upstream = get_cached_update_upstream_label()
@@ -510,10 +510,6 @@ def cmd_update(args) -> None:
     )
 
     _title("Atualização do Ector Agent")
-    print(color(f"  Instalação: {install_dir}", Colors.DIM))
-    current = _installed_version_label(install_dir)
-    if current:
-        print(color(f"  Versão instalada: {current}", Colors.DIM))
     if is_package_tree_install_dir(install_dir) and not looks_like_release_install_remote(
         install_dir
     ):
