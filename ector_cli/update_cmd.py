@@ -77,6 +77,9 @@ def _install_env(install_dir: Path) -> dict[str, str]:
         "ECTOR_INSTALL_DIR": str(install_dir),
         "ECTOR_NONINTERACTIVE": "1",
         "ECTOR_INSTALL_COMPACT": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_PAGER": "cat",
+        "GCM_INTERACTIVE": "Never",
         "PATH": os.pathsep.join(path_parts),
     }
     if ector_home:
@@ -292,17 +295,6 @@ class UpdateCancelled(Exception):
     """User interrupted ``ector update`` (Ctrl+C)."""
 
 
-def _terminate_process(proc: subprocess.Popen[str]) -> None:
-    if proc.poll() is not None:
-        return
-    proc.terminate()
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
-
-
 def _run_shell(
     cmd: list[str],
     *,
@@ -310,45 +302,41 @@ def _run_shell(
     env: dict | None = None,
     stream: bool = False,
 ) -> tuple[int, str]:
-    if not stream:
-        proc = subprocess.run(
-            cmd,
-            cwd=str(cwd) if cwd else None,
-            env=env,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        combined = f"{proc.stdout or ''}{proc.stderr or ''}"
-        if proc.stdout:
-            print(proc.stdout, end="")
-        if proc.stderr:
-            print(proc.stderr, end="", file=sys.stderr)
-        return proc.returncode, combined
+    """Run a shell command.
 
-    proc = subprocess.Popen(
+    ``stream=True`` attaches stdout/stderr to the terminal (no pipe capture).
+    Piping install.sh stdout causes block-buffering stalls that make ``ector
+    update`` look hung unless ``ECTOR_INSTALL_VERBOSE=1`` adds enough traffic
+    to flush the buffer.
+    """
+    run_cwd = str(cwd) if cwd else None
+    if stream:
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=run_cwd,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                check=False,
+            )
+        except KeyboardInterrupt:
+            raise UpdateCancelled from None
+        return proc.returncode, ""
+
+    proc = subprocess.run(
         cmd,
-        cwd=str(cwd) if cwd else None,
+        cwd=run_cwd,
         env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
         text=True,
-        bufsize=1,
+        capture_output=True,
+        check=False,
     )
-    chunks: list[str] = []
-    try:
-        if proc.stdout is None:
-            return proc.wait(), ""
-        for line in proc.stdout:
-            chunks.append(line)
-            sys.stdout.write(line)
-            sys.stdout.flush()
-        rc = proc.wait()
-    except KeyboardInterrupt:
-        _terminate_process(proc)
-        raise UpdateCancelled from None
-    combined = "".join(chunks)
-    return rc, combined
+    combined = f"{proc.stdout or ''}{proc.stderr or ''}"
+    if proc.stdout:
+        print(proc.stdout, end="")
+    if proc.stderr:
+        print(proc.stderr, end="", file=sys.stderr)
+    return proc.returncode, combined
 
 
 def _ensure_uv(env: dict[str, str]) -> bool:

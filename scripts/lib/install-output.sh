@@ -30,6 +30,11 @@ _install_step() {
     local label="$1"
     shift
     local log rc=0
+
+    if [ -n "${ECTOR_NONINTERACTIVE:-}" ] && ! _install_verbose; then
+        printf '→ %s...\n' "$label"
+    fi
+
     log="$(mktemp "${TMPDIR:-/tmp}/ector-install.XXXXXX")"
     if "$@" >"$log" 2>&1; then
         rm -f "$log"
