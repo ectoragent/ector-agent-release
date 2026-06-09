@@ -921,6 +921,15 @@ def _report_update_cancelled() -> None:
     _warn("Atualização cancelada.")
 
 
+def _report_update_success(install_dir: Path) -> None:
+    print()
+    updated = _installed_version_label(install_dir)
+    if updated:
+        _ok(f"Atualização concluída com sucesso — {updated}")
+    else:
+        _ok("Atualização concluída com sucesso")
+
+
 def _run_installer_update(
     installer: Path,
     install_dir: Path,
@@ -1086,7 +1095,7 @@ def cmd_update(args) -> None:
 
         env = _install_env(install_dir)
         try:
-            result, success_reported = _run_installer_update(
+            result, _success_reported = _run_installer_update(
                 installer,
                 install_dir,
                 env,
@@ -1103,13 +1112,9 @@ def cmd_update(args) -> None:
         if result != 0:
             sys.exit(result)
 
-        if not success_reported and not progress.enabled:
-            updated = _installed_version_label(install_dir)
-            if updated:
-                _ok(f"Atualizado para {updated}")
-
         _restart_gateway_if_needed(was_gateway_active, progress=progress)
         if progress.enabled:
             progress.phase_done()
 
+    _report_update_success(install_dir)
     _print_version_screen()
