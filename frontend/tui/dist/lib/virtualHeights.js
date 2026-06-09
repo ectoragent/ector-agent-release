@@ -65,6 +65,7 @@ export const isHeavyTranscriptMessage = (text, cols) => {
   return true;
 };
 export const estimatedMsgHeight = (msg, cols, {
+  boundedRender = false,
   compact,
   details,
   limitHistory = false
@@ -87,8 +88,9 @@ export const estimatedMsgHeight = (msg, cols, {
   const layoutCols = transcriptContentCols(cols);
   const bodyWidth = Math.max(20, layoutCols - transcriptChrome - nest - cardHorizontalGutter);
   const legacyBg = msg.kind !== 'background' ? backgroundMessageParts(msg.text) : null;
-  const text = msg.role === 'assistant' && limitHistory ? boundedHistoryRenderText(msg.text) : msg.text;
-  const mdBody = msg.kind === 'background' ? limitHistory ? boundedHistoryRenderText(msg.text) : msg.text : legacyBg ? limitHistory ? boundedHistoryRenderText(legacyBg.body) : legacyBg.body : text;
+  const boundText = body => boundedRender || limitHistory && msg.role === 'assistant' ? boundedHistoryRenderText(body) : body;
+  const text = boundText(msg.text);
+  const mdBody = msg.kind === 'background' ? boundText(msg.text) : legacyBg ? boundText(legacyBg.body) : text;
   // Slash vindo do Rich: medir sem ANSI para o virtualizer não subestimar linhas (scroll cortado).
   const wrapSource = msg.kind === 'slash' ? stripAnsi(text || '').replace(/\r\n/g, '\n') : mdBody || ' ';
   let h = estimateMarkdownBodyLines(wrapSource, bodyWidth);

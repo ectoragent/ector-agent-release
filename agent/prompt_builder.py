@@ -606,6 +606,7 @@ PLATFORM_HINTS = {
     "whatsapp": (
         "Você está no WhatsApp, plataforma de mensagens de texto. "
         "Não use markdown — não renderiza. "
+        "Não use tabelas markdown (| col |); prefira linhas simples com rótulo: valor. "
         "Para enviar mídia ao usuário, inclua MEDIA:/caminho/absoluto/do/arquivo na resposta. "
         "O arquivo vai como anexo nativo — imagens (.jpg, .png, .webp) como foto, "
         "vídeos (.mp4, .mov) inline, outros como documento para download. "
@@ -616,6 +617,8 @@ PLATFORM_HINTS = {
         "Você está no Telegram, plataforma de mensagens. "
         "Markdown padrão é convertido automaticamente. Suportado: **negrito**, *itálico*, "
         "~~tachado~~, ||spoiler||, `código inline`, ```blocos```, [links](url) e ## títulos. "
+        "Não use tabelas markdown (| col |) — não renderizam; prefira lista com "
+        "**rótulo:** valor. "
         "Para enviar arquivo, use MEDIA:/caminho/absoluto/do/arquivo na resposta. "
         "Imagens (.png, .jpg, .webp) como foto, áudio (.ogg) como mensagem de voz, "
         "vídeos (.mp4) inline. ![alt](url) também vira foto nativa."
@@ -623,6 +626,8 @@ PLATFORM_HINTS = {
     ),
     "discord": (
         "Você está em servidor ou chat de grupo no Discord. "
+        "Não use tabelas markdown (| col |) — não renderizam; prefira lista com "
+        "**rótulo:** valor. "
         "Para mídia, inclua MEDIA:/caminho/absoluto/do/arquivo na resposta. "
         "Imagens (.png, .jpg, .webp) como anexo de foto; áudio como arquivo. "
         "![alt](url) também é enviado como anexo."
@@ -630,6 +635,8 @@ PLATFORM_HINTS = {
     ),
     "slack": (
         "Você está em um workspace Slack. "
+        "Não use tabelas markdown (| col |) — não renderizam; prefira lista com "
+        "*rótulo:* valor. "
         "Para mídia, inclua MEDIA:/caminho/absoluto/do/arquivo na resposta. "
         "Imagens (.png, .jpg, .webp) como upload de foto; áudio como arquivo. "
         "![alt](url) também é enviado como anexo."

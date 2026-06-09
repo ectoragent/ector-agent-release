@@ -22,7 +22,5 @@ export const FULL_RENDER_TAIL_ITEMS = 8;
 export const LONG_MSG = 300;
 export const MAX_HISTORY = 800;
 export const THINKING_COT_MAX = 160;
-// Rows per wheel event (pre-accel), multiplied by wheelAccel mult. 2 feels
-// natural on trackpads/mechanical wheels; wheelAccel.ts ramps further on
-// sustained spins. Still well under typical viewport height for DECSTBM.
-export const WHEEL_SCROLL_STEP = 2;
+// Rows per wheel event (pre-accel), multiplied by wheelAccel mult.
+export const WHEEL_SCROLL_STEP = 6;

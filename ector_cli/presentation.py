@@ -22,8 +22,9 @@ from prompt_toolkit.formatted_text import ANSI as _PT_ANSI
 from rich.console import Console
 
 from ector_constants import get_ector_home
-from ector_cli import __release_name__ as RELEASE_NAME
 from ector_cli import __version__ as VERSION
+from ector_cli import __version_code__ as VERSION_CODE
+from ector_cli import __version_name__ as VERSION_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -247,33 +248,10 @@ def get_latest_release_tag(repo_dir: Optional[Path] = None) -> Optional[tuple]:
 
 def format_version_label() -> str:
     """Version line aligned with the Ink TUI (``formatBannerVersion``)."""
-    name = (RELEASE_NAME or "").strip()
-    version = (VERSION or "").strip().lstrip("vV")
-    label = f"v{version}"
-    return f"{label} · {name}" if name else label
-
-
-def format_release_month_year(release_date: str) -> str:
-    """Format a release date for display (mirrors ``pixelLogo.formatReleaseMonthYear``)."""
-    raw = (release_date or "").strip()
-    if not raw:
-        return ""
-
-    dot = re.match(r"^(\d{4})\.(\d{1,2})\.\d{1,2}$", raw)
-    if dot:
-        return f"{dot.group(1)}.{int(dot.group(2))}"
-
-    iso = re.match(r"^(\d{4})-(\d{2})-\d{2}$", raw)
-    if iso:
-        return f"{iso.group(1)}.{int(iso.group(2))}"
-
-    try:
-        from datetime import datetime
-
-        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        return f"{parsed.year}.{parsed.month}"
-    except ValueError:
-        return raw
+    name = (VERSION_NAME or VERSION or "").strip().lstrip("vV")
+    code = VERSION_CODE
+    label = f"v{name}"
+    return f"{label} ({code})" if code else label
 
 
 def _parse_hex_color(value: str) -> Optional[Tuple[int, int, int]]:

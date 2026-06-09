@@ -379,32 +379,10 @@ export function useVirtualHistory(scrollRef, items, columns, {
       s_1.scrollToBottom();
       lastScrollTopRef.current = Math.max(0, total - vp);
       forceTailFollowRef.current = false;
-    } else if (s_1 && shouldSetVirtualClamp({
-      itemCount: n,
-      liveTailActive,
-      sticky: stickyTailMount,
-      viewportHeight: vp
-    })) {
-      const effTopSpacer = offsets[effStart] ?? 0;
-      const effBottom = offsets[effEnd] ?? total;
-      // At effEnd=n there's no bottomSpacer — use Infinity so render-node-
-      // to-output's own Math.min(cur, maxScroll) governs. Using offsets[n]
-      // here would bake in heightCache (one render behind Yoga), and during
-      // streaming the tail item's cached height lags its real height —
-      // sticky-break would then clamp below the real max and push
-      // streaming text off-viewport.
-      const clampMin = effStart === 0 ? 0 : effTopSpacer;
-      const reportedMax = Math.max(0, reportedScrollH - vp);
-      const clampMax = effEnd === n ? Infinity : Math.max(effTopSpacer, effBottom - vp, reportedMax);
-      const scrollTop = Math.max(0, s_1.getScrollTop() + s_1.getPendingDelta());
-      // Stale height cache can set clampMax below the real scroll range — if
-      // the viewport is already past the clamp, drop it instead of trapping scroll.
-      if (clampMax !== Infinity && scrollTop > clampMax + 2) {
-        s_1.setClampBounds(undefined, undefined);
-      } else {
-        s_1.setClampBounds(clampMin, clampMax);
-      }
     } else {
+      // Virtual clamp (clampMin especially) traps scroll-up when height
+      // estimates overshoot rendered rows on large messages. Prefer a
+      // brief flash over a stuck transcript.
       s_1?.setClampBounds(undefined, undefined);
     }
     if (skipMeasurement.current) {
@@ -438,8 +416,30 @@ export function useVirtualHistory(scrollRef, items, columns, {
       onHeightsChangeRef.current?.(heights.current);
     }
   });
-  const topSpacer = offsets[effStart] ?? 0;
-  const bottomSpacer = Math.max(0, total - (offsets[effEnd] ?? total));
+  let topSpacer = offsets[effStart] ?? 0;
+  let bottomSpacer = Math.max(0, total - (offsets[effEnd] ?? total));
+  // When per-item estimates overshoot rendered height (large tables truncated
+  // in MessageLine), total - offsets[end] invents a huge bottomSpacer and the
+  // user scrolls through blank rows. Tie spacers to Yoga when possible.
+  // StreamingAssistant mounts below bottomSpacer; yoga scrollHeight includes it,
+  // so capping bottomSpacer to (reported - mounted) double-counts stream height
+  // and invents blank rows the user scrolls through at the tail.
+  if (s_0 && reportedScrollH > 0 && vp > 0 && !liveTailActive) {
+    let mountedSum = 0;
+    for (let i_3 = effStart; i_3 < effEnd; i_3++) {
+      const k_2 = items[i_3]?.key;
+      if (!k_2) {
+        continue;
+      }
+      const measured = measuredHeight(nodes.current.get(k_2));
+      mountedSum += measured > 0 ? measured : Math.max(1, Math.floor(heights.current.get(k_2) ?? estimate));
+    }
+    const yogaBottom = Math.max(0, reportedScrollH - topSpacer - mountedSum);
+    bottomSpacer = Math.min(bottomSpacer, yogaBottom);
+    if (!nearBottom) {
+      topSpacer = Math.min(topSpacer, target_0);
+    }
+  }
   return {
     bottomSpacer,
     end: effEnd,

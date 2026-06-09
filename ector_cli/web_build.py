@@ -40,12 +40,27 @@ def web_prebuilt_missing_message(project_root: Path) -> str:
     )
 
 
+def web_dist_is_stale(dashboard_dir: Path, dist: Path) -> bool:
+    """True when dashboard sources are newer than the last web build."""
+    index = dist / "index.html"
+    if not index.is_file():
+        return True
+    dist_mtime = index.stat().st_mtime
+    src = dashboard_dir / "src"
+    if not src.is_dir():
+        return False
+    for path in src.rglob("*"):
+        if path.is_file() and path.stat().st_mtime > dist_mtime:
+            return True
+    return False
+
+
 def build_web_ui(dashboard_dir: Path, *, fatal: bool = True) -> bool:
     """Garante ``ector_cli/web_dist/index.html`` existe, compilando se necessário."""
     project_root = dashboard_dir.parent.parent
     dist = web_dist_dir(project_root)
     index = dist / "index.html"
-    if index.is_file():
+    if index.is_file() and not web_dist_is_stale(dashboard_dir, dist):
         return True
 
     if not web_can_build_from_source(dashboard_dir):

@@ -1414,14 +1414,15 @@ print_success() {
         echo ""
         echo -e "${VIOLET}${BOLD}Atualização do Ector Agent concluída${NC}"
         if [ -f "$INSTALL_DIR/ector_cli/__init__.py" ]; then
-            local ver rel label
-            ver=$(grep -E '^__version__' "$INSTALL_DIR/ector_cli/__init__.py" 2>/dev/null \
+            local ver code label
+            ver=$(grep -E '^__version_name__|^__version__' "$INSTALL_DIR/ector_cli/__init__.py" 2>/dev/null \
+                | grep -E '"[^"]+"' \
                 | sed -E 's/.*"([^"]+)".*/\1/' | head -1)
-            rel=$(grep -E '^__release_name__' "$INSTALL_DIR/ector_cli/__init__.py" 2>/dev/null \
-                | sed -E 's/.*"([^"]*)".*/\1/' | head -1)
+            code=$(grep -E '^__version_code__' "$INSTALL_DIR/ector_cli/__init__.py" 2>/dev/null \
+                | sed -E 's/.*=\s*([0-9]+).*/\1/' | head -1)
             if [ -n "$ver" ]; then
-                if [ -n "$rel" ]; then
-                    label="v${ver} (${rel})"
+                if [ -n "$code" ]; then
+                    label="v${ver} (${code})"
                 else
                     label="v${ver}"
                 fi

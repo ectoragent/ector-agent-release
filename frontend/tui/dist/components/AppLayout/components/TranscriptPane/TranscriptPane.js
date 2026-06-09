@@ -55,9 +55,9 @@ export const TranscriptPane = memo(function TranscriptPane(t0) {
               flexDirection: "column",
               children: _jsx(Banner, {
                 cols: composer.cols,
-                releaseName: row.msg.info?.release_name,
                 t: ui.theme,
-                version: row.msg.info?.version
+                version: row.msg.info?.version_name ?? row.msg.info?.version,
+                versionCode: row.msg.info?.version_code
               })
             }, `${row.key}-body`) : row.msg.kind === "panel" && row.msg.panelData ? _jsx(Panel, {
               sections: row.msg.panelData.sections,

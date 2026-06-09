@@ -674,7 +674,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
         markers); models also emit ``**markdown**`` which does not map cleanly.
         Prefer the same plain-text normalization as ``send_message`` tool delivery.
         """
-        return normalize_whatsapp_outbound_text(content)
+        return normalize_whatsapp_outbound_text(self.preprocess_outbound_content(content))
 
     async def send(
         self,

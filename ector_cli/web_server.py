@@ -36,7 +36,7 @@ PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from ector_cli import __version__, __release_date__, __release_name__
+from ector_cli import __version__, __version_code__, __version_name__
 from ector_cli.config import (
     DEFAULT_CONFIG,
     OPTIONAL_ENV_VARS,
@@ -1280,8 +1280,8 @@ async def get_status(session_id: Optional[str] = None):
 
     return {
         "version": __version__,
-        "release_name": __release_name__,
-        "release_date": __release_date__,
+        "version_name": __version_name__,
+        "version_code": __version_code__,
         "ector_home": str(get_ector_home()),
         "config_path": str(get_config_path()),
         "env_path": str(get_env_path()),
@@ -3268,6 +3268,154 @@ async def cancel_oauth_session(session_id: str, request: Request):
 # ---------------------------------------------------------------------------
 
 
+def _token_stats_from_agent(agent) -> Dict[str, Any]:
+    """Live token counters from an in-memory web chat agent."""
+    def _g(name: str, fallback: str | None = None) -> int:
+        val = getattr(agent, name, 0) or (
+            getattr(agent, fallback, 0) if fallback else 0
+        )
+        try:
+            return int(val)
+        except (TypeError, ValueError):
+            return 0
+
+    return {
+        "input_tokens": _g("session_input_tokens", "session_prompt_tokens"),
+        "output_tokens": _g("session_output_tokens", "session_completion_tokens"),
+        "cache_read_tokens": _g("session_cache_read_tokens"),
+        "cache_write_tokens": _g("session_cache_write_tokens"),
+        "reasoning_tokens": _g("session_reasoning_tokens"),
+        "api_call_count": _g("session_api_calls"),
+        "model": (getattr(agent, "model", "") or "").strip(),
+    }
+
+
+def _token_stats_from_row(row: dict) -> Dict[str, Any]:
+    def _i(key: str) -> int:
+        try:
+            return int(row.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    return {
+        "input_tokens": _i("input_tokens"),
+        "output_tokens": _i("output_tokens"),
+        "cache_read_tokens": _i("cache_read_tokens"),
+        "cache_write_tokens": _i("cache_write_tokens"),
+        "reasoning_tokens": _i("reasoning_tokens"),
+        "api_call_count": _i("api_call_count"),
+        "model": (row.get("model") or "").strip(),
+    }
+
+
+def _build_session_usage_summary(session_id: str, db) -> Dict[str, Any]:
+    """Aggregate usage across compression lineage (root → tip)."""
+    chain = db._session_lineage_root_to_tip(session_id)
+    tip_id = chain[-1] if chain else session_id
+
+    with _CHAT_AGENTS_LOCK:
+        live_agent = _CHAT_AGENTS.get(tip_id)
+
+    models: list[str] = []
+    models_seen: set[str] = set()
+    totals = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": 0,
+    }
+    api_call_count = 0
+    tool_call_count = 0
+    total_cost = 0.0
+    cost_statuses: list[str] = []
+
+    for sid in chain:
+        row = db.get_session(sid) or {}
+        is_tip = sid == tip_id
+
+        if is_tip and live_agent is not None:
+            stats = _token_stats_from_agent(live_agent)
+            seg_cost, seg_status = _cost_usd_from_agent(live_agent)
+        else:
+            stats = _token_stats_from_row(row)
+            seg_cost, seg_status = _cost_usd_from_session_row(row)
+
+        for key in totals:
+            totals[key] += stats[key]
+        api_call_count += stats["api_call_count"]
+        tool_call_count += int(row.get("tool_call_count") or 0)
+
+        if seg_cost is not None and seg_cost > 0:
+            total_cost += float(seg_cost)
+            if seg_status:
+                cost_statuses.append(seg_status)
+
+        model = stats.get("model") or (row.get("model") or "").strip()
+        if model and model not in models_seen:
+            models_seen.add(model)
+            models.append(model)
+
+    tip_row = db.get_session(tip_id) or {}
+    message_count = int(tip_row.get("message_count") or 0)
+    total_tokens = sum(totals.values())
+
+    if total_cost <= 0 and total_tokens > 0:
+        billing_model = (
+            (live_agent.model if live_agent is not None else None)
+            or tip_row.get("model")
+            or (models[0] if models else "")
+        )
+        if billing_model:
+            try:
+                from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
+
+                cost_result = estimate_usage_cost(
+                    billing_model,
+                    CanonicalUsage(
+                        input_tokens=totals["input_tokens"],
+                        output_tokens=totals["output_tokens"],
+                        cache_read_tokens=totals["cache_read_tokens"],
+                        cache_write_tokens=totals["cache_write_tokens"],
+                    ),
+                    provider=tip_row.get("billing_provider"),
+                    base_url=tip_row.get("billing_base_url"),
+                )
+                if cost_result.amount_usd is not None and cost_result.amount_usd > 0:
+                    total_cost = float(cost_result.amount_usd)
+                    cost_statuses.append(
+                        cost_result.status if cost_result.status else "estimated"
+                    )
+            except Exception:
+                pass
+
+    if any(s == "actual" for s in cost_statuses):
+        cost_status = "actual"
+    elif any(s == "included" for s in cost_statuses):
+        cost_status = "included"
+    elif any(s == "estimated" for s in cost_statuses):
+        cost_status = "estimated"
+    elif total_cost > 0:
+        cost_status = "estimated"
+    else:
+        cost_status = "unknown"
+
+    return {
+        "message_count": message_count,
+        "models": models,
+        "input_tokens": totals["input_tokens"],
+        "output_tokens": totals["output_tokens"],
+        "cache_read_tokens": totals["cache_read_tokens"],
+        "cache_write_tokens": totals["cache_write_tokens"],
+        "reasoning_tokens": totals["reasoning_tokens"],
+        "total_tokens": total_tokens,
+        "api_call_count": api_call_count,
+        "tool_call_count": tool_call_count,
+        "cost_usd": total_cost if total_cost > 0 else None,
+        "cost_status": cost_status,
+    }
+
+
 @app.get("/api/sessions/{session_id}")
 async def get_session_detail(session_id: str):
     from ector_state import SessionDB
@@ -3277,7 +3425,10 @@ async def get_session_detail(session_id: str):
         session = db.get_session(sid) if sid else None
         if not session:
             raise HTTPException(status_code=404, detail="Sessão não encontrada")
-        return session
+        return {
+            **session,
+            "usage_summary": _build_session_usage_summary(sid, db),
+        }
     finally:
         db.close()
 

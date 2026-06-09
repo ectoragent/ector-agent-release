@@ -5,14 +5,14 @@ import { transcriptContentCols } from '../../domain/transcriptLayout.js';
 import { BannerLogo } from '../BannerLogo/index.js';
 export function Banner({
   cols,
-  releaseName,
   t,
-  version
+  version,
+  versionCode
 }) {
   const hero = t.bannerHero.trim();
   const customLogo = t.bannerLogo.trim();
   const contentCols = transcriptContentCols(cols);
-  const versionLabel = formatBannerVersion(version, releaseName);
+  const versionLabel = formatBannerVersion(version, versionCode);
   const composerInk = t.color.text;
   const edge = composerInk;
   const peak = composerInk;

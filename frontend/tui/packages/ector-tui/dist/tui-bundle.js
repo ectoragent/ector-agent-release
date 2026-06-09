@@ -487,6 +487,7 @@ import { forwardRef as forwardRef3, useEffect, useImperativeHandle, useRef } fro
 
 // src/lib/scrollMath.ts
 var BOTTOM_SLACK = 2;
+var MANUAL_SCROLL_GRACE_MS = 2500;
 var maxScrollTop = (scrollHeight, viewportHeight) => Math.max(0, scrollHeight - viewportHeight);
 var isNearScrollBottom = (scrollTop, scrollHeight, viewportHeight, slack = BOTTOM_SLACK) => scrollTop >= maxScrollTop(scrollHeight, viewportHeight) - slack;
 
@@ -507,21 +508,22 @@ var scrollViewportHeight = (sb) => {
   const termH = renderer2?.terminalHeight ?? process.stdout.rows ?? 24;
   return Math.max(6, termH - 10);
 };
-var MANUAL_SCROLL_GRACE_MS = 800;
-var syncStickyScroll = (sb, manualAt) => {
+var syncStickyScroll = (sb, manualAt, lastScrollHeight) => {
   const viewH = scrollViewportHeight(sb);
   const maxTop = maxScrollTop(sb.scrollHeight, viewH);
+  const grew = sb.scrollHeight > lastScrollHeight.current + 0.5;
+  lastScrollHeight.current = sb.scrollHeight;
   if (viewH <= 0) {
     return sb.stickyScroll;
   }
-  const manualGrace = Date.now() - manualAt < MANUAL_SCROLL_GRACE_MS;
-  if (manualGrace) {
+  const manualGrace = manualAt > 0 && Date.now() - manualAt < MANUAL_SCROLL_GRACE_MS;
+  const historySlack = Math.max(4, viewH >> 2);
+  const readingHistory = sb.scrollTop < maxTop - historySlack;
+  if (manualGrace || readingHistory) {
+    sb.stickyScroll = false;
     return false;
   }
-  if (!sb.stickyScroll && isNearScrollBottom(sb.scrollTop, sb.scrollHeight, viewH)) {
-    sb.stickyScroll = true;
-  }
-  if (sb.stickyScroll && sb.scrollTop < maxTop - 1) {
+  if (sb.stickyScroll && grew && isNearScrollBottom(sb.scrollTop, sb.scrollHeight, viewH) && sb.scrollTop < maxTop - 1) {
     sb.scrollTo(maxTop);
   }
   return sb.stickyScroll;
@@ -535,6 +537,7 @@ var ScrollBox = forwardRef3(function ScrollBox2({ children, stickyScroll, style:
   const pendingRef = useRef(0);
   const manualAtRef = useRef(0);
   const lastViewportHRef = useRef(0);
+  const lastScrollHeightRef = useRef(0);
   const notify = () => {
     for (const l of listenersRef.current) {
       l();
@@ -567,7 +570,7 @@ var ScrollBox = forwardRef3(function ScrollBox2({ children, stickyScroll, style:
           lastViewportHRef.current = vh;
           notify();
         }
-        syncStickyScroll(sb, manualAtRef.current);
+        syncStickyScroll(sb, manualAtRef.current, lastScrollHeightRef);
       }
       if (listenersRef.current.size === 0) {
         return;
@@ -601,10 +604,19 @@ var ScrollBox = forwardRef3(function ScrollBox2({ children, stickyScroll, style:
         }
         pendingRef.current += dy;
         clampRef.current = {};
-        sb.stickyScroll = false;
-        manualAtRef.current = Date.now();
         sb.scrollBy(dy);
-        syncStickyScroll(sb, manualAtRef.current);
+        const viewH = scrollViewportHeight(sb);
+        if (dy < 0) {
+          sb.stickyScroll = false;
+          manualAtRef.current = Date.now();
+        } else if (isNearScrollBottom(sb.scrollTop, sb.scrollHeight, viewH)) {
+          sb.stickyScroll = true;
+          manualAtRef.current = 0;
+        } else {
+          sb.stickyScroll = false;
+          manualAtRef.current = Date.now();
+        }
+        syncStickyScroll(sb, manualAtRef.current, lastScrollHeightRef);
         queueMicrotask(() => {
           pendingRef.current = 0;
           notify();
@@ -624,7 +636,15 @@ var ScrollBox = forwardRef3(function ScrollBox2({ children, stickyScroll, style:
           target = Math.min(max, target);
         }
         sb.scrollTo(target);
-        sb.stickyScroll = isNearScrollBottom(target, sb.scrollHeight, scrollViewportHeight(sb));
+        const viewH = scrollViewportHeight(sb);
+        const docked = isNearScrollBottom(target, sb.scrollHeight, viewH);
+        if (docked) {
+          sb.stickyScroll = true;
+          manualAtRef.current = 0;
+        } else {
+          sb.stickyScroll = false;
+          manualAtRef.current = Date.now();
+        }
         pendingRef.current = 0;
         notify();
       },
@@ -637,6 +657,12 @@ var ScrollBox = forwardRef3(function ScrollBox2({ children, stickyScroll, style:
         const viewH = scrollViewportHeight(sb);
         const target = Math.max(0, sb.scrollHeight - viewH);
         sb.stickyScroll = true;
+        manualAtRef.current = 0;
+        if (sb.scrollTop >= target - 1) {
+          pendingRef.current = 0;
+          notify();
+          return;
+        }
         sb.scrollTo(target);
         pendingRef.current = 0;
         notify();
@@ -659,7 +685,7 @@ var ScrollBox = forwardRef3(function ScrollBox2({ children, stickyScroll, style:
     {
       horizontalScrollbarOptions: { visible: false },
       ref: innerRef,
-      stickyScroll,
+      stickyScroll: false,
       verticalScrollbarOptions: { visible: false },
       viewportCulling: false,
       ...native,
@@ -1289,6 +1315,7 @@ export {
   Ansi,
   Box_default as Box,
   Link,
+  MANUAL_SCROLL_GRACE_MS,
   Newline,
   NoSelect,
   RawAnsi,

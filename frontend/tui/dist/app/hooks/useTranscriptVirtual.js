@@ -1,3 +1,4 @@
+import { MANUAL_SCROLL_GRACE_MS, maxScrollTop } from '@ector/ink';
 import { useStore } from '@nanostores/react';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef } from 'react';
 import { $uiState } from '../uiStore.js';
@@ -5,7 +6,7 @@ import { FULL_RENDER_TAIL_ITEMS } from '../../config/limits.js';
 import { sectionMode } from '../../domain/details.js';
 import { useVirtualHistory } from '../../hooks/useVirtualHistory.js';
 import { getViewportSnapshot } from '../../lib/viewportStore.js';
-import { estimatedMsgHeight, messageHeightKey } from '../../lib/virtualHeights.js';
+import { estimatedMsgHeight, isHeavyTranscriptMessage, messageHeightKey } from '../../lib/virtualHeights.js';
 const MAX_HEIGHT_CACHE_BUCKETS = 12;
 export function useTranscriptVirtual(opts) {
   const {
@@ -61,11 +62,17 @@ export function useTranscriptVirtual(opts) {
   const initialHeights = useMemo(() => {
     const out = new Map();
     for (const row of virtualRows) {
-      out.set(row.key, heightCache.get(row.key) ?? estimatedMsgHeight(row.msg, cols, {
+      const boundedRender = isHeavyTranscriptMessage(row.msg.text, cols);
+      const limitHistory = row.index < virtualRows.length - FULL_RENDER_TAIL_ITEMS;
+      const estimate = estimatedMsgHeight(row.msg, cols, {
+        boundedRender,
         compact,
         details: detailsVisible,
-        limitHistory: row.index < virtualRows.length - FULL_RENDER_TAIL_ITEMS
-      }));
+        limitHistory
+      });
+      const cached = heightCache.get(row.key);
+      const cachedOk = cached !== undefined && (!boundedRender || cached <= estimate * 2 + 8);
+      out.set(row.key, cachedOk ? cached : estimate);
     }
     return out;
   }, [cols, compact, detailsVisible, heightCache, virtualRows]);
@@ -136,9 +143,10 @@ export function useTranscriptVirtual(opts) {
       return;
     }
     if (len > transcriptLenRef.current) {
-      const snap = getViewportSnapshot(scrollRef.current);
+      const s_0 = scrollRef.current;
+      const snap = getViewportSnapshot(s_0);
       transcriptLenRef.current = len;
-      if (snap.atBottom || snap.viewportHeight <= 0) {
+      if (s_0?.isSticky() && Date.now() - (s_0.getLastManualScrollAt() || 0) >= MANUAL_SCROLL_GRACE_MS && (snap.atBottom || snap.viewportHeight <= 0)) {
         scrollTranscriptToBottom(virtualHistory.offsets[len] ?? 0);
       }
     } else {
@@ -156,8 +164,12 @@ export function useTranscriptVirtual(opts) {
         chaseBottomRef.current = false;
         return;
       }
-      const total = virtualHistory.offsets[virtualRows.length] ?? 0;
-      scrollTranscriptToBottom(total);
+      const s_1 = scrollRef.current;
+      if (s_1 && Date.now() - s_1.getLastManualScrollAt() < 2500) {
+        chaseBottomRef.current = false;
+        return;
+      }
+      scrollTranscriptToBottom(virtualHistory.offsets[virtualRows.length] ?? 0);
       const snap_0 = getViewportSnapshot(scrollRef.current);
       if (snap_0.atBottom && snap_0.viewportHeight > 0) {
         chaseBottomRef.current = false;
@@ -169,17 +181,30 @@ export function useTranscriptVirtual(opts) {
     return () => {
       cancelled = true;
     };
-  }, [historyItems.length, scrollRef, scrollTranscriptToBottom, sid, virtualHistory.offsets, virtualRows.length]);
+  }, [historyItems.length, scrollRef, scrollTranscriptToBottom, sid, virtualRows.length]);
   useLayoutEffect(() => {
     if (!liveTailActive) {
       return;
     }
-    const s_0 = scrollRef.current;
-    if (!s_0?.isSticky()) {
+    const s_2 = scrollRef.current;
+    if (!s_2) {
       return;
     }
-    s_0.setClampBounds(undefined, undefined);
-    s_0.scrollToBottom();
+    // scrollBy clears stickyScroll; do not snap back while the user reads
+    // history (each stream paint used to call scrollToBottom and felt stuck).
+    if (!s_2.isSticky() || Date.now() - s_2.getLastManualScrollAt() < MANUAL_SCROLL_GRACE_MS) {
+      return;
+    }
+    const scrollH = Math.max(s_2.getScrollHeight(), s_2.getFreshScrollHeight?.() ?? 0);
+    const vp_0 = Math.max(0, s_2.getViewportHeight());
+    const maxTop = maxScrollTop(scrollH, vp_0);
+    const cur = s_2.getScrollTop() + s_2.getPendingDelta();
+    // Already docked — skip redundant scrollTo (was causing micro-jitter at bottom).
+    if (cur >= maxTop - 1) {
+      return;
+    }
+    s_2.setClampBounds(undefined, undefined);
+    s_2.scrollTo(maxTop);
   }, [liveTailActive, scrollRef, virtualHistory.bottomSpacer, virtualHistory.end, virtualHistory.offsets, virtualHistory.topSpacer, virtualRows.length]);
   return {
     virtualHistory,

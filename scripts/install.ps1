@@ -1084,10 +1084,12 @@ function Write-Completion {
         Write-Host "Atualização do Ector Agent concluída" -ForegroundColor Green
         $initPy = Join-Path $InstallDir "ector_cli\__init__.py"
         if (Test-Path $initPy) {
-            $ver = (Select-String -Path $initPy -Pattern '^__version__\s*=\s*"([^"]+)"' | ForEach-Object { $_.Matches[0].Groups[1].Value } | Select-Object -First 1)
-            $rel = (Select-String -Path $initPy -Pattern '^__release_name__\s*=\s*"([^"]*)"' | ForEach-Object { $_.Matches[0].Groups[1].Value } | Select-Object -First 1)
+            $ver = (Select-String -Path $initPy -Pattern '^__version_name__\s*=\s*"([^"]+)"|^__version__\s*=\s*"([^"]+)"' | ForEach-Object {
+                if ($_.Matches[0].Groups[1].Success) { $_.Matches[0].Groups[1].Value } else { $_.Matches[0].Groups[2].Value }
+            } | Select-Object -First 1)
+            $code = (Select-String -Path $initPy -Pattern '^__version_code__\s*=\s*(\d+)' | ForEach-Object { $_.Matches[0].Groups[1].Value } | Select-Object -First 1)
             if ($ver) {
-                $label = if ($rel) { "v$ver ($rel)" } else { "v$ver" }
+                $label = if ($code) { "v$ver ($code)" } else { "v$ver" }
                 Write-Host "  Versão: $label" -ForegroundColor DarkGray
             }
         }

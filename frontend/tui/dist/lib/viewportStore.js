@@ -17,7 +17,7 @@ export function getViewportSnapshot(s) {
   const scrollHeight = Math.max(viewportHeight, s.getScrollHeight());
   const bottom = top + viewportHeight;
   return {
-    atBottom: s.isSticky() || bottom >= scrollHeight - 2,
+    atBottom: bottom >= scrollHeight - 2,
     bottom,
     pending,
     scrollHeight,

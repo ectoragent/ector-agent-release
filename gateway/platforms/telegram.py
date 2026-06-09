@@ -63,6 +63,7 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms.helpers import markdown_to_plain_text
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -102,101 +103,8 @@ def _escape_mdv2(text: str) -> str:
 
 
 def _strip_mdv2(text: str) -> str:
-    """Strip MarkdownV2 escape backslashes to produce clean plain text.
-
-    Also removes MarkdownV2 formatting markers so the fallback
-    doesn't show stray syntax characters from format_message conversion.
-    """
-    # Remove escape backslashes before special characters
-    cleaned = re.sub(r'\\([_*\[\]()~`>#\+\-=|{}.!\\])', r'\1', text)
-    # Remove MarkdownV2 bold markers that format_message converted from **bold**
-    cleaned = re.sub(r'\*([^*]+)\*', r'\1', cleaned)
-    # Remove MarkdownV2 italic markers that format_message converted from *italic*
-    # Use word boundary (\b) to avoid breaking snake_case like my_variable_name
-    cleaned = re.sub(r'(?<!\w)_([^_]+)_(?!\w)', r'\1', cleaned)
-    # Remove MarkdownV2 strikethrough markers (~text~ → text)
-    cleaned = re.sub(r'~([^~]+)~', r'\1', cleaned)
-    # Remove MarkdownV2 spoiler markers (||text|| → text)
-    cleaned = re.sub(r'\|\|([^|]+)\|\|', r'\1', cleaned)
-    return cleaned
-
-
-# ---------------------------------------------------------------------------
-# Markdown table → code block conversion
-# ---------------------------------------------------------------------------
-# Telegram's MarkdownV2 has no table syntax — '|' is just an escaped literal,
-# so pipe tables render as noisy backslash-pipe text with no alignment.
-# Wrapping the table in a fenced code block makes Telegram render it as
-# monospace preformatted text with columns intact.
-
-# Matches a GFM table delimiter row: optional outer pipes, cells containing
-# only dashes (with optional leading/trailing colons for alignment) separated
-# by '|'.  Requires at least one internal '|' so lone '---' horizontal rules
-# are NOT matched.
-_TABLE_SEPARATOR_RE = re.compile(
-    r'^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*){1,}\|?\s*$'
-)
-
-
-def _is_table_row(line: str) -> bool:
-    """Return True if *line* could plausibly be a table data row."""
-    stripped = line.strip()
-    return bool(stripped) and '|' in stripped
-
-
-def _wrap_markdown_tables(text: str) -> str:
-    """Wrap GFM-style pipe tables in ``` fences so Telegram renders them.
-
-    Detected by a row containing '|' immediately followed by a delimiter
-    row matching :data:`_TABLE_SEPARATOR_RE`.  Subsequent pipe-containing
-    non-blank lines are consumed as the table body and included in the
-    wrapped block.  Tables inside existing fenced code blocks are left
-    alone.
-    """
-    if '|' not in text or '-' not in text:
-        return text
-
-    lines = text.split('\n')
-    out: list[str] = []
-    in_fence = False
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        stripped = line.lstrip()
-
-        # Track existing fenced code blocks — never touch content inside.
-        if stripped.startswith('```'):
-            in_fence = not in_fence
-            out.append(line)
-            i += 1
-            continue
-        if in_fence:
-            out.append(line)
-            i += 1
-            continue
-
-        # Look for a header row (contains '|') immediately followed by a
-        # delimiter row.
-        if (
-            '|' in line
-            and i + 1 < len(lines)
-            and _TABLE_SEPARATOR_RE.match(lines[i + 1])
-        ):
-            table_block = [line, lines[i + 1]]
-            j = i + 2
-            while j < len(lines) and _is_table_row(lines[j]):
-                table_block.append(lines[j])
-                j += 1
-            out.append('```')
-            out.extend(table_block)
-            out.append('```')
-            i = j
-            continue
-
-        out.append(line)
-        i += 1
-
-    return '\n'.join(out)
+    """Backward-compatible alias for :func:`markdown_to_plain_text`."""
+    return markdown_to_plain_text(text)
 
 
 class TelegramAdapter(BasePlatformAdapter):
@@ -985,7 +893,11 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=None)
         
         try:
-            # Format and split message if needed
+            # Split raw content in parallel so plain-text fallbacks avoid
+            # MDV2 escape artifacts from formatted chunks.
+            raw_chunks = self.truncate_message(
+                content, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
+            )
             formatted = self.format_message(content)
             chunks = self.truncate_message(
                 formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
@@ -1039,7 +951,8 @@ class TelegramAdapter(BasePlatformAdapter):
                             # Markdown parsing failed, try plain text
                             if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
                                 logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
-                                plain_chunk = _strip_mdv2(chunk)
+                                plain_source = raw_chunks[i] if i < len(raw_chunks) else content
+                                plain_chunk = markdown_to_plain_text(plain_source)
                                 msg = await self._bot.send_message(
                                     chat_id=int(chat_id),
                                     text=plain_chunk,
@@ -1156,11 +1069,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 # "Message is not modified" is a no-op, not an error
                 if "not modified" in str(fmt_err).lower():
                     return SendResult(success=True, message_id=message_id)
-                # Fallback: retry without markdown formatting
+                # Fallback: retry as clean plain text (never raw markdown).
                 await self._bot.edit_message_text(
                     chat_id=int(chat_id),
                     message_id=int(message_id),
-                    text=content,
+                    text=markdown_to_plain_text(content),
                 )
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
@@ -1173,7 +1086,8 @@ class TelegramAdapter(BasePlatformAdapter):
             # split the overflow into a new message instead of dying.
             if "message_too_long" in err_str or "too long" in err_str:
                 truncated = _prefix_within_utf16_limit(
-                    content, self.MAX_MESSAGE_LENGTH - 20
+                    markdown_to_plain_text(content),
+                    self.MAX_MESSAGE_LENGTH - 20,
                 ) + "…"
                 try:
                     await self._bot.edit_message_text(
@@ -1201,7 +1115,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     await self._bot.edit_message_text(
                         chat_id=int(chat_id),
                         message_id=int(message_id),
-                        text=content,
+                        text=markdown_to_plain_text(content),
                     )
                     return SendResult(success=True, message_id=message_id)
                 except Exception as retry_err:
@@ -1604,17 +1518,18 @@ class TelegramAdapter(BasePlatformAdapter):
                 result_text = f"Error switching model: {exc}"
 
             # Edit message to show confirmation, remove buttons
+            formatted = self.format_message(result_text)
             try:
                 await query.edit_message_text(
-                    text=result_text,
-                    parse_mode=ParseMode.MARKDOWN,
+                    text=formatted,
+                    parse_mode=ParseMode.MARKDOWN_V2,
                     reply_markup=None,
                 )
             except Exception:
                 # Markdown parse failure — retry as plain text
                 try:
                     await query.edit_message_text(
-                        text=result_text,
+                        text=markdown_to_plain_text(result_text),
                         parse_mode=None,
                         reply_markup=None,
                     )
@@ -1784,14 +1699,22 @@ class TelegramAdapter(BasePlatformAdapter):
                 await query.answer(text=label)
 
                 # Edit message to show decision, remove buttons
+                decision_text = f"{label} by {user_display}"
                 try:
                     await query.edit_message_text(
-                        text=f"{label} by {user_display}",
+                        text=decision_text,
                         parse_mode=ParseMode.MARKDOWN,
                         reply_markup=None,
                     )
                 except Exception:
-                    pass  # non-fatal if edit fails
+                    try:
+                        await query.edit_message_text(
+                            text=markdown_to_plain_text(decision_text),
+                            parse_mode=None,
+                            reply_markup=None,
+                        )
+                    except Exception:
+                        pass  # non-fatal if edit fails
 
                 # Resolve the approval — unblocks the agent thread
                 try:
@@ -2153,13 +2076,7 @@ class TelegramAdapter(BasePlatformAdapter):
             placeholders[key] = value
             return key
 
-        text = content
-
-        # 0) Pre-wrap GFM-style pipe tables in ``` fences.  Telegram can't
-        #    render tables natively, but fenced code blocks render as
-        #    monospace preformatted text with columns intact.  The wrapped
-        #    tables then flow through step (1) below as protected regions.
-        text = _wrap_markdown_tables(text)
+        text = self.preprocess_outbound_content(content)
 
         # 1) Protect fenced code blocks (``` ... ```)
         #    Per MarkdownV2 spec, \ and ` inside pre/code must be escaped.

@@ -85,29 +85,14 @@ export function paintBannerGradient(lines, edge, peak, ripple, now = performance
     return out;
   });
 }
-/** `2026.4.30` → `2026.4`; aceita também ISO `YYYY-MM-DD`. */
-export function formatReleaseMonthYear(releaseDate) {
-  const s = releaseDate.trim();
-  const dot = /^(\d{4})\.(\d{1,2})\.\d{1,2}$/.exec(s);
-  if (dot) {
-    return `${dot[1]}.${dot[2]}`;
-  }
-  const iso = /^(\d{4})-(\d{2})-\d{2}$/.exec(s);
-  if (iso) {
-    return `${iso[1]}.${Number(iso[2])}`;
-  }
-  const d = new Date(s);
-  if (!Number.isNaN(d.getTime())) {
-    return `${d.getFullYear()}.${d.getMonth() + 1}`;
-  }
-  return s;
-}
-export function formatBannerVersion(version, releaseName) {
+export function formatBannerVersion(version, versionCode) {
   if (!version?.trim()) {
     return '';
   }
   const v = version.trim().replace(/^v/i, '');
   const label = `v${v}`;
-  const name = releaseName?.trim();
-  return name ? `${label} · ${name}` : label;
+  if (versionCode != null && versionCode > 0) {
+    return `${label} (${versionCode})`;
+  }
+  return label;
 }

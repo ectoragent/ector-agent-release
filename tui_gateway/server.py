@@ -993,18 +993,18 @@ def _session_info(agent, session_key: str | None = None) -> dict:
         "skills": {},
         "cwd": _agent_cwd(session_key),
         "version": "",
-        "release_name": "",
-        "release_date": "",
+        "version_name": "",
+        "version_code": 0,
         "update_behind": None,
         "update_command": "",
         "usage": _get_usage(agent),
     }
     try:
-        from ector_cli import __version__, __release_date__, __release_name__
+        from ector_cli import __version__, __version_code__, __version_name__
 
         info["version"] = __version__
-        info["release_name"] = __release_name__
-        info["release_date"] = __release_date__
+        info["version_name"] = __version_name__
+        info["version_code"] = __version_code__
     except Exception:
         pass
     try:

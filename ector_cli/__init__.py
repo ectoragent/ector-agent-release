@@ -11,6 +11,6 @@ Provides subcommands for:
 - ector cron          - Manage cron jobs
 """
 
-__version__ = "1.0"
-__release_name__ = "beta"
-__release_date__ = "2026.5.23"
+__version_name__ = "1.0"
+__version_code__ = 2
+__version__ = __version_name__

@@ -44,7 +44,7 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 from gateway.config import Platform, PlatformConfig
 import re
 
-from gateway.platforms.helpers import MessageDeduplicator, ThreadParticipationTracker
+from gateway.platforms.helpers import MessageDeduplicator, ThreadParticipationTracker, markdown_to_plain_text
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -1100,6 +1100,10 @@ class DiscordAdapter(BasePlatformAdapter):
             # Format and split message if needed
             formatted = self.format_message(content)
             chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+            raw_chunks = self.truncate_message(
+                self.preprocess_outbound_content(content),
+                self.MAX_MESSAGE_LENGTH,
+            )
 
             message_ids = []
             reference = None
@@ -1114,18 +1118,14 @@ class DiscordAdapter(BasePlatformAdapter):
                 except Exception as e:
                     logger.debug("Could not fetch reply-to message: %s", e)
 
-            for i, chunk in enumerate(chunks):
-                if self._reply_to_mode == "all":
-                    chunk_reference = reference
-                else:  # "first" (default) or "off"
-                    chunk_reference = reference if i == 0 else None
+            async def _send_chunk(chunk: str, plain_source: str, chunk_reference):
                 try:
-                    msg = await channel.send(
+                    return await channel.send(
                         content=chunk,
                         reference=chunk_reference,
                     )
-                except Exception as e:
-                    err_text = str(e)
+                except Exception as send_err:
+                    err_text = str(send_err)
                     if (
                         chunk_reference is not None
                         and (
@@ -1141,13 +1141,24 @@ class DiscordAdapter(BasePlatformAdapter):
                             self.name,
                             reply_to,
                         )
-                        reference = None
-                        msg = await channel.send(
-                            content=chunk,
-                            reference=None,
-                        )
-                    else:
-                        raise
+                        return await channel.send(content=chunk, reference=None)
+                    err_lower = err_text.lower()
+                    if "400" in err_lower or "invalid" in err_lower or "embed" in err_lower:
+                        plain = markdown_to_plain_text(plain_source)
+                        if len(plain) > self.MAX_MESSAGE_LENGTH:
+                            plain = plain[: self.MAX_MESSAGE_LENGTH - 3] + "..."
+                        return await channel.send(content=plain, reference=chunk_reference)
+                    raise
+
+            for i, chunk in enumerate(chunks):
+                if self._reply_to_mode == "all":
+                    chunk_reference = reference
+                else:  # "first" (default) or "off"
+                    chunk_reference = reference if i == 0 else None
+                plain_source = raw_chunks[i] if i < len(raw_chunks) else content
+                msg = await _send_chunk(chunk, plain_source, chunk_reference)
+                if chunk_reference is not None and msg.reference is None and reference is not None:
+                    reference = None
                 message_ids.append(str(msg.id))
 
             self.remember_outbound_chunks(
@@ -1301,7 +1312,17 @@ class DiscordAdapter(BasePlatformAdapter):
             formatted = self.format_message(content)
             if len(formatted) > self.MAX_MESSAGE_LENGTH:
                 formatted = formatted[:self.MAX_MESSAGE_LENGTH - 3] + "..."
-            await msg.edit(content=formatted)
+            try:
+                await msg.edit(content=formatted)
+            except Exception as fmt_err:
+                err_lower = str(fmt_err).lower()
+                if "400" in err_lower or "invalid" in err_lower or "embed" in err_lower:
+                    plain = markdown_to_plain_text(content)
+                    if len(plain) > self.MAX_MESSAGE_LENGTH:
+                        plain = plain[:self.MAX_MESSAGE_LENGTH - 3] + "..."
+                    await msg.edit(content=plain)
+                else:
+                    raise
             return SendResult(success=True, message_id=message_id)
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to edit Discord message %s: %s", self.name, message_id, e, exc_info=True)
@@ -2134,10 +2155,10 @@ class DiscordAdapter(BasePlatformAdapter):
         """
         Format message for Discord.
 
-        Discord uses its own markdown variant.
+        Discord uses its own markdown variant. GFM pipe tables are converted
+        to bullet lists because Discord does not render them.
         """
-        # Discord markdown is fairly standard, no special escaping needed
-        return content
+        return self.preprocess_outbound_content(content)
 
     async def _run_simple_slash(
         self,

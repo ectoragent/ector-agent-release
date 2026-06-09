@@ -161,18 +161,173 @@ class TextBatchAggregator:
         self._pending.clear()
 
 
-# ─── Markdown Stripping ──────────────────────────────────────────────────────
+# ─── Markdown Stripping & Table Conversion ───────────────────────────────────
 
-# Pre-compiled regexes for performance
+# GFM table delimiter row: optional outer pipes, dash cells separated by '|'.
+_TABLE_SEPARATOR_RE = re.compile(
+    r'^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*){1,}\|?\s*$'
+)
+
 _RE_BOLD = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
 _RE_ITALIC_STAR = re.compile(r"\*(.+?)\*", re.DOTALL)
 _RE_BOLD_UNDER = re.compile(r"__(.+?)__", re.DOTALL)
 _RE_ITALIC_UNDER = re.compile(r"_(.+?)_", re.DOTALL)
-_RE_CODE_BLOCK = re.compile(r"```[a-zA-Z0-9_+-]*\n?")
-_RE_INLINE_CODE = re.compile(r"`(.+?)`")
+_RE_STRIKE = re.compile(r"~~(.+?)~~", re.DOTALL)
+_RE_SPOILER = re.compile(r"\|\|(.+?)\|\|", re.DOTALL)
+_RE_TILDE = re.compile(r"~([^~]+)~")
+_RE_CODE_BLOCK = re.compile(r"```[\s\S]*?```")
+_RE_CODE_BLOCK_OPEN = re.compile(r"```[a-zA-Z0-9_+-]*\n?")
+_RE_INLINE_CODE = re.compile(r"`([^`\n]+)`")
 _RE_HEADING = re.compile(r"^#{1,6}\s+", re.MULTILINE)
 _RE_LINK = re.compile(r"\[([^\]]+)\]\([^\)]+\)")
+_RE_BLOCKQUOTE = re.compile(r"^>\s?", re.MULTILINE)
+_RE_MDV2_ESCAPE = re.compile(r'\\([_*\[\]()~`>#+\-=|{}.!\\])')
 _RE_MULTI_NEWLINE = re.compile(r"\n{3,}")
+
+
+def _is_table_row(line: str) -> bool:
+    stripped = line.strip()
+    return bool(stripped) and '|' in stripped
+
+
+def _split_table_cells(line: str) -> list[str]:
+    stripped = line.strip()
+    if stripped.startswith('|'):
+        stripped = stripped[1:]
+    if stripped.endswith('|'):
+        stripped = stripped[:-1]
+    return [cell.strip() for cell in stripped.split('|')]
+
+
+def _strip_cell_inline_markdown(cell: str) -> str:
+    cell = cell.strip()
+    cell = re.sub(r'\*\*(.+?)\*\*', r'\1', cell)
+    cell = re.sub(r'\*(.+?)\*', r'\1', cell)
+    cell = re.sub(r'__([^_]+)__', r'\1', cell)
+    cell = re.sub(r'_([^_]+)_', r'\1', cell)
+    return cell.strip()
+
+
+def _format_table_row_as_bullet(row: list[str]) -> str:
+    """Render one table row as a bullet key/value line."""
+    if len(row) >= 2:
+        label = _strip_cell_inline_markdown(row[0])
+        rest = [cell.strip() for cell in row[1:]]
+        if len(rest) == 1:
+            return f'• **{label}:** {rest[0]}'
+        joined = ' — '.join(rest)
+        return f'• **{label}:** {joined}'
+    if row:
+        cells = [_strip_cell_inline_markdown(c) for c in row]
+        return '• ' + ' — '.join(cells)
+    return ''
+
+
+def _emit_table_rows(rows: list[list[str]], out: list[str]) -> None:
+    for row in rows:
+        bullet = _format_table_row_as_bullet(row)
+        if bullet:
+            out.append(bullet)
+
+
+def _count_consecutive_pipe_rows(lines: list[str], start: int) -> int:
+    """Count consecutive pipe rows that are not delimiter separators."""
+    count = 0
+    j = start
+    while j < len(lines) and _is_table_row(lines[j]) and not _TABLE_SEPARATOR_RE.match(lines[j]):
+        cells = _split_table_cells(lines[j])
+        if len(cells) < 2:
+            break
+        count += 1
+        j += 1
+    return count
+
+
+def convert_markdown_tables(text: str) -> str:
+    """Convert GFM pipe tables to bullet key/value lines for chat platforms.
+
+    Telegram, Slack, Discord, WhatsApp and SMS clients do not render GFM
+    tables; raw ``| col |`` syntax reads as noisy unparsed markdown.
+
+    Supports standard GFM tables (header + ``|---|---|`` separator) and a
+    fallback heuristic for models that omit the separator row.
+    """
+    if '|' not in text:
+        return text
+
+    lines = text.split('\n')
+    out: list[str] = []
+    in_fence = False
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.lstrip()
+
+        if stripped.startswith('```'):
+            in_fence = not in_fence
+            out.append(line)
+            i += 1
+            continue
+        if in_fence:
+            out.append(line)
+            i += 1
+            continue
+
+        if (
+            '|' in line
+            and i + 1 < len(lines)
+            and _TABLE_SEPARATOR_RE.match(lines[i + 1])
+        ):
+            i += 2  # skip header and separator
+            rows: list[list[str]] = []
+            while i < len(lines) and _is_table_row(lines[i]):
+                rows.append(_split_table_cells(lines[i]))
+                i += 1
+            _emit_table_rows(rows, out)
+            continue
+
+        # Fallback: 2+ consecutive pipe rows without a separator line.
+        run = _count_consecutive_pipe_rows(lines, i)
+        if run >= 2:
+            rows = [_split_table_cells(lines[j]) for j in range(i, i + run)]
+            _emit_table_rows(rows, out)
+            i += run
+            continue
+
+        out.append(line)
+        i += 1
+
+    return '\n'.join(out)
+
+
+def markdown_to_plain_text(text: str) -> str:
+    """Convert markdown (or a partially formatted payload) to clean plain text."""
+    if not text:
+        return text
+
+    cleaned = _RE_MDV2_ESCAPE.sub(r'\1', text)
+    cleaned = convert_markdown_tables(cleaned)
+
+    def _unwrap_fence(m: re.Match) -> str:
+        inner = m.group(0)
+        inner = re.sub(r'^```[A-Za-z0-9_-]*\n?', '', inner)
+        inner = re.sub(r'\n?```$', '', inner)
+        return inner.strip('\n')
+
+    cleaned = _RE_CODE_BLOCK.sub(_unwrap_fence, cleaned)
+    cleaned = _RE_INLINE_CODE.sub(r'\1', cleaned)
+    cleaned = _RE_LINK.sub(r'\1', cleaned)
+    cleaned = _RE_BOLD.sub(r'\1', cleaned)
+    cleaned = _RE_BOLD_UNDER.sub(r'\1', cleaned)
+    cleaned = _RE_STRIKE.sub(r'\1', cleaned)
+    cleaned = _RE_SPOILER.sub(r'\1', cleaned)
+    cleaned = _RE_ITALIC_STAR.sub(r'\1', cleaned)
+    cleaned = re.sub(r'(?<!\w)_([^_]+)_(?!\w)', r'\1', cleaned)
+    cleaned = _RE_TILDE.sub(r'\1', cleaned)
+    cleaned = _RE_HEADING.sub('', cleaned)
+    cleaned = _RE_BLOCKQUOTE.sub('', cleaned)
+    cleaned = _RE_MULTI_NEWLINE.sub('\n\n', cleaned)
+    return cleaned.strip()
 
 
 def strip_markdown(text: str) -> str:
@@ -181,16 +336,7 @@ def strip_markdown(text: str) -> str:
     Replaces the identical ``_strip_markdown()`` functions previously
     duplicated in sms.py, bluebubbles.py, and feishu.py.
     """
-    text = _RE_BOLD.sub(r"\1", text)
-    text = _RE_ITALIC_STAR.sub(r"\1", text)
-    text = _RE_BOLD_UNDER.sub(r"\1", text)
-    text = _RE_ITALIC_UNDER.sub(r"\1", text)
-    text = _RE_CODE_BLOCK.sub("", text)
-    text = _RE_INLINE_CODE.sub(r"\1", text)
-    text = _RE_HEADING.sub("", text)
-    text = _RE_LINK.sub(r"\1", text)
-    text = _RE_MULTI_NEWLINE.sub("\n\n", text)
-    return text.strip()
+    return markdown_to_plain_text(text)
 
 
 # ─── Thread Participation Tracking ───────────────────────────────────────────

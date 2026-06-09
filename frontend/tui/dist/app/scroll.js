@@ -8,9 +8,15 @@ export function scrollWithSelectionBy(delta, {
   }
   const cur = s.getScrollTop() + s.getPendingDelta();
   const viewport = Math.max(0, s.getViewportHeight());
-  const max = Math.max(0, s.getScrollHeight() - viewport);
+  const reported = s.getScrollHeight();
+  const fresh = s.getFreshScrollHeight();
+  const scrollH = Math.max(reported, fresh ?? reported);
+  const max = Math.max(0, scrollH - viewport);
   const actual = Math.max(0, Math.min(max, cur + delta)) - cur;
   if (actual === 0) {
+    if (delta !== 0) {
+      s.setClampBounds(undefined, undefined);
+    }
     return;
   }
   const sel = selection.getState();

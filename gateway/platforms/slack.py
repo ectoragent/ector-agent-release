@@ -33,7 +33,7 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.helpers import MessageDeduplicator
+from gateway.platforms.helpers import MessageDeduplicator, markdown_to_plain_text
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -591,7 +591,16 @@ class SlackAdapter(BasePlatformAdapter):
                     if broadcast and i == 0:
                         kwargs["reply_broadcast"] = True
 
-                last_result = await self._get_client(chat_id).chat_postMessage(**kwargs)
+                try:
+                    last_result = await self._get_client(chat_id).chat_postMessage(**kwargs)
+                except Exception as chunk_err:
+                    err_lower = str(chunk_err).lower()
+                    if "invalid" in err_lower or "format" in err_lower or "mrkdwn" in err_lower:
+                        kwargs["text"] = markdown_to_plain_text(chunk)
+                        kwargs["mrkdwn"] = False
+                        last_result = await self._get_client(chat_id).chat_postMessage(**kwargs)
+                    else:
+                        raise
                 sent_ts = last_result.get("ts") if last_result else None
                 if sent_ts:
                     chunk_pairs.append((sent_ts, chunk))
@@ -634,11 +643,22 @@ class SlackAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
         try:
             formatted = self.format_message(content)
-            await self._get_client(chat_id).chat_update(
-                channel=chat_id,
-                ts=message_id,
-                text=formatted,
-            )
+            try:
+                await self._get_client(chat_id).chat_update(
+                    channel=chat_id,
+                    ts=message_id,
+                    text=formatted,
+                )
+            except Exception as fmt_err:
+                err_lower = str(fmt_err).lower()
+                if "invalid" in err_lower or "format" in err_lower or "mrkdwn" in err_lower:
+                    await self._get_client(chat_id).chat_update(
+                        channel=chat_id,
+                        ts=message_id,
+                        text=markdown_to_plain_text(content),
+                    )
+                else:
+                    raise
             return SendResult(success=True, message_id=message_id)
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error(
@@ -830,6 +850,8 @@ class SlackAdapter(BasePlatformAdapter):
         if not content:
             return content
 
+        text = self.preprocess_outbound_content(content)
+
         placeholders: dict = {}
         counter = [0]
 
@@ -839,8 +861,6 @@ class SlackAdapter(BasePlatformAdapter):
             counter[0] += 1
             placeholders[key] = value
             return key
-
-        text = content
 
         # 1) Protect fenced code blocks (``` ... ```)
         text = re.sub(

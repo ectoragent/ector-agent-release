@@ -1895,6 +1895,7 @@ class BasePlatformAdapter(ABC):
         network errors, sends the user a brief delivery-failure notice so they
         know to retry rather than waiting indefinitely.
         """
+        content = self.preprocess_outbound_content(content)
 
         result = await self.send(
             chat_id=chat_id,
@@ -1954,7 +1955,7 @@ class BasePlatformAdapter(ABC):
         logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
         fallback_result = await self.send(
             chat_id=chat_id,
-            content=f"(Response formatting failed, plain text:)\n\n{content[:3500]}",
+            content=self.plain_text_message(content),
             reply_to=reply_to,
             metadata=metadata,
         )
@@ -2833,6 +2834,13 @@ class BasePlatformAdapter(ABC):
         """
         pass
     
+    def preprocess_outbound_content(self, content: str) -> str:
+        """Normalize agent markdown before platform-specific formatting."""
+        from gateway.platforms.helpers import convert_markdown_tables
+        if not content:
+            return content
+        return convert_markdown_tables(content)
+
     def format_message(self, content: str) -> str:
         """
         Format a message for this platform.
@@ -2842,7 +2850,12 @@ class BasePlatformAdapter(ABC):
         
         Default implementation returns content as-is.
         """
-        return content
+        return self.preprocess_outbound_content(content)
+
+    def plain_text_message(self, content: str) -> str:
+        """Return a clean plain-text version suitable for formatting fallbacks."""
+        from gateway.platforms.helpers import markdown_to_plain_text
+        return markdown_to_plain_text(content)
     
     @staticmethod
     def truncate_message(

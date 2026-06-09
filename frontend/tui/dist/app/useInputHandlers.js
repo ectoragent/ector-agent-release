@@ -305,10 +305,10 @@ export function useInputHandlers(ctx) {
       return rows ? scrollTranscript(dir_1 * rows * wheelStep) : undefined;
     }
     if (key.shift && key.upArrow) {
-      return scrollTranscript(-1);
+      return scrollTranscript(-wheelStep * 3);
     }
     if (key.shift && key.downArrow) {
-      return scrollTranscript(1);
+      return scrollTranscript(wheelStep * 3);
     }
     if (key.pageUp || key.pageDown) {
       // Half-viewport keeps 50% continuity and stays under Ink's
