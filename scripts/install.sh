@@ -907,6 +907,10 @@ clone_repo() {
     fi
 }
 
+_venv_usable() {
+    [ -x "venv/bin/python" ] && venv/bin/python -c 'import sys; sys.exit(0)' 2>/dev/null
+}
+
 _recreate_venv() {
     if [ -d "venv" ]; then
         rm -rf venv
@@ -919,13 +923,20 @@ _recreate_venv() {
     fi
 }
 
+_ensure_venv() {
+    if _venv_usable; then
+        return 0
+    fi
+    _recreate_venv
+}
+
 setup_venv() {
     if [ "$USE_VENV" = false ]; then
         return 0
     fi
 
     if _is_update_mode && declare -F _install_step >/dev/null 2>&1; then
-        _install_step "Ambiente virtual Python" _recreate_venv || exit 1
+        _install_step "Ambiente virtual Python" _ensure_venv || exit 1
         return 0
     fi
 
@@ -981,8 +992,13 @@ install_deps() {
         fi
     fi
 
-    _install_step "Pacote Python e dependências" bash -c \
-        "$UV_CMD pip install '.[all]' 2>/dev/null || $UV_CMD pip install '.'" || exit 1
+    if _is_update_mode; then
+        _install_step "Pacote Python e dependências" bash -c \
+            "$UV_CMD pip install --upgrade '.[all]' 2>/dev/null || $UV_CMD pip install --upgrade '.'" || exit 1
+    else
+        _install_step "Pacote Python e dependências" bash -c \
+            "$UV_CMD pip install '.[all]' 2>/dev/null || $UV_CMD pip install '.'" || exit 1
+    fi
 }
 
 setup_path() {
@@ -1240,7 +1256,7 @@ install_node_deps() {
         return 0
     fi
 
-    if [ -f "$INSTALL_DIR/package.json" ]; then
+    if [ -f "$INSTALL_DIR/package.json" ] && ! _is_update_mode; then
         cd "$INSTALL_DIR"
         _install_step_try "Ferramentas de navegador: dependências" npm install --silent
 
@@ -1267,6 +1283,8 @@ install_node_deps() {
             esac
         }
         _install_step_try "Navegador Chromium (Playwright)" _install_playwright
+    elif [ -f "$INSTALL_DIR/package.json" ] && _is_update_mode && declare -F _install_step_ok >/dev/null 2>&1; then
+        _install_step_ok "Ferramentas de navegador (mantidas)"
     fi
 
     # TUI (OpenTUI): Bun + pnpm/npm

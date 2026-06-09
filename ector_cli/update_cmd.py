@@ -270,21 +270,67 @@ def _check_updates_available(install_dir: Path) -> int:
     return behind
 
 
-def _run_shell(cmd: list[str], *, cwd: Path | None = None, env: dict | None = None) -> tuple[int, str]:
-    proc = subprocess.run(
+class UpdateCancelled(Exception):
+    """User interrupted ``ector update`` (Ctrl+C)."""
+
+
+def _terminate_process(proc: subprocess.Popen[str]) -> None:
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
+def _run_shell(
+    cmd: list[str],
+    *,
+    cwd: Path | None = None,
+    env: dict | None = None,
+    stream: bool = False,
+) -> tuple[int, str]:
+    if not stream:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(cwd) if cwd else None,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        combined = f"{proc.stdout or ''}{proc.stderr or ''}"
+        if proc.stdout:
+            print(proc.stdout, end="")
+        if proc.stderr:
+            print(proc.stderr, end="", file=sys.stderr)
+        return proc.returncode, combined
+
+    proc = subprocess.Popen(
         cmd,
         cwd=str(cwd) if cwd else None,
         env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
-        capture_output=True,
-        check=False,
+        bufsize=1,
     )
-    combined = f"{proc.stdout or ''}{proc.stderr or ''}"
-    if proc.stdout:
-        print(proc.stdout, end="")
-    if proc.stderr:
-        print(proc.stderr, end="", file=sys.stderr)
-    return proc.returncode, combined
+    chunks: list[str] = []
+    try:
+        if proc.stdout is None:
+            return proc.wait(), ""
+        for line in proc.stdout:
+            chunks.append(line)
+            sys.stdout.write(line)
+            sys.stdout.flush()
+        rc = proc.wait()
+    except KeyboardInterrupt:
+        _terminate_process(proc)
+        raise UpdateCancelled from None
+    combined = "".join(chunks)
+    return rc, combined
 
 
 def _ensure_uv(env: dict[str, str]) -> bool:
@@ -466,7 +512,11 @@ def _report_install_failure(returncode: int, log: str) -> None:
     print()
     print(color("  Diagnóstico: ector doctor", Colors.DIM))
     print(color("  Logs: ector logs --level warning", Colors.DIM))
-    print(color("  Modo detalhado: ECTOR_INSTALL_VERBOSE=1 ector update", Colors.DIM))
+
+
+def _report_update_cancelled() -> None:
+    print()
+    _warn("Atualização cancelada.")
 
 
 def _run_installer_update(installer: Path, install_dir: Path, env: dict[str, str]) -> int:
@@ -485,11 +535,18 @@ def _run_installer_update(installer: Path, install_dir: Path, env: dict[str, str
     last_rc = 1
     last_log = ""
 
+    _info("Aplicando atualização...")
+    print()
+
     for attempt in range(1, _MAX_INSTALL_ATTEMPTS + 1):
         if attempt > 1:
             print()
             _info("Tentando atualização novamente...")
-        last_rc, last_log = _run_shell(cmd, cwd=install_dir, env=env)
+        try:
+            last_rc, last_log = _run_shell(cmd, cwd=install_dir, env=env, stream=True)
+        except UpdateCancelled:
+            _report_update_cancelled()
+            return 130
         if last_rc == 0:
             return 0
         if attempt < _MAX_INSTALL_ATTEMPTS and _attempt_recovery(install_dir, last_log, env):
@@ -586,10 +643,16 @@ def cmd_update(args) -> None:
     _stop_gateways_quietly()
 
     env = _install_env(install_dir)
-    result = _run_installer_update(installer, install_dir, env)
+    try:
+        result = _run_installer_update(installer, install_dir, env)
+    except KeyboardInterrupt:
+        _report_update_cancelled()
+        sys.exit(130)
 
     _invalidate_update_cache()
 
+    if result == 130:
+        sys.exit(130)
     if result != 0:
         sys.exit(result)
 
