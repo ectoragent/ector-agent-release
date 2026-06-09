@@ -211,12 +211,35 @@ def _remote_version_label(install_dir: Path, upstream_label: str) -> str | None:
     return format_version_label(*meta)
 
 
+def _commits_behind(install_dir: Path, *, force_refresh: bool = False) -> int | None:
+    """Commits behind upstream, or ``None`` on failure.
+
+    When git reports ``0`` but ``versionCode`` on the remote is higher, treat
+    as at least one pending update (same release branch, newer build).
+    """
+    from ector_cli.presentation import check_for_updates, get_cached_update_upstream_label
+    from ector_cli.version_info import read_git_ref_version, read_install_version
+
+    behind = check_for_updates(force_refresh=force_refresh)
+    if behind is None:
+        return None
+    if behind > 0:
+        return behind
+
+    upstream = get_cached_update_upstream_label()
+    local_meta = read_install_version(install_dir)
+    remote_meta = read_git_ref_version(install_dir, upstream) if upstream else None
+    if local_meta and remote_meta and remote_meta[1] > local_meta[1]:
+        return remote_meta[1] - local_meta[1]
+    return 0
+
+
 def _check_updates_available(install_dir: Path) -> int:
     """Return commits behind upstream, or exit on failure / already up to date."""
-    from ector_cli.presentation import check_for_updates, get_cached_update_upstream_label
+    from ector_cli.presentation import get_cached_update_upstream_label
 
     _info("Verificando atualizações...")
-    behind = check_for_updates()
+    behind = _commits_behind(install_dir, force_refresh=True)
     if behind is None:
         _fail("Não foi possível verificar atualizações (rede ou git).")
         sys.exit(1)
@@ -427,9 +450,9 @@ def _run_installer_update(installer: Path, install_dir: Path, env: dict[str, str
 def cmd_update_check() -> None:
     install_dir = _resolve_update_install_dir()
 
-    from ector_cli.presentation import check_for_updates, get_cached_update_upstream_label
+    from ector_cli.presentation import get_cached_update_upstream_label
 
-    behind = check_for_updates()
+    behind = _commits_behind(install_dir, force_refresh=True)
     if behind is None:
         _fail("Não foi possível verificar atualizações (rede ou git).")
         sys.exit(1)
@@ -487,6 +510,7 @@ def cmd_update(args) -> None:
     )
 
     _title("Atualização do Ector Agent")
+    print(color(f"  Instalação: {install_dir}", Colors.DIM))
     current = _installed_version_label(install_dir)
     if current:
         print(color(f"  Versão instalada: {current}", Colors.DIM))

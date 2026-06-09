@@ -130,13 +130,16 @@ def get_cached_update_upstream_label() -> str:
     return "origin/main"
 
 
-def check_for_updates() -> Optional[int]:
+def check_for_updates(*, force_refresh: bool = False) -> Optional[int]:
     """Check how many commits behind the tracking branch the local repo is.
 
     Does a ``git fetch`` at most once every 6 hours (cached to
     ``ECTOR_HOME/.update_check``).  Returns the number of commits behind, or
     ``None`` if the check fails.  Does not refresh the cache when ``fetch``
     fails (avoids freezing a stale count).
+
+    Pass ``force_refresh=True`` from ``ector update`` so a stale cached
+    ``behind=0`` does not skip a newly published release.
     """
     from ector_cli.install_paths import resolve_install_dir
 
@@ -147,15 +150,16 @@ def check_for_updates() -> Optional[int]:
     cache_file = get_ector_home() / ".update_check"
 
     now = time.time()
-    try:
-        if cache_file.exists():
-            cached = json.loads(cache_file.read_text())
-            if now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS:
-                behind = cached.get("behind")
-                if behind is None or isinstance(behind, int):
-                    return behind
-    except Exception:
-        pass
+    if not force_refresh:
+        try:
+            if cache_file.exists():
+                cached = json.loads(cache_file.read_text())
+                if now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS:
+                    behind = cached.get("behind")
+                    if behind is None or isinstance(behind, int):
+                        return behind
+        except Exception:
+            pass
 
     remote, branch = _resolve_git_upstream(repo_dir)
     upstream_label = f"{remote}/{branch}"
