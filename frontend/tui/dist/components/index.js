@@ -1,0 +1,25 @@
+/** Public component API — import from here or from `<Component>/index.js`. */
+export { AgentsOverlay, closeAgentsOverlay, openAgentsOverlay } from './AgentsOverlay/index.js';
+export { FloatBox, GoodVibesHeart, StatusRule, StickyPromptTracker, TranscriptScrollbar } from './AppChrome/index.js';
+export { AppLayout } from './AppLayout/index.js';
+export { CompletionMenu, FloatingOverlays, PromptZone } from './AppOverlays/index.js';
+export { BannerLogo } from './BannerLogo/index.js';
+export { Banner, Panel } from './Branding/index.js';
+export { ComposerFooter, showComposerContextPct } from './ComposerFooter/index.js';
+export { FpsOverlay } from './FpsOverlay/index.js';
+export { AUDIO_DIRECTIVE_RE, INLINE_RE, Md, MEDIA_LINE_RE, stripInlineMarkup } from './Markdown/index.js';
+export { MaskedPrompt } from './MaskedPrompt/index.js';
+export { MessageLine } from './MessageLine/index.js';
+export { ModelPicker } from './ModelPicker/index.js';
+export { OverlayHint, useOverlayKeys, windowItems, windowOffset } from './OverlayControls/index.js';
+export { ApprovalPrompt, ConfirmPrompt, parseApprovalFindings, WiserPrompt } from './Prompts/index.js';
+export { getQueueWindow, QUEUE_WINDOW, QueuedMessages } from './QueuedMessages/index.js';
+export { SessionPicker } from './SessionPicker/index.js';
+export { SkillsHub } from './SkillsHub/index.js';
+export { LiveTodoPanel, StreamingAssistant } from './StreamingAssistant/index.js';
+export { findStableBoundary, StreamingMd } from './StreamingMarkdown/index.js';
+export { lineNav, offsetFromPosition, TextInput } from './TextInput/index.js';
+export { Fg } from './Themed/index.js';
+export { Spinner, Thinking, ToolTrail } from './Thinking/index.js';
+export { TodoPanel } from './TodoPanel/index.js';
+export { TranscriptCard } from './TranscriptCard/index.js';

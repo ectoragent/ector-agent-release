@@ -1,0 +1,70 @@
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+const MAX = 1000;
+const legacyDir = process.env.ECTOR_HOME ?? join(homedir(), '.ector');
+const dir = process.env.ECTOR_HOME ?? process.env.ECTOR_HOME ?? join(homedir(), '.ector');
+const file = join(dir, '.ector_history');
+const legacyFile = join(legacyDir, '.ector_history');
+let cache = null;
+export function load() {
+  if (cache) {
+    return cache;
+  }
+  try {
+    if (!existsSync(file) && existsSync(legacyFile)) {
+      mkdirSync(dir, {
+        recursive: true
+      });
+      // migrate once, then only use the new file
+      appendFileSync(file, readFileSync(legacyFile, 'utf8'), 'utf8');
+    }
+    if (!existsSync(file)) {
+      cache = [];
+      return cache;
+    }
+    const entries = [];
+    let current = [];
+    for (const line of readFileSync(file, 'utf8').split('\n')) {
+      if (line.startsWith('+')) {
+        current.push(line.slice(1));
+      } else if (current.length) {
+        entries.push(current.join('\n'));
+        current = [];
+      }
+    }
+    if (current.length) {
+      entries.push(current.join('\n'));
+    }
+    cache = entries.slice(-MAX);
+  } catch {
+    cache = [];
+  }
+  return cache;
+}
+export function append(line) {
+  const trimmed = line.trim();
+  if (!trimmed) {
+    return;
+  }
+  const items = load();
+  if (items.at(-1) === trimmed) {
+    return;
+  }
+  items.push(trimmed);
+  if (items.length > MAX) {
+    items.splice(0, items.length - MAX);
+  }
+  try {
+    if (!existsSync(dir)) {
+      mkdirSync(dir, {
+        recursive: true
+      });
+    }
+    const ts = new Date().toISOString().replace('T', ' ').replace('Z', '');
+    const encoded = trimmed.split('\n').map(l => `+${l}`).join('\n');
+    appendFileSync(file, `\n# ${ts}\n${encoded}\n`);
+  } catch {
+    void 0;
+  }
+}

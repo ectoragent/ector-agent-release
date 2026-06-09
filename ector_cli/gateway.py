@@ -1,0 +1,3207 @@
+"""
+Gateway subcommand for ector CLI.
+
+Handles: ector gateway [run|start|stop|restart|status|install|uninstall|setup]
+"""
+
+import asyncio
+import os
+import shutil
+import signal
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).parent.parent.resolve()
+
+from gateway.status import terminate_pid
+from gateway.restart import (
+    DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
+    GATEWAY_SERVICE_RESTART_EXIT_CODE,
+    parse_restart_drain_timeout,
+)
+from ector_cli.config import (
+    get_env_value,
+    get_ector_home,
+    is_managed,
+    managed_error,
+    read_raw_config,
+    save_env_value,
+)
+# display_ector_home is imported lazily at call sites to avoid ImportError
+# when ector_constants is cached from a pre-update version during `ector update`.
+from ector_cli.setup import (
+    print_header, print_info, print_success, print_warning, print_error,
+    prompt, prompt_choice, prompt_yes_no,
+)
+from ector_cli.colors import Colors, color
+
+
+# =============================================================================
+# Process Management (for manual gateway runs)
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class GatewayRuntimeSnapshot:
+    manager: str
+    service_installed: bool = False
+    service_running: bool = False
+    gateway_pids: tuple[int, ...] = ()
+    service_scope: str | None = None
+
+    @property
+    def running(self) -> bool:
+        return self.service_running or bool(self.gateway_pids)
+
+    @property
+    def has_process_service_mismatch(self) -> bool:
+        return self.service_installed and self.running and not self.service_running
+
+def _get_service_pids() -> set:
+    """Return PIDs currently managed by systemd or launchd gateway services.
+
+    Used to avoid killing freshly-restarted service processes when sweeping
+    for stale manual gateway processes after a service restart.  Relies on the
+    service manager having committed the new PID before the restart command
+    returns (true for both systemd and launchd in practice).
+    """
+    pids: set = set()
+
+    # --- systemd (Linux): user and system scopes ---
+    if supports_systemd_services():
+        for scope_args in [["systemctl", "--user"], ["systemctl"]]:
+            try:
+                result = subprocess.run(
+                    scope_args + ["list-units", "ector-gateway*",
+                                  "--plain", "--no-legend", "--no-pager"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                for line in result.stdout.strip().splitlines():
+                    parts = line.split()
+                    if not parts or not parts[0].endswith(".service"):
+                        continue
+                    svc = parts[0]
+                    try:
+                        show = subprocess.run(
+                            scope_args + ["show", svc,
+                                          "--property=MainPID", "--value"],
+                            capture_output=True, text=True, timeout=5,
+                        )
+                        pid = int(show.stdout.strip())
+                        if pid > 0:
+                            pids.add(pid)
+                    except (ValueError, subprocess.TimeoutExpired):
+                        pass
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                pass
+
+    # --- launchd (macOS) ---
+    if is_macos():
+        try:
+            label = get_launchd_label()
+            result = subprocess.run(
+                ["launchctl", "list", label],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                # Output: "PID\tStatus\tLabel" header, then one data line
+                for line in result.stdout.strip().splitlines():
+                    parts = line.split()
+                    if len(parts) >= 3 and parts[2] == label:
+                        try:
+                            pid = int(parts[0])
+                            if pid > 0:
+                                pids.add(pid)
+                        except ValueError:
+                            pass
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
+    return pids
+
+
+def _get_parent_pid(pid: int) -> int | None:
+    """Return the parent PID for ``pid``, or ``None`` when unavailable."""
+    if pid <= 1:
+        return None
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "ppid=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    raw = result.stdout.strip()
+    if not raw:
+        return None
+    try:
+        parent_pid = int(raw.splitlines()[-1].strip())
+    except ValueError:
+        return None
+    return parent_pid if parent_pid > 0 else None
+
+
+def _is_pid_ancestor_of_current_process(target_pid: int) -> bool:
+    """Return True when ``target_pid`` is this process or one of its ancestors."""
+    if target_pid <= 0:
+        return False
+
+    pid = os.getpid()
+    seen: set[int] = set()
+    while pid and pid not in seen:
+        if pid == target_pid:
+            return True
+        seen.add(pid)
+        pid = _get_parent_pid(pid) or 0
+    return False
+
+
+def _request_gateway_self_restart(pid: int) -> bool:
+    """Ask a running gateway ancestor to restart itself asynchronously."""
+    if not hasattr(signal, "SIGUSR1"):
+        return False
+    if not _is_pid_ancestor_of_current_process(pid):
+        return False
+    try:
+        os.kill(pid, signal.SIGUSR1)
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+    return True
+
+
+def _graceful_restart_via_sigusr1(pid: int, drain_timeout: float) -> bool:
+    """Send SIGUSR1 to a gateway PID and wait for it to exit gracefully.
+
+    SIGUSR1 is wired in gateway/run.py to ``request_restart(via_service=True)``
+    which drains in-flight agent runs (up to ``agent.restart_drain_timeout``
+    seconds), then exits with code 75.  Both systemd (``Restart=on-failure``
+    + ``RestartForceExitStatus=75``) and launchd (``KeepAlive.SuccessfulExit
+    = false``) relaunch the process after the graceful exit.
+
+    This is the drain-aware alternative to ``systemctl restart`` / ``SIGTERM``,
+    which SIGKILL in-flight agents after a short timeout.
+
+    Args:
+        pid: Gateway process PID (systemd MainPID, launchd PID, or bare
+            process PID).
+        drain_timeout: Seconds to wait for the process to exit after sending
+            SIGUSR1.  Should be slightly larger than the gateway's
+            ``agent.restart_drain_timeout`` to allow the drain loop to
+            finish cleanly.
+
+    Returns:
+        True if the PID was signalled and exited within the timeout.
+        False if SIGUSR1 couldn't be sent or the process didn't exit in
+        time (caller should fall back to a harder restart path).
+    """
+    if not hasattr(signal, "SIGUSR1"):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, signal.SIGUSR1)
+    except ProcessLookupError:
+        # Already gone — nothing to drain.
+        return True
+    except (PermissionError, OSError):
+        return False
+
+    import time as _time
+
+    deadline = _time.monotonic() + max(drain_timeout, 1.0)
+    while _time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)  # signal 0 — probe liveness
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            # Process still exists but we can't signal it.  Treat as alive
+            # so the caller falls back.
+            pass
+        _time.sleep(0.5)
+    # Drain didn't finish in time.
+    return False
+
+
+def _append_unique_pid(pids: list[int], pid: int | None, exclude_pids: set[int]) -> None:
+    if pid is None or pid <= 0:
+        return
+    if pid == os.getpid() or pid in exclude_pids or pid in pids:
+        return
+    pids.append(pid)
+
+
+def _scan_gateway_pids(exclude_pids: set[int], all_profiles: bool = False) -> list[int]:
+    """Best-effort process-table scan for gateway PIDs.
+
+    This supplements the profile-scoped PID file so status views can still spot
+    a live gateway when the PID file is stale/missing, and ``--all`` sweeps can
+    discover gateways outside the current profile.
+    """
+    pids: list[int] = []
+    patterns = [
+        "ector_cli.main gateway",
+        "ector_cli.main --profile",
+        "ector_cli.main -p",
+        "ector_cli/main.py gateway",
+        "ector_cli/main.py --profile",
+        "ector_cli/main.py -p",
+        "ector gateway",
+        "gateway/run.py",
+    ]
+    current_home = str(get_ector_home().resolve())
+    current_profile_arg = _profile_arg(current_home)
+    current_profile_name = current_profile_arg.split()[-1] if current_profile_arg else ""
+
+    def _matches_current_profile(command: str) -> bool:
+        if current_profile_name:
+            return (
+                f"--profile {current_profile_name}" in command
+                or f"-p {current_profile_name}" in command
+                or f"ECTOR_HOME={current_home}" in command
+            )
+
+        if "--profile " in command or " -p " in command:
+            return False
+        if "ECTOR_HOME=" in command and f"ECTOR_HOME={current_home}" not in command:
+            return False
+        return True
+
+    try:
+        if is_windows():
+            result = subprocess.run(
+                ["wmic", "process", "get", "ProcessId,CommandLine", "/FORMAT:LIST"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode != 0:
+                return []
+            current_cmd = ""
+            for line in result.stdout.split("\n"):
+                line = line.strip()
+                if line.startswith("CommandLine="):
+                    current_cmd = line[len("CommandLine="):]
+                elif line.startswith("ProcessId="):
+                    pid_str = line[len("ProcessId="):]
+                    if any(p in current_cmd for p in patterns) and (
+                        all_profiles or _matches_current_profile(current_cmd)
+                    ):
+                        try:
+                            _append_unique_pid(pids, int(pid_str), exclude_pids)
+                        except ValueError:
+                            pass
+                    current_cmd = ""
+        else:
+            result = subprocess.run(
+                ["ps", "-A", "eww", "-o", "pid=,command="],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode != 0:
+                return []
+            for line in result.stdout.split("\n"):
+                stripped = line.strip()
+                if not stripped or "grep" in stripped:
+                    continue
+
+                pid = None
+                command = ""
+
+                parts = stripped.split(None, 1)
+                if len(parts) == 2:
+                    try:
+                        pid = int(parts[0])
+                        command = parts[1]
+                    except ValueError:
+                        pid = None
+
+                if pid is None:
+                    aux_parts = stripped.split()
+                    if len(aux_parts) > 10 and aux_parts[1].isdigit():
+                        pid = int(aux_parts[1])
+                        command = " ".join(aux_parts[10:])
+
+                if pid is None:
+                    continue
+                if any(pattern in command for pattern in patterns) and (
+                    all_profiles or _matches_current_profile(command)
+                ):
+                    _append_unique_pid(pids, pid, exclude_pids)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+
+    return pids
+
+
+def find_gateway_pids(exclude_pids: set | None = None, all_profiles: bool = False) -> list:
+    """Find PIDs of running gateway processes.
+
+    Args:
+        exclude_pids: PIDs to exclude from the result (e.g. service-managed
+            PIDs that should not be killed during a stale-process sweep).
+        all_profiles: When ``True``, return gateway PIDs across **all**
+            profiles (the pre-7923 global behaviour).  ``ector update``
+            needs this because a code update affects every profile.
+            When ``False`` (default), only PIDs belonging to the current
+            Ector profile are returned.
+    """
+    _exclude = set(exclude_pids or set())
+    pids: list[int] = []
+    if not all_profiles:
+        try:
+            from gateway.status import get_running_pid
+
+            _append_unique_pid(pids, get_running_pid(), _exclude)
+        except Exception:
+            pass
+    for pid in _get_service_pids():
+        _append_unique_pid(pids, pid, _exclude)
+    for pid in _scan_gateway_pids(_exclude, all_profiles=all_profiles):
+        _append_unique_pid(pids, pid, _exclude)
+    return pids
+
+
+def _probe_systemd_service_running(system: bool = False) -> tuple[bool, bool]:
+    selected_system = _select_systemd_scope(system)
+    unit_exists = get_systemd_unit_path(system=selected_system).exists()
+    if not unit_exists:
+        return selected_system, False
+    try:
+        result = _run_systemctl(
+            ["is-active", get_service_name()],
+            system=selected_system,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (RuntimeError, subprocess.TimeoutExpired):
+        return selected_system, False
+    return selected_system, result.stdout.strip() == "active"
+
+
+def _read_systemd_unit_properties(
+    system: bool = False,
+    properties: tuple[str, ...] = (
+        "ActiveState",
+        "SubState",
+        "Result",
+        "ExecMainStatus",
+    ),
+) -> dict[str, str]:
+    """Return selected ``systemctl show`` properties for the gateway unit."""
+    selected_system = _select_systemd_scope(system)
+    try:
+        result = _run_systemctl(
+            [
+                "show",
+                get_service_name(),
+                "--no-pager",
+                "--property",
+                ",".join(properties),
+            ],
+            system=selected_system,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (RuntimeError, subprocess.TimeoutExpired, OSError):
+        return {}
+
+    if result.returncode != 0:
+        return {}
+
+    parsed: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        parsed[key] = value.strip()
+    return parsed
+
+
+def _wait_for_systemd_service_restart(
+    *,
+    system: bool = False,
+    previous_pid: int | None = None,
+    timeout: float = 60.0,
+) -> bool:
+    """Wait for the gateway service to become active after a restart handoff."""
+    import time
+
+    svc = get_service_name()
+    scope_label = _service_scope_label(system).capitalize()
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        props = _read_systemd_unit_properties(system=system)
+        active_state = props.get("ActiveState", "")
+        sub_state = props.get("SubState", "")
+        new_pid = None
+        try:
+            from gateway.status import get_running_pid
+
+            new_pid = get_running_pid()
+        except Exception:
+            new_pid = None
+
+        if active_state == "active":
+            if new_pid and (previous_pid is None or new_pid != previous_pid):
+                print(f"✔ Serviço {scope_label} reiniciado (PID {new_pid})")
+                return True
+            if previous_pid is None:
+                print(f"✔ Serviço {scope_label} reiniciado")
+                return True
+
+        if active_state == "activating" and sub_state == "auto-restart":
+            time.sleep(1)
+            continue
+
+        time.sleep(2)
+
+    print(
+        f"▲ O serviço {scope_label} não se tornou ativo em {int(timeout)}s.\n"
+        f"  Verifique o status: {'sudo ' if system else ''}ector gateway status\n"
+        f"  Verifique os logs:   journalctl {'--user ' if not system else ''}-u {svc} -l --since '2 min ago'"
+    )
+    return False
+
+
+def _recover_pending_systemd_restart(system: bool = False, previous_pid: int | None = None) -> bool:
+    """Recover a planned service restart that is stuck in systemd state."""
+    props = _read_systemd_unit_properties(system=system)
+    if not props:
+        return False
+
+    try:
+        from gateway.status import read_runtime_status
+    except Exception:
+        return False
+
+    runtime_state = read_runtime_status() or {}
+    if not runtime_state.get("restart_requested"):
+        return False
+
+    active_state = props.get("ActiveState", "")
+    sub_state = props.get("SubState", "")
+    exec_main_status = props.get("ExecMainStatus", "")
+    result = props.get("Result", "")
+
+    if active_state == "activating" and sub_state == "auto-restart":
+        print("⏳ Reinicialização do serviço já pendente — aguardando relançamento pelo systemd...")
+        return _wait_for_systemd_service_restart(
+            system=system,
+            previous_pid=previous_pid,
+        )
+
+    if active_state == "failed" and (
+        exec_main_status == str(GATEWAY_SERVICE_RESTART_EXIT_CODE)
+        or result == "exit-code"
+    ):
+        svc = get_service_name()
+        scope_label = _service_scope_label(system).capitalize()
+        print(f"↻ Limpando estado de falha para reinicialização pendente do serviço {scope_label.lower()}...")
+        _run_systemctl(
+            ["reset-failed", svc],
+            system=system,
+            check=False,
+            timeout=30,
+        )
+        _run_systemctl(
+            ["start", svc],
+            system=system,
+            check=False,
+            timeout=90,
+        )
+        return _wait_for_systemd_service_restart(
+            system=system,
+            previous_pid=previous_pid,
+        )
+
+    return False
+
+
+def _probe_launchd_service_running() -> bool:
+    if not get_launchd_plist_path().exists():
+        return False
+    try:
+        result = subprocess.run(
+            ["launchctl", "list", get_launchd_label()],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired:
+        return False
+    return result.returncode == 0
+
+
+def get_gateway_runtime_snapshot(system: bool = False) -> GatewayRuntimeSnapshot:
+    """Return a unified view of gateway liveness for the current profile."""
+    gateway_pids = tuple(find_gateway_pids())
+    if is_termux():
+        return GatewayRuntimeSnapshot(
+            manager="Termux / processo manual",
+            gateway_pids=gateway_pids,
+        )
+
+    from ector_constants import is_container
+
+    if is_linux() and is_container():
+        return GatewayRuntimeSnapshot(
+            manager="docker (primeiro plano)",
+            gateway_pids=gateway_pids,
+        )
+
+    if supports_systemd_services():
+        selected_system, service_running = _probe_systemd_service_running(system=system)
+        scope_label = _service_scope_label(selected_system)
+        return GatewayRuntimeSnapshot(
+            manager=f"systemd ({scope_label})",
+            service_installed=get_systemd_unit_path(system=selected_system).exists(),
+            service_running=service_running,
+            gateway_pids=gateway_pids,
+            service_scope=scope_label,
+        )
+
+    if is_macos():
+        return GatewayRuntimeSnapshot(
+            manager="launchd",
+            service_installed=get_launchd_plist_path().exists(),
+            service_running=_probe_launchd_service_running(),
+            gateway_pids=gateway_pids,
+            service_scope="launchd",
+        )
+
+    return GatewayRuntimeSnapshot(
+        manager="processo manual",
+        gateway_pids=gateway_pids,
+    )
+
+
+def _format_gateway_pids(pids: tuple[int, ...] | list[int], *, limit: int | None = 3) -> str:
+    rendered = [str(pid) for pid in pids[:limit] if pid > 0] if limit is not None else [str(pid) for pid in pids if pid > 0]
+    if limit is not None and len(pids) > limit:
+        rendered.append("...")
+    return ", ".join(rendered)
+
+
+def _print_gateway_process_mismatch(snapshot: GatewayRuntimeSnapshot) -> None:
+    if not snapshot.has_process_service_mismatch:
+        return
+    print()
+    print("▲ O processo do Gateway está rodando para este perfil, mas o serviço não está ativo")
+    print(f"  PID(s): {_format_gateway_pids(snapshot.gateway_pids, limit=None)}")
+    print("  Isso geralmente é uma execução manual (foreground/tmux/nohup), então o `ector gateway` ")
+    print("  pode se recusar a iniciar outra cópia até que este processo pare.")
+
+
+def kill_gateway_processes(force: bool = False, exclude_pids: set | None = None,
+                           all_profiles: bool = False) -> int:
+    """Kill any running gateway processes. Returns count killed.
+
+    Args:
+        force: Use the platform's force-kill mechanism instead of graceful terminate.
+        exclude_pids: PIDs to skip (e.g. service-managed PIDs that were just
+            restarted and should not be killed).
+        all_profiles: When ``True``, kill across all profiles.  Passed
+            through to :func:`find_gateway_pids`.
+    """
+    pids = find_gateway_pids(exclude_pids=exclude_pids, all_profiles=all_profiles)
+    killed = 0
+    
+    for pid in pids:
+        try:
+            terminate_pid(pid, force=force)
+            killed += 1
+        except ProcessLookupError:
+            # Process already gone
+            pass
+        except PermissionError:
+            print(f"▲ Permissão negada para encerrar o PID {pid}")
+    
+        except OSError as exc:
+            print(f"Falha ao encerrar o PID {pid}: {exc}")
+    return killed
+
+
+def stop_profile_gateway() -> bool:
+    """Stop only the gateway for the current profile (ECTOR_HOME-scoped).
+
+    Uses the PID file written by start_gateway(), so it only kills the
+    gateway belonging to this profile — not gateways from other profiles.
+    Returns True if a process was stopped, False if none was found.
+    """
+    try:
+        from gateway.status import get_running_pid, remove_pid_file
+    except ImportError:
+        return False
+
+    pid = get_running_pid()
+    if pid is None:
+        return False
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass  # Already gone
+    except PermissionError:
+        print(f"▲ Permissão negada para encerrar o PID {pid}")
+        return False
+
+    # Wait briefly for it to exit
+    import time as _time
+    for _ in range(20):
+        try:
+            os.kill(pid, 0)
+            _time.sleep(0.5)
+        except (ProcessLookupError, PermissionError):
+            break
+
+    if get_running_pid() is None:
+        remove_pid_file()
+    return True
+
+
+def is_linux() -> bool:
+    return sys.platform.startswith('linux')
+
+
+from ector_constants import is_container, is_termux, is_wsl
+
+
+def _wsl_systemd_operational() -> bool:
+    """Check if systemd is actually running as PID 1 on WSL.
+
+    WSL2 with ``systemd=true`` in wsl.conf has working systemd.
+    WSL2 without it (or WSL1) does not — systemctl commands fail.
+    """
+    return _systemd_operational(system=True)
+
+
+def _systemd_operational(system: bool = False) -> bool:
+    """Return True when the requested systemd scope is usable."""
+    try:
+        result = _run_systemctl(
+            ["is-system-running"],
+            system=system,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        # "running", "degraded", "starting" all mean systemd is PID 1
+        status = result.stdout.strip().lower()
+        return status in ("running", "degraded", "starting", "initializing")
+    except (RuntimeError, subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def _container_systemd_operational() -> bool:
+    """Return True when a container exposes working user or system systemd."""
+    if _systemd_operational(system=False):
+        return True
+    if _systemd_operational(system=True):
+        return True
+    return False
+
+
+def supports_systemd_services() -> bool:
+    if not is_linux() or is_termux():
+        return False
+    if shutil.which("systemctl") is None:
+        return False
+    if is_wsl():
+        return _wsl_systemd_operational()
+    if is_container():
+        return _container_systemd_operational()
+    return True
+
+
+def is_macos() -> bool:
+    return sys.platform == 'darwin'
+
+def is_windows() -> bool:
+    return sys.platform == 'win32'
+
+
+# =============================================================================
+# Service Configuration
+# =============================================================================
+
+_SERVICE_BASE = "ector-gateway"
+SERVICE_DESCRIPTION = "Ector Agent Gateway - Integração com Plataformas de Mensagens"
+
+
+def _profile_suffix() -> str:
+    """Derive a service-name suffix from the current ECTOR_HOME.
+
+    Returns ``""`` for the default root, the profile name for
+    ``<root>/profiles/<name>``, or a short hash for any other path.
+    Works correctly in Docker (ECTOR_HOME=/opt/data) and standard deployments.
+    """
+    import hashlib
+    import re
+    from ector_constants import get_default_ector_root
+    home = get_ector_home().resolve()
+    default = get_default_ector_root().resolve()
+    if home == default:
+        return ""
+    # Detect <root>/profiles/<name> pattern → use the profile name
+    profiles_root = (default / "profiles").resolve()
+    try:
+        rel = home.relative_to(profiles_root)
+        parts = rel.parts
+        if len(parts) == 1 and re.match(r"^[a-z0-9][a-z0-9_-]{0,63}$", parts[0]):
+            return parts[0]
+    except ValueError:
+        pass
+    # Fallback: short hash for arbitrary ECTOR_HOME paths
+    return hashlib.sha256(str(home).encode()).hexdigest()[:8]
+
+
+def _profile_arg(ector_home: str | None = None) -> str:
+    """Return ``--profile <name>`` only when ECTOR_HOME is a named profile.
+
+    For ``~/.ector/profiles/<name>``, returns ``"--profile <name>"``.
+    For the default profile or hash-based custom paths, returns the empty string.
+
+    Args:
+        ector_home: Optional explicit ECTOR_HOME path. Defaults to the current
+            ``get_ector_home()`` value. Should be passed when generating a
+            service definition for a different user (e.g. system service).
+    """
+    import re
+    from ector_constants import get_default_ector_root
+    home = Path(ector_home or str(get_ector_home())).resolve()
+    default = get_default_ector_root().resolve()
+    if home == default:
+        return ""
+    profiles_root = (default / "profiles").resolve()
+    try:
+        rel = home.relative_to(profiles_root)
+        parts = rel.parts
+        if len(parts) == 1 and re.match(r"^[a-z0-9][a-z0-9_-]{0,63}$", parts[0]):
+            return f"--profile {parts[0]}"
+    except ValueError:
+        pass
+    return ""
+
+
+def get_service_name() -> str:
+    """Derive a systemd service name scoped to this ECTOR_HOME.
+
+    Default ``~/.ector`` returns ``ector-gateway`` (backward compatible).
+    Profile ``~/.ector/profiles/coder`` returns ``ector-gateway-coder``.
+    Any other ECTOR_HOME appends a short hash for uniqueness.
+    """
+    suffix = _profile_suffix()
+    if not suffix:
+        return _SERVICE_BASE
+    return f"{_SERVICE_BASE}-{suffix}"
+
+
+
+def get_systemd_unit_path(system: bool = False) -> Path:
+    name = get_service_name()
+    if system:
+        return Path("/etc/systemd/system") / f"{name}.service"
+    return Path.home() / ".config" / "systemd" / "user" / f"{name}.service"
+
+
+class UserSystemdUnavailableError(RuntimeError):
+    """Raised when ``systemctl --user`` cannot reach the user D-Bus session.
+
+    Typically hit on fresh RHEL/Debian SSH sessions where linger is disabled
+    and no user@.service is running, so ``/run/user/$UID/bus`` never exists.
+    Carries a user-facing remediation message in ``args[0]``.
+    """
+
+
+def _user_dbus_socket_path() -> Path:
+    """Return the expected per-user D-Bus socket path (regardless of existence)."""
+    xdg = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    return Path(xdg) / "bus"
+
+
+def _ensure_user_systemd_env() -> None:
+    """Ensure DBUS_SESSION_BUS_ADDRESS and XDG_RUNTIME_DIR are set for systemctl --user.
+
+    On headless servers (SSH sessions), these env vars may be missing even when
+    the user's systemd instance is running (via linger).  Without them,
+    ``systemctl --user`` fails with "Failed to connect to bus: No medium found".
+    We detect the standard socket path and set the vars so all subsequent
+    subprocess calls inherit them.
+    """
+    uid = os.getuid()
+    if "XDG_RUNTIME_DIR" not in os.environ:
+        runtime_dir = f"/run/user/{uid}"
+        if Path(runtime_dir).exists():
+            os.environ["XDG_RUNTIME_DIR"] = runtime_dir
+
+    if "DBUS_SESSION_BUS_ADDRESS" not in os.environ:
+        xdg_runtime = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{uid}")
+        bus_path = Path(xdg_runtime) / "bus"
+        if bus_path.exists():
+            os.environ["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus_path}"
+
+
+def _wait_for_user_dbus_socket(timeout: float = 3.0) -> bool:
+    """Poll for the user D-Bus socket to appear, up to ``timeout`` seconds.
+
+    Linger-enabled user@.service can take a second or two to spawn the socket
+    after ``loginctl enable-linger`` runs.  Returns True once the socket exists.
+    """
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _user_dbus_socket_path().exists():
+            _ensure_user_systemd_env()
+            return True
+        time.sleep(0.2)
+    return _user_dbus_socket_path().exists()
+
+
+def _preflight_user_systemd(*, auto_enable_linger: bool = True) -> None:
+    """Ensure ``systemctl --user`` will reach the user D-Bus session bus.
+
+    No-op when the bus socket is already there (the common case on desktops
+    and linger-enabled servers).  On fresh SSH sessions where the socket is
+    missing:
+
+    * If linger is already enabled, wait briefly for user@.service to spawn
+      the socket.
+    * If linger is disabled and ``auto_enable_linger`` is True, try
+      ``loginctl enable-linger $USER`` (works as non-root when polkit permits
+      it, otherwise needs sudo).
+    * If the socket is still missing afterwards, raise
+      :class:`UserSystemdUnavailableError` with a precise remediation message.
+
+    Callers should treat the exception as a terminal condition for user-scope
+    systemd operations and surface the message to the user.
+    """
+    _ensure_user_systemd_env()
+    bus_path = _user_dbus_socket_path()
+    if bus_path.exists():
+        return
+
+    import getpass
+
+    username = getpass.getuser()
+    linger_enabled, linger_detail = get_systemd_linger_status()
+
+    if linger_enabled is True:
+        if _wait_for_user_dbus_socket(timeout=3.0):
+            return
+        # Linger is on but socket still missing — unusual; fall through to error.
+        _raise_user_systemd_unavailable(
+            username,
+            reason="O socket D-Bus do usuário está ausente, embora o linger esteja habilitado.",
+            fix_hint=(
+                f"  systemctl start user@{os.getuid()}.service\n"
+                "  (pode exigir sudo; tente novamente após o comando ser bem-sucedido)"
+            ),
+        )
+
+    if auto_enable_linger and shutil.which("loginctl"):
+        try:
+            result = subprocess.run(
+                ["loginctl", "enable-linger", username],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+        except Exception as exc:
+            _raise_user_systemd_unavailable(
+                username,
+                reason=f"falha ao habilitar linger via loginctl ({exc}).",
+                fix_hint=f"  sudo loginctl enable-linger {username}",
+            )
+        else:
+            if result.returncode == 0:
+                if _wait_for_user_dbus_socket(timeout=5.0):
+                    print(f"✔ Linger habilitado para {username} — D-Bus do usuário agora disponível")
+                    return
+                # enable-linger succeeded but the socket never appeared.
+                _raise_user_systemd_unavailable(
+                    username,
+                    reason="O linger foi habilitado, mas o socket D-Bus do usuário não apareceu.",
+                    fix_hint=(
+                        "  Saia e entre novamente na sessão, então execute o comando novamente.\n"
+                        f"  Ou reinicie e execute: systemctl --user start {get_service_name()}"
+                    ),
+                )
+            detail = (result.stderr or result.stdout or f"exit {result.returncode}").strip()
+            _raise_user_systemd_unavailable(
+                username,
+                reason=f"loginctl enable-linger foi negado: {detail}",
+                fix_hint=f"  sudo loginctl enable-linger {username}",
+            )
+
+    _raise_user_systemd_unavailable(
+        username,
+        reason=(
+            "A sessão D-Bus do usuário não está disponível "
+            f"({linger_detail or 'linger desabilitado'})."
+        ),
+        fix_hint=f"  sudo loginctl enable-linger {username}",
+    )
+
+
+def _raise_user_systemd_unavailable(username: str, *, reason: str, fix_hint: str) -> None:
+    """Build a user-facing error message and raise UserSystemdUnavailableError."""
+    msg = (
+        f"{reason}\n"
+        "  systemctl --user não consegue alcançar a sessão D-Bus do usuário neste shell.\n"
+        "\n"
+        "  Para corrigir:\n"
+        f"{fix_hint}\n"
+        "\n"
+        "  Alternativa: execute o gateway em primeiro plano (permanece ativo até você\n"
+        "  sair / fechar o terminal):\n"
+        "    ector gateway run"
+    )
+    raise UserSystemdUnavailableError(msg)
+
+
+def _systemctl_cmd(system: bool = False) -> list[str]:
+    if not system:
+        _ensure_user_systemd_env()
+    return ["systemctl"] if system else ["systemctl", "--user"]
+
+
+def _journalctl_cmd(system: bool = False) -> list[str]:
+    return ["journalctl"] if system else ["journalctl", "--user"]
+
+
+def _run_systemctl(args: list[str], *, system: bool = False, **kwargs) -> subprocess.CompletedProcess:
+    """Run a systemctl command, raising RuntimeError if systemctl is missing.
+
+    Defense-in-depth: callers are gated by ``supports_systemd_services()``,
+    but this ensures any future caller that bypasses the gate still gets a
+    clear error instead of a raw ``FileNotFoundError`` traceback.
+    """
+    try:
+        return subprocess.run(_systemctl_cmd(system) + args, **kwargs)
+    except FileNotFoundError:
+        raise RuntimeError(
+            "systemctl não está disponível neste sistema"
+        ) from None
+
+
+def _service_scope_label(system: bool = False) -> str:
+    return "do sistema" if system else "do usuário"
+
+
+def get_installed_systemd_scopes() -> list[str]:
+    scopes = []
+    seen_paths: set[Path] = set()
+    for system, label in ((False, "do usuário"), (True, "do sistema")):
+        unit_path = get_systemd_unit_path(system=system)
+        if unit_path in seen_paths:
+            continue
+        if unit_path.exists():
+            scopes.append(label)
+            seen_paths.add(unit_path)
+    return scopes
+
+
+def has_conflicting_systemd_units() -> bool:
+    return len(get_installed_systemd_scopes()) > 1
+
+
+# Legacy service names from older Ector installs that predate the
+# ector-gateway rename. Kept as an explicit allowlist (NOT a glob) so
+# profile units (ector-gateway-*.service) and unrelated third-party
+# "ector" units are never matched.
+_LEGACY_SERVICE_NAMES: tuple[str, ...] = ("ector.service",)
+
+# ExecStart content markers that identify a unit as running our gateway.
+# A legacy unit is only flagged when its file contains one of these.
+_LEGACY_UNIT_EXECSTART_MARKERS: tuple[str, ...] = (
+    "ector_cli.main gateway",
+    "ector_cli/main.py gateway",
+    "gateway/run.py",
+    " ector gateway ",
+    "/ector gateway ",
+)
+
+
+def _legacy_unit_search_paths() -> list[tuple[bool, Path]]:
+    """Return ``[(is_system, base_dir), ...]`` — directories to scan for legacy units.
+
+    Factored out so tests can monkeypatch the search roots without touching
+    real filesystem paths.
+    """
+    return [
+        (False, Path.home() / ".config" / "systemd" / "user"),
+        (True, Path("/etc/systemd/system")),
+    ]
+
+
+def _find_legacy_ector_units() -> list[tuple[str, Path, bool]]:
+    """Return ``[(unit_name, unit_path, is_system)]`` for legacy Ector gateway units.
+
+    Detects unit files installed by older Ector versions that used a
+    different service name (e.g. ``ector.service`` before the rename to
+    ``ector-gateway.service``). When both a legacy unit and the current
+    ``ector-gateway.service`` are active, they fight over the same bot
+    token — the PR #5646 signal-recovery change turns this into a 30-second
+    SIGTERM flap loop.
+
+    Safety guards:
+
+    * Explicit allowlist of legacy names (no globbing). Profile units such
+      as ``ector-gateway-coder.service`` and unrelated third-party
+      ``ector-*`` services are never matched.
+    * ExecStart content check — only flag units that invoke our gateway
+      entrypoint. A user-created ``ector.service`` running an unrelated
+      binary is left untouched.
+    * Results are returned purely for caller inspection; this function
+      never mutates or removes anything.
+    """
+    results: list[tuple[str, Path, bool]] = []
+    for is_system, base in _legacy_unit_search_paths():
+        for name in _LEGACY_SERVICE_NAMES:
+            unit_path = base / name
+            try:
+                if not unit_path.exists():
+                    continue
+                text = unit_path.read_text(encoding="utf-8", errors="ignore")
+            except (OSError, PermissionError):
+                continue
+            if not any(marker in text for marker in _LEGACY_UNIT_EXECSTART_MARKERS):
+                # Not our gateway — leave alone
+                continue
+            results.append((name, unit_path, is_system))
+    return results
+
+
+def has_legacy_ector_units() -> bool:
+    """Return True when any legacy Ector gateway unit files exist."""
+    return bool(_find_legacy_ector_units())
+
+
+def print_legacy_unit_warning() -> None:
+    """Warn about legacy Ector gateway unit files if any are installed.
+
+    Idempotent: prints nothing when no legacy units are detected. Safe to
+    call from any status/install/setup path.
+    """
+    legacy = _find_legacy_ector_units()
+    if not legacy:
+        return
+    print_warning("Legacy Ector gateway unit(s) detected from an older install:")
+    for name, path, is_system in legacy:
+        scope = "system" if is_system else "user"
+        print_info(f"    {path}  ({scope} scope)")
+    print_info("  These run alongside the current ector-gateway service and")
+    print_info("  cause SIGTERM flap loops — both try to use the same bot token.")
+    print_info("  Remove them with:")
+    print_info("    ector gateway migrate-legacy")
+
+
+def remove_legacy_ector_units(
+    interactive: bool = True,
+    dry_run: bool = False,
+) -> tuple[int, list[Path]]:
+    """Stop, disable, and remove legacy Ector gateway unit files.
+
+    Iterates over whatever ``_find_legacy_ector_units()`` returns — which is
+    an explicit allowlist of legacy names (not a glob). Profile units and
+    unrelated third-party services are never touched.
+
+    Args:
+        interactive: When True, prompt before removing. When False, remove
+            without asking (used when another prompt has already confirmed,
+            e.g. from the install flow).
+        dry_run: When True, list what would be removed and return.
+
+    Returns:
+        ``(removed_count, remaining_paths)`` — remaining includes units we
+        couldn't remove (typically system-scope when not running as root).
+    """
+    legacy = _find_legacy_ector_units()
+    if not legacy:
+        print("No legacy Ector gateway units found.")
+        return 0, []
+
+    user_units = [(n, p) for n, p, is_sys in legacy if not is_sys]
+    system_units = [(n, p) for n, p, is_sys in legacy if is_sys]
+
+    print()
+    print("Legacy Ector gateway unit(s) found:")
+    for name, path, is_system in legacy:
+        scope = "system" if is_system else "user"
+        print(f"  {path}  ({scope} scope)")
+    print()
+
+    if dry_run:
+        print("(dry-run — nothing removed)")
+        return 0, [p for _, p, _ in legacy]
+
+    if interactive and not prompt_yes_no("Remove these legacy units?", True):
+        print("Skipped. Run again with: ector gateway migrate-legacy")
+        return 0, [p for _, p, _ in legacy]
+
+    removed = 0
+    remaining: list[Path] = []
+
+    # User-scope removal
+    for name, path in user_units:
+        try:
+            _run_systemctl(["stop", name], system=False, check=False, timeout=90)
+            _run_systemctl(["disable", name], system=False, check=False, timeout=30)
+            path.unlink(missing_ok=True)
+            print(f"  ✔ Removed {path}")
+            removed += 1
+        except (OSError, RuntimeError) as e:
+            print(f"  ▲ Could not remove {path}: {e}")
+            remaining.append(path)
+
+    if user_units:
+        try:
+            _run_systemctl(["daemon-reload"], system=False, check=False, timeout=30)
+        except RuntimeError:
+            pass
+
+    # System-scope removal (needs root)
+    if system_units:
+        if os.geteuid() != 0:
+            print()
+            print_warning("System-scope legacy units require root to remove.")
+            print_info("  Re-run with: sudo ector gateway migrate-legacy")
+            for _, path in system_units:
+                remaining.append(path)
+        else:
+            for name, path in system_units:
+                try:
+                    _run_systemctl(["stop", name], system=True, check=False, timeout=90)
+                    _run_systemctl(["disable", name], system=True, check=False, timeout=30)
+                    path.unlink(missing_ok=True)
+                    print(f"  ✔ Removed {path}")
+                    removed += 1
+                except (OSError, RuntimeError) as e:
+                    print(f"  ▲ Could not remove {path}: {e}")
+                    remaining.append(path)
+
+            try:
+                _run_systemctl(["daemon-reload"], system=True, check=False, timeout=30)
+            except RuntimeError:
+                pass
+
+    print()
+    if remaining:
+        print_warning(f"{len(remaining)} legacy unit(s) still present — see messages above.")
+    else:
+        print_success(f"Removed {removed} legacy unit(s).")
+
+    return removed, remaining
+
+
+def print_systemd_scope_conflict_warning() -> None:
+    scopes = get_installed_systemd_scopes()
+    if len(scopes) < 2:
+        return
+
+    rendered_scopes = " + ".join(scopes)
+    print_warning(f"Both user and system gateway services are installed ({rendered_scopes}).")
+    print_info("  This is confusing and can make start/stop/status behavior ambiguous.")
+    print_info("  Default gateway commands target the user service unless you pass --system.")
+    print_info("  Keep one of these:")
+    print_info("    ector gateway uninstall")
+    print_info("    sudo ector gateway uninstall --system")
+
+
+def _require_root_for_system_service(action: str) -> None:
+    if os.geteuid() != 0:
+        print(f"System gateway {action} requires root. Re-run with sudo.")
+        sys.exit(1)
+
+
+def _system_service_identity(run_as_user: str | None = None) -> tuple[str, str, str]:
+    import getpass
+    import grp
+    import pwd
+
+    username = (run_as_user or os.getenv("SUDO_USER") or os.getenv("USER") or os.getenv("LOGNAME") or getpass.getuser()).strip()
+    if not username:
+        raise ValueError("Could not determine which user the gateway service should run as")
+    if username == "root" and not run_as_user:
+        raise ValueError("Refusing to install the gateway system service as root; pass --run-as-user root to override (e.g. in LXC containers)")
+    if username == "root":
+        print_warning("Installing gateway service to run as root.")
+        print_info("  This is fine for LXC/container environments but not recommended on bare-metal hosts.")
+
+    try:
+        user_info = pwd.getpwnam(username)
+    except KeyError as e:
+        raise ValueError(f"Unknown user: {username}") from e
+
+    group_name = grp.getgrgid(user_info.pw_gid).gr_name
+    return username, group_name, user_info.pw_dir
+
+
+def _read_systemd_user_from_unit(unit_path: Path) -> str | None:
+    if not unit_path.exists():
+        return None
+
+    for line in unit_path.read_text(encoding="utf-8").splitlines():
+        if line.startswith("User="):
+            value = line.split("=", 1)[1].strip()
+            return value or None
+    return None
+
+
+def _default_system_service_user() -> str | None:
+    for candidate in (os.getenv("SUDO_USER"), os.getenv("USER"), os.getenv("LOGNAME")):
+        if candidate and candidate.strip() and candidate.strip() != "root":
+            return candidate.strip()
+    return None
+
+
+def prompt_linux_gateway_install_scope() -> str | None:
+    choice = prompt_choice(
+        "  Choose how the gateway should run in the background:",
+        [
+            "User service (no sudo; best for laptops/dev boxes; may need linger after logout)",
+            "System service (starts on boot; requires sudo; still runs as your user)",
+            "Skip service install for now",
+        ],
+        default=0,
+    )
+    return {0: "user", 1: "system", 2: None}[choice]
+
+
+def install_linux_gateway_from_setup(force: bool = False) -> tuple[str | None, bool]:
+    scope = prompt_linux_gateway_install_scope()
+    if scope is None:
+        return None, False
+
+    if scope == "system":
+        run_as_user = _default_system_service_user()
+        if os.geteuid() != 0:
+            print_warning("  System service install requires sudo, so Ector can't create it from this user session.")
+            if run_as_user:
+                print_info(f"  After setup, run: sudo ector gateway install --system --run-as-user {run_as_user}")
+            else:
+                print_info("  After setup, run: sudo ector gateway install --system --run-as-user <your-user>")
+            print_info("  Then start it with: sudo ector gateway start --system")
+            return scope, False
+
+        if not run_as_user:
+            while True:
+                run_as_user = prompt("  Run the system gateway service as which user?", default="")
+                run_as_user = (run_as_user or "").strip()
+                if run_as_user:
+                    break
+                print_error("  Enter a username.")
+
+        systemd_install(force=force, system=True, run_as_user=run_as_user)
+        return scope, True
+
+    systemd_install(force=force, system=False)
+    return scope, True
+
+
+def get_systemd_linger_status() -> tuple[bool | None, str]:
+    """Return systemd linger status for the current user.
+
+    Returns:
+        (True, "") when linger is enabled.
+        (False, "") when linger is disabled.
+        (None, detail) when the status could not be determined.
+    """
+    if is_termux():
+        return None, "not supported in Termux"
+    if not is_linux():
+        return None, "not supported on this platform"
+
+    if not shutil.which("loginctl"):
+        return None, "loginctl not found"
+
+    username = os.getenv("USER") or os.getenv("LOGNAME")
+    if not username:
+        try:
+            import pwd
+            username = pwd.getpwuid(os.getuid()).pw_name
+        except Exception:
+            return None, "could not determine current user"
+
+    try:
+        result = subprocess.run(
+            ["loginctl", "show-user", username, "--property=Linger", "--value"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except Exception as e:
+        return None, str(e)
+
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or f"exit {result.returncode}").strip()
+        return None, detail or "loginctl query failed"
+
+    value = (result.stdout or "").strip().lower()
+    if value in {"yes", "true", "1"}:
+        return True, ""
+    if value in {"no", "false", "0"}:
+        return False, ""
+
+    rendered = value or "<empty>"
+    return None, f"unexpected loginctl output: {rendered}"
+
+
+def print_systemd_linger_guidance() -> None:
+    """Print the current linger status and the fix when it is disabled."""
+    linger_enabled, linger_detail = get_systemd_linger_status()
+    if linger_enabled is True:
+        print("✔ Systemd linger is enabled (service survives logout)")
+    elif linger_enabled is False:
+        print("▲ Systemd linger is disabled (gateway may stop when you log out)")
+        print("  Run: sudo loginctl enable-linger $USER")
+    else:
+        print(f"▲ Could not verify systemd linger ({linger_detail})")
+        print("  If you want the gateway user service to survive logout, run:")
+        print("  sudo loginctl enable-linger $USER")
+
+def _launchd_user_home() -> Path:
+    """Return the real macOS user home for launchd artifacts.
+
+    Profile-mode Ector often sets ``HOME`` to a profile-scoped directory, but
+    launchd user agents still live under the actual account home.
+    """
+    import pwd
+
+    return Path(pwd.getpwuid(os.getuid()).pw_dir)
+
+
+def get_launchd_plist_path() -> Path:
+    """Return the launchd plist path, scoped per profile.
+
+    Default ``~/.ector`` → ``ai.ector.gateway.plist`` (backward compatible).
+    Profile ``~/.ector/profiles/coder`` → ``ai.ector.gateway-coder.plist``.
+    """
+    suffix = _profile_suffix()
+    name = f"ai.ector.gateway-{suffix}" if suffix else "ai.ector.gateway"
+    return _launchd_user_home() / "Library" / "LaunchAgents" / f"{name}.plist"
+
+def _detect_venv_dir() -> Path | None:
+    """Detect the active virtualenv directory.
+
+    Checks ``sys.prefix`` first (works regardless of the directory name),
+    then ``VIRTUAL_ENV`` env var (covers uv-managed environments where
+    sys.prefix == sys.base_prefix), then falls back to probing common
+    directory names under PROJECT_ROOT.
+    Returns ``None`` when no virtualenv can be found.
+    """
+    # If we're running inside a virtualenv, sys.prefix points to it.
+    if sys.prefix != sys.base_prefix:
+        venv = Path(sys.prefix)
+        if venv.is_dir():
+            return venv
+
+    # uv and some other tools set VIRTUAL_ENV without changing sys.prefix.
+    # This catches `uv run` where sys.prefix == sys.base_prefix but the
+    # environment IS a venv.  (#8620)
+    _virtual_env = os.environ.get("VIRTUAL_ENV")
+    if _virtual_env:
+        venv = Path(_virtual_env)
+        if venv.is_dir():
+            return venv
+
+    # Fallback: check common virtualenv directory names under the project root.
+    for candidate in (".venv", "venv"):
+        venv = PROJECT_ROOT / candidate
+        if venv.is_dir():
+            return venv
+
+    return None
+
+
+def get_python_path() -> str:
+    venv = _detect_venv_dir()
+    if venv is not None:
+        if is_windows():
+            venv_python = venv / "Scripts" / "python.exe"
+        else:
+            venv_python = venv / "bin" / "python"
+        if venv_python.exists():
+            return str(venv_python)
+    return sys.executable
+
+
+# =============================================================================
+# Systemd (Linux)
+# =============================================================================
+
+def _build_user_local_paths(home: Path, path_entries: list[str]) -> list[str]:
+    """Return user-local bin dirs that exist and aren't already in *path_entries*."""
+    candidates = [
+        str(home / ".local" / "bin"),       # uv, uvx, pip-installed CLIs
+        str(home / ".cargo" / "bin"),        # Rust/cargo tools
+        str(home / "go" / "bin"),            # Go tools
+        str(home / ".npm-global" / "bin"),   # npm global packages
+    ]
+    return [p for p in candidates if p not in path_entries and Path(p).exists()]
+
+
+def _remap_path_for_user(path: str, target_home_dir: str) -> str:
+    """Remap *path* from the current user's home to *target_home_dir*.
+
+    If *path* lives under ``Path.home()`` the corresponding prefix is swapped
+    to *target_home_dir*; otherwise the path is returned unchanged.
+
+      /root/.ector/ector-agent  -> /home/alice/.ector/ector-agent
+      /opt/ector                 -> /opt/ector  (kept as-is)
+
+    Note: this function intentionally does NOT resolve symlinks. A venv's
+    ``bin/python`` is typically a symlink to the base interpreter (e.g. a
+    uv-managed CPython at ``~/.local/share/uv/python/.../python3.11``);
+    resolving that symlink swaps the unit's ``ExecStart`` to a bare Python
+    that has none of the venv's site-packages, so the service crashes on
+    the first ``import``. Keep the symlinked path so the venv activates
+    its own environment. Lexical expansion only via ``expanduser``.
+    """
+    current_home = Path.home()
+    p = Path(path).expanduser()
+    try:
+        relative = p.relative_to(current_home)
+        return str(Path(target_home_dir) / relative)
+    except ValueError:
+        return str(p)
+
+
+def _ector_home_for_target_user(target_home_dir: str) -> str:
+    """Remap the current ECTOR_HOME to the equivalent under a target user's home.
+
+    When installing a system service via sudo, get_ector_home() resolves to
+    root's home.  This translates it to the target user's equivalent path:
+      /root/.ector                    → /home/alice/.ector
+      /root/.ector/profiles/coder     → /home/alice/.ector/profiles/coder
+      /opt/custom-ector               → /opt/custom-ector  (kept as-is)
+    """
+    current_ector_home = get_ector_home().resolve()
+    current_default = (Path.home() / ".ector").resolve()
+    target_default = Path(target_home_dir) / ".ector"
+
+    # Default ~/.ector → remap to target user's default
+    if current_ector_home == current_default:
+        return str(target_default)
+
+    # Profile or subdir of ~/.ector → preserve the relative structure
+    try:
+        relative = current_ector_home.relative_to(current_default)
+        return str(target_default / relative)
+    except ValueError:
+        # Completely custom path (not under ~/.ector) — keep as-is
+        return str(current_ector_home)
+
+
+def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) -> str:
+    python_path = get_python_path()
+    working_dir = str(PROJECT_ROOT)
+    detected_venv = _detect_venv_dir()
+    venv_dir = str(detected_venv) if detected_venv else str(PROJECT_ROOT / "venv")
+    venv_bin = str(detected_venv / "bin") if detected_venv else str(PROJECT_ROOT / "venv" / "bin")
+    node_bin = str(PROJECT_ROOT / "node_modules" / ".bin")
+
+    path_entries = [venv_bin, node_bin]
+    resolved_node = shutil.which("node")
+    if resolved_node:
+        resolved_node_dir = str(Path(resolved_node).resolve().parent)
+        if resolved_node_dir not in path_entries:
+            path_entries.append(resolved_node_dir)
+
+    common_bin_paths = ["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"]
+    # systemd's TimeoutStopSec must exceed the gateway's drain_timeout so
+    # there's budget left for post-interrupt cleanup (tool subprocess kill,
+    # adapter disconnect, session DB close) before systemd escalates to
+    # SIGKILL on the cgroup — otherwise bash/sleep tool-call children left
+    # by a force-interrupted agent get reaped by systemd instead of us
+    # (#8202). 30s of headroom covers the worst case we've observed.
+    _drain_timeout = int(_get_restart_drain_timeout() or 0)
+    restart_timeout = max(60, _drain_timeout) + 30
+
+    if system:
+        username, group_name, home_dir = _system_service_identity(run_as_user)
+        ector_home = _ector_home_for_target_user(home_dir)
+        profile_arg = _profile_arg(ector_home)
+        # Remap all paths that may resolve under the calling user's home
+        # (e.g. /root/) to the target user's home so the service can
+        # actually access them.
+        python_path = _remap_path_for_user(python_path, home_dir)
+        working_dir = _remap_path_for_user(working_dir, home_dir)
+        venv_dir = _remap_path_for_user(venv_dir, home_dir)
+        venv_bin = _remap_path_for_user(venv_bin, home_dir)
+        node_bin = _remap_path_for_user(node_bin, home_dir)
+        path_entries = [_remap_path_for_user(p, home_dir) for p in path_entries]
+        path_entries.extend(_build_user_local_paths(Path(home_dir), path_entries))
+        path_entries.extend(common_bin_paths)
+        sane_path = ":".join(path_entries)
+        return f"""[Unit]
+Description={SERVICE_DESCRIPTION}
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User={username}
+Group={group_name}
+ExecStart={python_path} -m ector_cli.main{f" {profile_arg}" if profile_arg else ""} gateway run --replace
+WorkingDirectory={working_dir}
+Environment="HOME={home_dir}"
+Environment="USER={username}"
+Environment="LOGNAME={username}"
+Environment="PATH={sane_path}"
+Environment="VIRTUAL_ENV={venv_dir}"
+Environment="ECTOR_HOME={ector_home}"
+Restart=on-failure
+RestartSec=30
+RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
+KillMode=mixed
+KillSignal=SIGTERM
+ExecReload=/bin/kill -USR1 $MAINPID
+TimeoutStopSec={restart_timeout}
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+    ector_home = str(get_ector_home().resolve())
+    profile_arg = _profile_arg(ector_home)
+    path_entries.extend(_build_user_local_paths(Path.home(), path_entries))
+    path_entries.extend(common_bin_paths)
+    sane_path = ":".join(path_entries)
+    return f"""[Unit]
+Description={SERVICE_DESCRIPTION}
+After=network.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart={python_path} -m ector_cli.main{f" {profile_arg}" if profile_arg else ""} gateway run --replace
+WorkingDirectory={working_dir}
+Environment="PATH={sane_path}"
+Environment="VIRTUAL_ENV={venv_dir}"
+Environment="ECTOR_HOME={ector_home}"
+Restart=on-failure
+RestartSec=30
+RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
+KillMode=mixed
+KillSignal=SIGTERM
+ExecReload=/bin/kill -USR1 $MAINPID
+TimeoutStopSec={restart_timeout}
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
+"""
+
+def _normalize_service_definition(text: str) -> str:
+    return "\n".join(line.rstrip() for line in text.strip().splitlines())
+
+
+def _normalize_launchd_plist_for_comparison(text: str) -> str:
+    """Normalize launchd plist text for staleness checks.
+
+    The generated plist intentionally captures a broad PATH assembled from the
+    invoking shell so user-installed tools remain reachable under launchd.
+    That makes raw text comparison unstable across shells, so ignore the PATH
+    payload when deciding whether the installed plist is stale.
+    """
+    import re
+
+    normalized = _normalize_service_definition(text)
+    return re.sub(
+        r'(<key>PATH</key>\s*<string>)(.*?)(</string>)',
+        r'\1__ECTOR_PATH__\3',
+        normalized,
+        flags=re.S,
+    )
+
+
+def systemd_unit_is_current(system: bool = False) -> bool:
+    unit_path = get_systemd_unit_path(system=system)
+    if not unit_path.exists():
+        return False
+
+    installed = unit_path.read_text(encoding="utf-8")
+    expected_user = _read_systemd_user_from_unit(unit_path) if system else None
+    expected = generate_systemd_unit(system=system, run_as_user=expected_user)
+    return _normalize_service_definition(installed) == _normalize_service_definition(expected)
+
+
+
+def refresh_systemd_unit_if_needed(system: bool = False) -> bool:
+    """Rewrite the installed systemd unit when the generated definition has changed."""
+    unit_path = get_systemd_unit_path(system=system)
+    if not unit_path.exists() or systemd_unit_is_current(system=system):
+        return False
+
+    expected_user = _read_systemd_user_from_unit(unit_path) if system else None
+    unit_path.write_text(generate_systemd_unit(system=system, run_as_user=expected_user), encoding="utf-8")
+    _run_systemctl(["daemon-reload"], system=system, check=True, timeout=30)
+    print(f"↻ Atualizada a definição do serviço {_service_scope_label(system)} do gateway para corresponder à instalação atual do Ector")
+    return True
+
+
+
+def _print_linger_enable_warning(username: str, detail: str | None = None) -> None:
+    print()
+    print("▲ Linger não habilitado — o gateway pode parar quando você fechar este terminal.")
+    if detail:
+        print(f"  Falha ao habilitar automaticamente: {detail}")
+    print()
+    print("  Em servidores sem interface gráfica (VPS, instâncias na nuvem) execute:")
+    print(f"    sudo loginctl enable-linger {username}")
+    print()
+    print("  Depois reinicie o gateway:")
+    print(f"    systemctl --user restart {get_service_name()}.service")
+    print()
+
+
+
+def _ensure_linger_enabled() -> None:
+    """Enable linger when possible so the user gateway survives logout."""
+    if is_termux() or not is_linux():
+        return
+
+    import getpass
+
+    username = getpass.getuser()
+    linger_file = Path(f"/var/lib/systemd/linger/{username}")
+    if linger_file.exists():
+        print("✔ O linger do Systemd está habilitado (o serviço sobrevive ao logout)")
+        return
+
+    linger_enabled, linger_detail = get_systemd_linger_status()
+    if linger_enabled is True:
+        print("✔ O linger do Systemd está habilitado (o serviço sobrevive ao logout)")
+        return
+
+    if not shutil.which("loginctl"):
+        _print_linger_enable_warning(username, linger_detail or "loginctl not found")
+        return
+
+    print("Habilitando o linger para que o gateway sobreviva ao logout do SSH...")
+    try:
+        result = subprocess.run(
+            ["loginctl", "enable-linger", username],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except Exception as e:
+        _print_linger_enable_warning(username, str(e))
+        return
+
+    if result.returncode == 0:
+        print("✔ Linger habilitado — o gateway persistirá após o logout")
+        return
+
+    detail = (result.stderr or result.stdout or f"exit {result.returncode}").strip()
+    _print_linger_enable_warning(username, detail or linger_detail)
+
+
+def _select_systemd_scope(system: bool = False) -> bool:
+    if system:
+        return True
+    return get_systemd_unit_path(system=True).exists() and not get_systemd_unit_path(system=False).exists()
+
+
+def _get_restart_drain_timeout() -> float:
+    """Return the configured gateway restart drain timeout in seconds."""
+    raw = os.getenv("ECTOR_RESTART_DRAIN_TIMEOUT", "").strip()
+    if not raw:
+        cfg = read_raw_config()
+        agent_cfg = cfg.get("agent", {}) if isinstance(cfg, dict) else {}
+        raw = str(
+            agent_cfg.get(
+                "restart_drain_timeout", DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
+            )
+        )
+    return parse_restart_drain_timeout(raw)
+
+
+def systemd_install(force: bool = False, system: bool = False, run_as_user: str | None = None):
+    if system:
+        _require_root_for_system_service("install")
+
+    # Offer to remove legacy units (ector.service from pre-rename installs)
+    # before installing the new ector-gateway.service. If both remain, they
+    # flap-fight for the Telegram bot token on every gateway startup.
+    # Only removes units matching _LEGACY_SERVICE_NAMES + our ExecStart
+    # signature — profile units are never touched.
+    if has_legacy_ector_units():
+        print()
+        print_legacy_unit_warning()
+        print()
+        if prompt_yes_no("Remover a(s) unidade(s) legada(s) antes de instalar?", True):
+            remove_legacy_ector_units(interactive=False)
+            print()
+
+    unit_path = get_systemd_unit_path(system=system)
+    scope_flag = " --system" if system else ""
+
+    if unit_path.exists() and not force:
+        if not systemd_unit_is_current(system=system):
+            print(f"↻ Reparando serviço systemd {_service_scope_label(system)} desatualizado em: {unit_path}")
+            refresh_systemd_unit_if_needed(system=system)
+            _run_systemctl(["enable", get_service_name()], system=system, check=True, timeout=30)
+            print(f"✔ Definição do serviço {_service_scope_label(system)} atualizada")
+            return
+        print(f"Serviço já instalado em: {unit_path}")
+        print("Use --force para reinstalar")
+        return
+
+    unit_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Instalando serviço systemd {_service_scope_label(system)} em: {unit_path}")
+    unit_path.write_text(generate_systemd_unit(system=system, run_as_user=run_as_user), encoding="utf-8")
+
+    _run_systemctl(["daemon-reload"], system=system, check=True, timeout=30)
+    _run_systemctl(["enable", get_service_name()], system=system, check=True, timeout=30)
+
+    print()
+    print(f"✔ Serviço {_service_scope_label(system)} instalado e habilitado!")
+    print()
+    print("Próximos passos:")
+    print(f"  {'sudo ' if system else ''}ector gateway start{scope_flag}              # Iniciar o serviço")
+    print(f"  {'sudo ' if system else ''}ector gateway status{scope_flag}             # Verificar status")
+    print(f"  {'journalctl' if system else 'journalctl --user'} -u {get_service_name()} -f  # Ver logs")
+    print()
+
+    if system:
+        configured_user = _read_systemd_user_from_unit(unit_path)
+        if configured_user:
+            print(f"Configurado para rodar como: {configured_user}")
+    else:
+        _ensure_linger_enabled()
+
+    print_systemd_scope_conflict_warning()
+    print_legacy_unit_warning()
+
+
+def systemd_uninstall(system: bool = False):
+    system = _select_systemd_scope(system)
+    if system:
+        _require_root_for_system_service("uninstall")
+
+    _run_systemctl(["stop", get_service_name()], system=system, check=False, timeout=90)
+    _run_systemctl(["disable", get_service_name()], system=system, check=False, timeout=30)
+
+    unit_path = get_systemd_unit_path(system=system)
+    if unit_path.exists():
+        unit_path.unlink()
+        print(f"✔ Removido {unit_path}")
+
+    _run_systemctl(["daemon-reload"], system=system, check=True, timeout=30)
+    print(f"✔ Serviço {_service_scope_label(system)} desinstalado")
+
+
+def systemd_start(system: bool = False):
+    system = _select_systemd_scope(system)
+    if system:
+        _require_root_for_system_service("start")
+    else:
+        # Fail fast with actionable guidance if the user D-Bus session is not
+        # reachable (common on fresh RHEL/Debian SSH sessions without linger).
+        # Raises UserSystemdUnavailableError with a remediation message.
+        _preflight_user_systemd()
+    refresh_systemd_unit_if_needed(system=system)
+    _run_systemctl(["start", get_service_name()], system=system, check=True, timeout=30)
+    print(f"✔ Serviço {_service_scope_label(system)} iniciado")
+
+
+
+def systemd_stop(system: bool = False):
+    system = _select_systemd_scope(system)
+    if system:
+        _require_root_for_system_service("stop")
+    _run_systemctl(["stop", get_service_name()], system=system, check=True, timeout=90)
+    print(f"✔ Serviço {_service_scope_label(system)} parado")
+
+
+
+def systemd_restart(system: bool = False):
+    system = _select_systemd_scope(system)
+    if system:
+        _require_root_for_system_service("restart")
+    else:
+        _preflight_user_systemd()
+    refresh_systemd_unit_if_needed(system=system)
+    from gateway.status import get_running_pid
+
+    pid = get_running_pid()
+    if pid is not None and _request_gateway_self_restart(pid):
+        import time
+        scope_label = _service_scope_label(system).capitalize()
+        svc = get_service_name()
+
+        # Phase 1: wait for old process to exit (drain + shutdown)
+        print(f"⏳ Serviço {_service_scope_label(system)} finalizando trabalhos ativos...")
+        deadline = time.time() + 90
+        while time.time() < deadline:
+            try:
+                os.kill(pid, 0)
+                time.sleep(1)
+            except (ProcessLookupError, PermissionError):
+                break  # old process is gone
+        else:
+            print(f"▲ Antigo processo (PID {pid}) ainda vivo após 90s")
+
+        # The gateway exits with code 75 for a planned service restart.
+        # systemd can sit in the RestartSec window or even wedge itself into a
+        # failed/rate-limited state if the operator asks for another restart in
+        # the middle of that handoff. Clear any stale failed state and kick the
+        # unit immediately so `ector gateway restart` behaves idempotently.
+        _run_systemctl(
+            ["reset-failed", svc],
+            system=system,
+            check=False,
+            timeout=30,
+        )
+        _run_systemctl(
+            ["start", svc],
+            system=system,
+            check=False,
+            timeout=90,
+        )
+        _wait_for_systemd_service_restart(system=system, previous_pid=pid)
+        return
+
+    if _recover_pending_systemd_restart(system=system, previous_pid=pid):
+        return
+
+    _run_systemctl(
+        ["reset-failed", get_service_name()],
+        system=system,
+        check=False,
+        timeout=30,
+    )
+    _run_systemctl(["reload-or-restart", get_service_name()], system=system, check=True, timeout=90)
+    print(f"✔ Serviço {_service_scope_label(system)} reiniciado")
+
+
+
+def systemd_status(deep: bool = False, system: bool = False, full: bool = False):
+    system = _select_systemd_scope(system)
+    unit_path = get_systemd_unit_path(system=system)
+    scope_flag = " --system" if system else ""
+
+    if not unit_path.exists():
+        print("✖ O serviço de gateway não está instalado")
+        print(f"  Execute: {'sudo ' if system else ''}ector gateway install{scope_flag}")
+        return
+
+    if has_conflicting_systemd_units():
+        print_systemd_scope_conflict_warning()
+        print()
+
+    if has_legacy_ector_units():
+        print_legacy_unit_warning()
+        print()
+
+    if not systemd_unit_is_current(system=system):
+        print("▲ A definição do serviço de gateway instalada está desatualizada")
+        print(f"  Execute: {'sudo ' if system else ''}ector gateway restart{scope_flag}  # atualiza automaticamente a unidade")
+        print()
+
+    status_cmd = ["status", get_service_name(), "--no-pager"]
+    if full:
+        status_cmd.append("-l")
+
+    _run_systemctl(
+        status_cmd,
+        system=system,
+        capture_output=False,
+        timeout=10,
+    )
+
+    result = _run_systemctl(
+        ["is-active", get_service_name()],
+        system=system,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    status = result.stdout.strip()
+
+    if status == "active":
+        print(f"✔ Serviço de gateway {_service_scope_label(system)} está rodando")
+    else:
+        print(f"✖ Serviço de gateway {_service_scope_label(system)} está parado")
+        print(f"  Execute: {'sudo ' if system else ''}ector gateway start{scope_flag}")
+
+    configured_user = _read_systemd_user_from_unit(unit_path) if system else None
+    if configured_user:
+        print(f"Configurado para rodar como: {configured_user}")
+
+    runtime_lines = _runtime_health_lines()
+    if runtime_lines:
+        print()
+        print("Saúde recente do gateway:")
+        for line in runtime_lines:
+            print(f"  {line}")
+
+    unit_props = _read_systemd_unit_properties(system=system)
+    active_state = unit_props.get("ActiveState", "")
+    sub_state = unit_props.get("SubState", "")
+    exec_main_status = unit_props.get("ExecMainStatus", "")
+    result_code = unit_props.get("Result", "")
+    if active_state == "activating" and sub_state == "auto-restart":
+        print("  ⏳ Reinicialização pendente: o systemd está aguardando para relançar o gateway")
+    elif active_state == "failed" and exec_main_status == str(GATEWAY_SERVICE_RESTART_EXIT_CODE):
+        print("  ▲ A reinicialização planejada está travada no estado de falha do systemd (saída 75)")
+        print(f"  Execute: systemctl {'--user ' if not system else ''}reset-failed {get_service_name()} && {'sudo ' if system else ''}ector gateway start{scope_flag}")
+    elif active_state == "failed" and result_code:
+        print(f"  ▲ Resultado da unidade Systemd: {result_code}")
+
+    if system:
+        print("✔ O serviço do sistema inicia no boot sem exigir linger do systemd")
+    elif deep:
+        print_systemd_linger_guidance()
+    else:
+        linger_enabled, _ = get_systemd_linger_status()
+        if linger_enabled is True:
+            print("✔ O linger do Systemd está habilitado (o serviço sobrevive ao logout)")
+        elif linger_enabled is False:
+            print("▲ O linger do Systemd está desabilitado (o gateway pode parar ao fazer logout)")
+            print("  Execute: sudo loginctl enable-linger $USER")
+
+    if deep:
+        print()
+        print("Logs recentes:")
+        log_cmd = _journalctl_cmd(system) + ["-u", get_service_name(), "-n", "20", "--no-pager"]
+        if full:
+            log_cmd.append("-l")
+        subprocess.run(log_cmd, timeout=10)
+
+
+# =============================================================================
+# Launchd (macOS)
+# =============================================================================
+
+def get_launchd_label() -> str:
+    """Return the launchd service label, scoped per profile."""
+    suffix = _profile_suffix()
+    return f"ai.ector.gateway-{suffix}" if suffix else "ai.ector.gateway"
+
+
+def _launchd_domain() -> str:
+    return f"gui/{os.getuid()}"
+
+
+def generate_launchd_plist() -> str:
+    python_path = get_python_path()
+    working_dir = str(PROJECT_ROOT)
+    ector_home = str(get_ector_home().resolve())
+    log_dir = get_ector_home() / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    label = get_launchd_label()
+    profile_arg = _profile_arg(ector_home)
+    # Build a sane PATH for the launchd plist.  launchd provides only a
+    # minimal default (/usr/bin:/bin:/usr/sbin:/sbin) which misses Homebrew,
+    # nvm, cargo, etc.  We prepend venv/bin and node_modules/.bin (matching
+    # the systemd unit), then capture the user's full shell PATH so every
+    # user-installed tool (node, ffmpeg, …) is reachable.
+    detected_venv = _detect_venv_dir()
+    venv_bin = str(detected_venv / "bin") if detected_venv else str(PROJECT_ROOT / "venv" / "bin")
+    venv_dir = str(detected_venv) if detected_venv else str(PROJECT_ROOT / "venv")
+    node_bin = str(PROJECT_ROOT / "node_modules" / ".bin")
+    # Resolve the directory containing the node binary (e.g. Homebrew, nvm)
+    # so it's explicitly in PATH even if the user's shell PATH changes later.
+    priority_dirs = [venv_bin, node_bin]
+    resolved_node = shutil.which("node")
+    if resolved_node:
+        resolved_node_dir = str(Path(resolved_node).resolve().parent)
+        if resolved_node_dir not in priority_dirs:
+            priority_dirs.append(resolved_node_dir)
+    sane_path = ":".join(
+        dict.fromkeys(priority_dirs + [p for p in os.environ.get("PATH", "").split(":") if p])
+    )
+
+    # Build ProgramArguments array, including --profile when using a named profile
+    prog_args = [
+        f"<string>{python_path}</string>",
+        "<string>-m</string>",
+        "<string>ector_cli.main</string>",
+    ]
+    if profile_arg:
+        for part in profile_arg.split():
+            prog_args.append(f"<string>{part}</string>")
+    prog_args.extend([
+        "<string>gateway</string>",
+        "<string>run</string>",
+        "<string>--replace</string>",
+    ])
+    prog_args_xml = "\n        ".join(prog_args)
+
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        {prog_args_xml}
+    </array>
+    
+    <key>WorkingDirectory</key>
+    <string>{working_dir}</string>
+    
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{sane_path}</string>
+        <key>VIRTUAL_ENV</key>
+        <string>{venv_dir}</string>
+        <key>ECTOR_HOME</key>
+        <string>{ector_home}</string>
+    </dict>
+    
+    <key>RunAtLoad</key>
+    <true/>
+    
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    
+    <key>StandardOutPath</key>
+    <string>{log_dir}/gateway.log</string>
+    
+    <key>StandardErrorPath</key>
+    <string>{log_dir}/gateway.error.log</string>
+</dict>
+</plist>
+"""
+
+def launchd_plist_is_current() -> bool:
+    """Check if the installed launchd plist matches the currently generated one."""
+    plist_path = get_launchd_plist_path()
+    if not plist_path.exists():
+        return False
+
+    installed = plist_path.read_text(encoding="utf-8")
+    expected = generate_launchd_plist()
+    return _normalize_launchd_plist_for_comparison(installed) == _normalize_launchd_plist_for_comparison(expected)
+
+
+def refresh_launchd_plist_if_needed() -> bool:
+    """Rewrite the installed launchd plist when the generated definition has changed.
+
+    Unlike systemd, launchd picks up plist changes on the next ``launchctl kill``/
+    ``launchctl kickstart`` cycle — no daemon-reload is needed. We still bootout/
+    bootstrap to make launchd re-read the updated plist immediately.
+    """
+    plist_path = get_launchd_plist_path()
+    if not plist_path.exists() or launchd_plist_is_current():
+        return False
+
+    plist_path.write_text(generate_launchd_plist(), encoding="utf-8")
+    label = get_launchd_label()
+    # Bootout/bootstrap so launchd picks up the new definition
+    subprocess.run(["launchctl", "bootout", f"{_launchd_domain()}/{label}"], check=False, timeout=90)
+    subprocess.run(["launchctl", "bootstrap", _launchd_domain(), str(plist_path)], check=False, timeout=30)
+    print("↻ Atualizada a definição do serviço launchd do gateway para corresponder à instalação atual do Ector")
+    return True
+
+
+def launchd_install(force: bool = False):
+    plist_path = get_launchd_plist_path()
+    
+    if plist_path.exists() and not force:
+        if not launchd_plist_is_current():
+            print(f"↻ Reparando serviço launchd desatualizado em: {plist_path}")
+            refresh_launchd_plist_if_needed()
+            print("✔ Definição do serviço atualizada")
+            return
+        print(f"Serviço já instalado em: {plist_path}")
+        print("Use --force para reinstalar")
+        return
+    
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Instalando serviço launchd em: {plist_path}")
+    plist_path.write_text(generate_launchd_plist())
+    
+    subprocess.run(["launchctl", "bootstrap", _launchd_domain(), str(plist_path)], check=True, timeout=30)
+    
+    print()
+    print("✔ Serviço instalado e carregado!")
+    print()
+    print("Próximos passos:")
+    print("  ector gateway status             # Verificar status")
+    from ector_constants import display_ector_home as _dhh
+    print(f"  tail -f {_dhh()}/logs/gateway.log  # Ver logs")
+
+def launchd_uninstall():
+    plist_path = get_launchd_plist_path()
+    label = get_launchd_label()
+    subprocess.run(["launchctl", "bootout", f"{_launchd_domain()}/{label}"], check=False, timeout=90)
+    
+    if plist_path.exists():
+        plist_path.unlink()
+        print(f"✔ Removido {plist_path}")
+    
+    print("✔ Serviço desinstalado")
+
+def launchd_start():
+    plist_path = get_launchd_plist_path()
+    label = get_launchd_label()
+
+    # Self-heal if the plist is missing entirely (e.g., manual cleanup, failed upgrade)
+    if not plist_path.exists():
+        print("↻ plist do launchd ausente; regenerando definição do serviço")
+        plist_path.parent.mkdir(parents=True, exist_ok=True)
+        plist_path.write_text(generate_launchd_plist(), encoding="utf-8")
+        subprocess.run(["launchctl", "bootstrap", _launchd_domain(), str(plist_path)], check=True, timeout=30)
+        subprocess.run(["launchctl", "kickstart", f"{_launchd_domain()}/{label}"], check=True, timeout=30)
+        print("✔ Serviço iniciado")
+        return
+
+    refresh_launchd_plist_if_needed()
+    try:
+        subprocess.run(["launchctl", "kickstart", f"{_launchd_domain()}/{label}"], check=True, timeout=30)
+    except subprocess.CalledProcessError as e:
+        if e.returncode not in (3, 113):
+            raise
+        print("↻ trabalho do launchd estava descarregado; recarregando definição do serviço")
+        subprocess.run(["launchctl", "bootstrap", _launchd_domain(), str(plist_path)], check=True, timeout=30)
+        subprocess.run(["launchctl", "kickstart", f"{_launchd_domain()}/{label}"], check=True, timeout=30)
+    print("✔ Serviço iniciado")
+
+def launchd_stop():
+    label = get_launchd_label()
+    target = f"{_launchd_domain()}/{label}"
+    # bootout unloads the service definition so KeepAlive doesn't respawn
+    # the process.  A plain `kill SIGTERM` only signals the process — launchd
+    # immediately restarts it because KeepAlive.SuccessfulExit = false.
+    # `ector gateway start` re-bootstraps when it detects the job is unloaded.
+    try:
+        subprocess.run(["launchctl", "bootout", target], check=True, timeout=90)
+    except subprocess.CalledProcessError as e:
+        if e.returncode in (3, 113):
+            pass  # Already unloaded — nothing to stop.
+        else:
+            raise
+    _wait_for_gateway_exit(timeout=10.0, force_after=5.0)
+    print("✔ Serviço parado")
+
+def _wait_for_gateway_exit(timeout: float = 10.0, force_after: float | None = 5.0) -> bool:
+    """Wait for the gateway process (by saved PID) to exit.
+
+    Uses the PID from the gateway.pid file — not launchd labels — so this
+    works correctly when multiple gateway instances run under separate
+    ECTOR_HOME directories.
+
+    Args:
+        timeout: Total seconds to wait before giving up.
+        force_after: Seconds of graceful waiting before escalating to force-kill.
+    """
+    import time
+    from gateway.status import get_running_pid
+
+    deadline = time.monotonic() + timeout
+    force_deadline = (time.monotonic() + force_after) if force_after is not None else None
+    force_sent = False
+
+    while time.monotonic() < deadline:
+        pid = get_running_pid()
+        if pid is None:
+            return True  # Process exited cleanly.
+
+        if force_after is not None and not force_sent and time.monotonic() >= force_deadline:
+            # Grace period expired — force-kill the specific PID.
+            try:
+                terminate_pid(pid, force=True)
+                print(f"▲ Gateway PID {pid} não encerrou graciosamente; enviado SIGKILL")
+            except (ProcessLookupError, PermissionError, OSError):
+                return True  # Already gone or we can't touch it.
+            force_sent = True
+
+        time.sleep(0.3)
+
+    # Timed out even after force-kill.
+    remaining_pid = get_running_pid()
+    if remaining_pid is not None:
+        print(f"▲ Gateway PID {remaining_pid} ainda rodando após {timeout}s — o reinício pode falhar")
+        return False
+    return True
+
+
+def launchd_restart():
+    label = get_launchd_label()
+    target = f"{_launchd_domain()}/{label}"
+    drain_timeout = _get_restart_drain_timeout()
+    from gateway.status import get_running_pid
+
+    try:
+        pid = get_running_pid()
+        if pid is not None and _request_gateway_self_restart(pid):
+            print("✔ Reinício do serviço solicitado")
+            return
+        if pid is not None:
+            try:
+                terminate_pid(pid, force=False)
+            except (ProcessLookupError, PermissionError, OSError):
+                pid = None
+            if pid is not None:
+                exited = _wait_for_gateway_exit(timeout=drain_timeout, force_after=None)
+                if not exited:
+                    print(f"▲ O esgotamento do gateway expirou após {drain_timeout:.0f}s — forçando reinício do launchd")
+        subprocess.run(["launchctl", "kickstart", "-k", target], check=True, timeout=90)
+        print("✔ Serviço reiniciado")
+    except subprocess.CalledProcessError as e:
+        if e.returncode not in (3, 113):
+            raise
+        # Job not loaded — bootstrap and start fresh
+        print("↻ trabalho do launchd estava descarregado; recarregando")
+        plist_path = get_launchd_plist_path()
+        subprocess.run(["launchctl", "bootstrap", _launchd_domain(), str(plist_path)], check=True, timeout=30)
+        subprocess.run(["launchctl", "kickstart", target], check=True, timeout=30)
+        print("✔ Serviço reiniciado")
+
+def launchd_status(deep: bool = False):
+    plist_path = get_launchd_plist_path()
+    label = get_launchd_label()
+    try:
+        result = subprocess.run(
+            ["launchctl", "list", label],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        loaded = result.returncode == 0
+        loaded_output = result.stdout
+    except subprocess.TimeoutExpired:
+        loaded = False
+        loaded_output = ""
+
+    print(f"Launchd plist: {plist_path}")
+    if launchd_plist_is_current():
+        print("✔ A definição do serviço corresponde à instalação atual do Ector")
+    else:
+        print("▲ A definição do serviço está desatualizada em relação à instalação atual do Ector")
+        print("  Execute: ector gateway start")
+
+    if loaded:
+        print("✔ O serviço de gateway está carregado")
+        print(loaded_output)
+    else:
+        print("✖ O serviço de gateway não está carregado")
+        print("  A definição do serviço existe localmente, mas o launchd não a carregou.")
+        print("  Execute: ector gateway start")
+    
+    if deep:
+        log_file = get_ector_home() / "logs" / "gateway.log"
+        if log_file.exists():
+            print()
+            print("Logs recentes:")
+            subprocess.run(["tail", "-20", str(log_file)], timeout=10)
+
+
+# =============================================================================
+# Gateway Runner
+# =============================================================================
+
+def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False):
+    """Run the gateway in foreground.
+    
+    Args:
+        verbose: Stderr log verbosity count added on top of default WARNING (0=WARNING, 1=INFO, 2+=DEBUG).
+        quiet: Suppress all stderr log output.
+        replace: If True, kill any existing gateway instance before starting.
+                 This prevents systemd restart loops when the old process
+                 hasn't fully exited yet.
+    """
+    if not quiet:
+        print_header("Gateway do Ector")
+        print_info("Iniciando…  Ctrl+C para encerrar")
+        print()
+    
+    sys.path.insert(0, str(PROJECT_ROOT))
+    
+    from gateway.run import start_gateway
+    
+    # Exit with code 1 if gateway fails to connect any platform,
+    # so systemd Restart=on-failure will retry on transient errors
+    verbosity = None if quiet else verbose
+    success = asyncio.run(start_gateway(replace=replace, verbosity=verbosity))
+    if not success:
+        sys.exit(1)
+
+
+# =============================================================================
+# Gateway Setup (Interactive Messaging Platform Configuration)
+# =============================================================================
+
+# Per-platform config: each entry defines the env vars, setup instructions,
+# and prompts needed to configure a messaging platform.
+_PLATFORMS = [
+    {
+        "key": "telegram",
+        "label": "Telegram",
+        "emoji": "📱",
+        "token_var": "TELEGRAM_BOT_TOKEN",
+        "setup_instructions": [
+            "1. Abra o Telegram e envie uma mensagem para @BotFather",
+            "2. Envie /newbot e siga as instruções para criar seu bot",
+            "3. Copie o token HTTP do bot (não o link t.me/… nem o @username do bot)",
+            "4. Seu ID pessoal: envie /start para @userinfobot e copie o número (User.id) — não use o @username do bot",
+        ],
+        "vars": [
+            {"name": "TELEGRAM_BOT_TOKEN", "prompt": "Token do Bot", "password": True,
+             "help": "Cole o token do @BotFather (passo 3 acima)."},
+            {"name": "TELEGRAM_ALLOWED_USERS", "prompt": "IDs de usuários permitidos (separados por vírgula)", "password": False,
+             "is_allowlist": True,
+             "help": "Cole seu ID de usuário do passo 4 acima."},
+            {"name": "TELEGRAM_HOME_CHANNEL", "prompt": "ID do canal principal (para entrega de cron/notificações, ou vazio para definir depois com /set-home)", "password": False,
+             "help": "Para DMs, este é o seu ID de usuário. Você pode definir isso depois digitando /set-home no chat."},
+        ],
+    },
+    {
+        "key": "discord",
+        "label": "Discord",
+        "emoji": "💬",
+        "token_var": "DISCORD_BOT_TOKEN",
+        "setup_instructions": [
+            "1. Vá para https://discord.com/developers/applications → New Application",
+            "2. Vá para Bot → Reset Token → copie o token do bot",
+            "3. Habilite: Bot → Privileged Gateway Intents → Message Content Intent",
+            "4. Convide o bot para o seu servidor:",
+            "   OAuth2 → URL Generator → marque AMBAS as permissões:",
+            "     - bot",
+            "     - applications.commands  (necessário para comandos de barra!)",
+            "   Permissões do Bot: Send Messages, Read Message History, Attach Files",
+            "   Copie a URL e abra-a no navegador para convidar.",
+            "5. Obtenha seu ID de usuário: habilite o Modo Desenvolvedor nas configurações do Discord,",
+            "   clique com o botão direito no seu nome → Copiar ID",
+        ],
+        "vars": [
+            {"name": "DISCORD_BOT_TOKEN", "prompt": "Token do Bot", "password": True,
+             "help": "Cole o token do passo 2 acima."},
+            {"name": "DISCORD_ALLOWED_USERS", "prompt": "IDs de usuários ou nomes de usuário permitidos (separados por vírgula)", "password": False,
+             "is_allowlist": True,
+             "help": "Cole seu ID de usuário do passo 5 acima."},
+            {"name": "DISCORD_HOME_CHANNEL", "prompt": "ID do canal principal (para entrega de cron/notificações, ou vazio para definir depois com /set-home)", "password": False,
+             "help": "Clique com o botão direito em um canal → Copiar ID do Canal (requer Modo Desenvolvedor)."},
+        ],
+    },
+    {
+        "key": "slack",
+        "label": "Slack",
+        "emoji": "💼",
+        "token_var": "SLACK_BOT_TOKEN",
+        "setup_instructions": [
+            "1. Vá para https://api.slack.com/apps → Create New App → From Scratch",
+            "2. Habilite o Socket Mode: Settings → Socket Mode → Enable",
+            "   Crie um App-Level Token com a permissão: connections:write → copie o token xapp-...",
+            "3. Adicione permissões do Bot: Features → OAuth & Permissions → Scopes",
+            "   Obrigatório: chat:write, app_mentions:read, channels:history, channels:read,",
+            "   groups:history, im:history, im:read, im:write, users:read, files:read, files:write",
+            "4. Inscreva-se em eventos: Features → Event Subscriptions → Enable",
+            "   Eventos obrigatórios: message.im, message.channels, app_mention",
+            "   Opcional: message.groups (para canais privados)",
+            "   ▲ Sem message.channels, o bot funcionará APENAS em DMs!",
+            "5. Instale no Workspace: Settings → Install App → copie o token xoxb-...",
+            "6. Reinstale o app após qualquer alteração de permissão ou evento",
+            "7. Encontre seu ID de usuário: clique no seu perfil → três pontos → Copiar ID de membro",
+            "8. Convide o bot para os canais: /invite @SeuBot",
+        ],
+        "vars": [
+            {"name": "SLACK_BOT_TOKEN", "prompt": "Token do Bot (xoxb-...)", "password": True,
+             "help": "Cole o token do bot do passo 3 acima."},
+            {"name": "SLACK_APP_TOKEN", "prompt": "Token do App (xapp-...)", "password": True,
+             "help": "Cole o token de nível de app do passo 4 acima."},
+            {"name": "SLACK_ALLOWED_USERS", "prompt": "IDs de usuários permitidos (separados por vírgula)", "password": False,
+             "is_allowlist": True,
+             "help": "Cole seu ID de membro do passo 7 acima."},
+        ],
+    },
+    {
+        "key": "whatsapp",
+        "label": "WhatsApp",
+        "emoji": "📲",
+        "token_var": "WHATSAPP_ENABLED",
+    }
+]
+
+
+def _platform_status(platform: dict) -> str:
+    """Return a plain-text status string for a platform.
+
+    Returns uncolored text so it can safely be embedded in
+    simple_term_menu items (ANSI codes break width calculation).
+    """
+    token_var = platform["token_var"]
+    val = get_env_value(token_var)
+    if token_var == "WHATSAPP_ENABLED":
+        if val and val.lower() == "true":
+            session_file = get_ector_home() / "whatsapp" / "session" / "creds.json"
+            if session_file.exists():
+                return color("configurado + pareado", Colors.GREEN)
+            return color("habilitado, não pareado", Colors.YELLOW)
+        return "não configurado"
+
+
+
+
+    if val:
+        return color("configurado", Colors.GREEN)
+    return "não configurado"
+
+
+def _runtime_health_lines() -> list[str]:
+    """Summarize the latest persisted gateway runtime health state."""
+    try:
+        from gateway.status import read_runtime_status
+    except Exception:
+        return []
+
+    state = read_runtime_status()
+    if not state:
+        return []
+
+    lines: list[str] = []
+    gateway_state = state.get("gateway_state")
+    exit_reason = state.get("exit_reason")
+    active_agents = state.get("active_agents")
+    restart_requested = state.get("restart_requested")
+    platforms = state.get("platforms", {}) or {}
+
+    for platform, pdata in platforms.items():
+        if pdata.get("state") == "fatal":
+            message = pdata.get("error_message") or "unknown error"
+            lines.append(color(f"▲ {platform}: {message}", Colors.RED))
+
+    if gateway_state == "startup_failed" and exit_reason:
+        lines.append(color(f"▲ Último problema na inicialização: {exit_reason}", Colors.RED))
+    elif gateway_state == "draining":
+        action = "restart" if restart_requested else "shutdown"
+        count = int(active_agents or 0)
+        lines.append(color(f"⏳ Gateway esvaziando para {action} ({count} agente(s) ativo(s))", Colors.YELLOW))
+    elif gateway_state == "stopped" and exit_reason:
+        lines.append(color(f"▲ Último motivo de encerramento: {exit_reason}", Colors.YELLOW))
+
+    return lines
+
+
+def _setup_standard_platform(platform: dict):
+    """Interactive setup for Telegram, Discord, or Slack."""
+    emoji = platform["emoji"]
+    label = platform["label"]
+    token_var = platform["token_var"]
+
+    print()
+    print(color(f"  ─── {emoji} {label} Setup ───", Colors.CYAN))
+
+    # Show step-by-step setup instructions if this platform has them
+    instructions = platform.get("setup_instructions")
+    if instructions:
+        print()
+        for line in instructions:
+            print_info(f"  {line}")
+
+    existing_token = get_env_value(token_var)
+    if existing_token:
+        print()
+        print_success(f"{label} já está configurado.")
+        if not prompt_yes_no(f"  Reconfigurar {label}?", False):
+            return
+
+    allowed_val_set = None  # Track if user set an allowlist (for home channel offer)
+
+    for var in platform["vars"]:
+        print()
+        print_info(f"  {var['help']}")
+        existing = get_env_value(var["name"])
+        if existing and var["name"] != token_var:
+            print_info(f"  Atual: {existing}")
+
+        # Allowlist fields get special handling for the deny-by-default security model
+        if var.get("is_allowlist"):
+            print_info("  O gateway NEGA todos os usuários por padrão por segurança.")
+            print_info("  Insira IDs de usuário para criar uma lista de permissões, ou deixe")
+            print_info("  em branco e você será perguntado sobre o acesso aberto em seguida.")
+            value = prompt(f"  {var['prompt']}", password=False)
+            if value:
+                cleaned = value.replace(" ", "")
+                # For Discord, strip common prefixes (user:123, <@123>, <@!123>)
+                if "DISCORD" in var["name"]:
+                    parts = []
+                    for uid in cleaned.split(","):
+                        uid = uid.strip()
+                        if uid.startswith("<@") and uid.endswith(">"):
+                            uid = uid.lstrip("<@!").rstrip(">")
+                        if uid.lower().startswith("user:"):
+                            uid = uid[5:]
+                        if uid:
+                            parts.append(uid)
+                    cleaned = ",".join(parts)
+                save_env_value(var["name"], cleaned)
+                print_success("  Salvo — apenas estes usuários podem interagir com o bot.")
+                allowed_val_set = cleaned
+            else:
+                # No allowlist — ask about open access vs DM pairing
+                print()
+                access_choices = [
+                    "Habilitar acesso aberto (qualquer pessoa pode enviar mensagens para o bot)",
+                    "Usar pareamento de DM (usuários desconhecidos solicitam acesso, você aprova com 'ector pairing approve')",
+                    "Pular por enquanto (o bot negará todos os usuários até ser configurado)",
+                ]
+                access_idx = prompt_choice("  Como os usuários não autorizados devem ser tratados?", access_choices, 1)
+                if access_idx == 0:
+                    save_env_value("GATEWAY_ALLOW_ALL_USERS", "true")
+                    print_warning("  Acesso aberto habilitado — qualquer pessoa pode usar seu bot!")
+                elif access_idx == 1:
+                    print_success("  Modo de pareamento de DM — os usuários receberão um código para solicitar acesso.")
+                    print_info("  Aprove com: ector pairing approve <plataforma> <code>")
+                else:
+                    print_info("  Pulado — configure mais tarde com 'ector gateway setup'")
+            continue
+
+        value = prompt(f"  {var['prompt']}", password=var.get("password", False))
+        if value:
+            save_env_value(var["name"], value)
+            print_success(f"  Salvo {var['name']}")
+        elif var["name"] == token_var:
+            print_warning(f"  Pulado — {label} não funcionará sem isso.")
+            return
+        else:
+            print_info("  Pulado (pode configurar mais tarde)")
+
+    # If an allowlist was set and home channel wasn't, offer to reuse
+    # the first user ID (common for Telegram DMs).
+    home_var = f"{label.upper()}_HOME_CHANNEL"
+    home_val = get_env_value(home_var)
+    if allowed_val_set and not home_val and label == "Telegram":
+        first_id = allowed_val_set.split(",")[0].strip()
+        if first_id and prompt_yes_no(f"  Usar seu ID de usuário ({first_id}) como o canal principal (home channel)?", True):
+            save_env_value(home_var, first_id)
+            print_success(f"  Canal principal definido como {first_id}")
+
+    print()
+    print_success(f"{emoji} {label} configurado!")
+
+
+def _setup_whatsapp():
+    """Delegate to the existing WhatsApp setup flow."""
+    from ector_cli.main import cmd_whatsapp
+    import argparse
+    cmd_whatsapp(argparse.Namespace())
+
+
+def any_gateway_platform_configured() -> bool:
+    """Return True when at least one supported messaging channel is configured."""
+    try:
+        from gateway.platform_catalog import list_platforms
+
+        return any(
+            p["state"] in ("configured", "paired", "partial")
+            for p in list_platforms()
+        )
+    except Exception:
+        return any(
+            bool(get_env_value(p["token_var"]))
+            for p in _PLATFORMS
+            if p["key"] != "whatsapp"
+        ) or (get_env_value("WHATSAPP_ENABLED") or "").lower() == "true"
+
+
+def offer_gateway_service_actions() -> None:
+    """Prompt to install, start, or restart the gateway after channel setup."""
+    service_installed = _is_service_installed()
+    service_running = _is_service_running()
+    supports_systemd = supports_systemd_services()
+
+    if service_running:
+        if prompt_yes_no("  Reiniciar o gateway para aplicar as alterações?", True):
+            try:
+                if supports_systemd:
+                    systemd_restart()
+                elif is_macos():
+                    launchd_restart()
+                else:
+                    stop_profile_gateway()
+                    print_info("Inicie manualmente: ector gateway run")
+            except UserSystemdUnavailableError as e:
+                print_error("  A reinicialização falhou — systemd do usuário não alcançável:")
+                for line in str(e).splitlines():
+                    print(f"  {line}")
+            except subprocess.CalledProcessError as e:
+                print_error(f"  A reinicialização falhou: {e}")
+    elif service_installed:
+        if prompt_yes_no("  Iniciar o serviço do gateway?", True):
+            try:
+                if supports_systemd:
+                    systemd_start()
+                elif is_macos():
+                    launchd_start()
+            except UserSystemdUnavailableError as e:
+                print_error("  Falha ao iniciar — systemd do usuário não alcançável:")
+                for line in str(e).splitlines():
+                    print(f"  {line}")
+            except subprocess.CalledProcessError as e:
+                print_error(f"  Falha ao iniciar: {e}")
+    elif supports_systemd or is_macos():
+        platform_name = "systemd" if supports_systemd else "launchd"
+        wsl_note = " (nota: serviços podem não sobreviver a reinicializações do WSL)" if is_wsl() else ""
+        if prompt_yes_no(
+            f"  Instalar o gateway como um serviço {platform_name}?{wsl_note} "
+            "(roda em segundo plano, inicia no boot)",
+            True,
+        ):
+            try:
+                installed_scope = None
+                did_install = False
+                if supports_systemd:
+                    installed_scope, did_install = install_linux_gateway_from_setup(force=False)
+                else:
+                    launchd_install(force=False)
+                    did_install = True
+                print()
+                if did_install and prompt_yes_no("  Iniciar o serviço agora?", True):
+                    try:
+                        if supports_systemd:
+                            systemd_start(system=installed_scope == "system")
+                        else:
+                            launchd_start()
+                    except UserSystemdUnavailableError as e:
+                        print_error("  Falha ao iniciar — systemd do usuário não alcançável:")
+                        for line in str(e).splitlines():
+                            print(f"  {line}")
+                    except subprocess.CalledProcessError as e:
+                        print_error(f"  Falha ao iniciar: {e}")
+            except subprocess.CalledProcessError as e:
+                print_error(f"  A instalação falhou: {e}")
+                print_info("  Você pode tentar manualmente: ector gateway install")
+        else:
+            print_info("  Você pode instalar depois: ector gateway install")
+            if supports_systemd:
+                print_info("  Ou como um serviço de boot: sudo ector gateway install --system")
+            print_info("  Ou execute em primeiro plano: ector gateway run")
+    elif is_wsl():
+        print_info("  WSL detectado, mas o systemd não está rodando.")
+        print_info("  Execute em primeiro plano: ector gateway run")
+        print_info("  Para persistência:   tmux new -s ector 'ector gateway run'")
+        print_info("  Para habilitar o systemd: adicione systemd=true em /etc/wsl.conf, depois 'wsl --shutdown'")
+    elif is_termux():
+        from ector_constants import display_ector_home as _dhh
+
+        print_info("  O Termux não usa serviços systemd/launchd.")
+        print_info("  Execute em primeiro plano: ector gateway run")
+        print_info(
+            f"  Ou inicie manualmente em segundo plano: "
+            f"nohup ector gateway run >{_dhh()}/logs/gateway.log 2>&1 &"
+        )
+    elif is_container():
+        print_info("Inicie o gateway para colocar seus bots online:")
+        print_info("   ector gateway run          # Executar como processo principal do contêiner")
+        print_info("")
+        print_info("Para reinicializações automáticas, use uma política de reinicialização do Docker:")
+        print_info("   docker run --restart unless-stopped ...")
+    else:
+        print_info("  Instalação de serviço não suportada nesta plataforma.")
+        print_info("  Execute em primeiro plano: ector gateway run")
+
+
+def _is_service_installed() -> bool:
+    """Verifica se o gateway está instalado como um serviço do sistema."""
+    if supports_systemd_services():
+        return get_systemd_unit_path(system=False).exists() or get_systemd_unit_path(system=True).exists()
+    elif is_macos():
+        return get_launchd_plist_path().exists()
+    return False
+
+
+def _is_service_running() -> bool:
+    """Verifica se o serviço do gateway está em execução no momento."""
+    if supports_systemd_services():
+        user_unit_exists = get_systemd_unit_path(system=False).exists()
+        system_unit_exists = get_systemd_unit_path(system=True).exists()
+
+        if user_unit_exists:
+            try:
+                result = _run_systemctl(
+                    ["is-active", get_service_name()],
+                    system=False, capture_output=True, text=True, timeout=10,
+                )
+                if result.stdout.strip() == "active":
+                    return True
+            except (RuntimeError, subprocess.TimeoutExpired):
+                pass
+
+        if system_unit_exists:
+            try:
+                result = _run_systemctl(
+                    ["is-active", get_service_name()],
+                    system=True, capture_output=True, text=True, timeout=10,
+                )
+                if result.stdout.strip() == "active":
+                    return True
+            except (RuntimeError, subprocess.TimeoutExpired):
+                pass
+
+        return False
+    elif is_macos() and get_launchd_plist_path().exists():
+        try:
+            result = subprocess.run(
+                ["launchctl", "list", get_launchd_label()],
+                capture_output=True, text=True, timeout=10,
+            )
+            return result.returncode == 0
+        except subprocess.TimeoutExpired:
+            return False
+    # Check for manual processes
+    return len(find_gateway_pids()) > 0
+
+
+def gateway_setup():
+    """Interactive setup for messaging platforms + gateway service."""
+    if is_managed():
+        managed_error("run gateway setup")
+        return
+
+    print()
+    print(color("┌─────────────────────────────────────────────────────────┐", Colors.CYAN))
+    print(color("│             ⚡ Gateway Setup                            │", Colors.CYAN))
+    print(color("├─────────────────────────────────────────────────────────┤", Colors.CYAN))
+    print(color("│  Configure as plataformas de mensagens e o serviço do gateway. │", Colors.CYAN))
+    print(color("│  Pressione Ctrl+C a qualquer momento para sair.              │", Colors.CYAN))
+    print(color("└───────────────────────────────────────────────────────────────┘", Colors.CYAN))
+
+    # ── Gateway service status ──
+    print()
+    service_installed = _is_service_installed()
+    service_running = _is_service_running()
+
+    if supports_systemd_services() and has_conflicting_systemd_units():
+        print_systemd_scope_conflict_warning()
+        print()
+
+    if supports_systemd_services() and has_legacy_ector_units():
+        print_legacy_unit_warning()
+        print()
+
+    if service_installed and service_running:
+        print_success("O serviço do gateway está instalado e em execução.")
+    elif service_installed:
+        print_warning("O serviço do gateway está instalado, mas não está em execução.")
+        if prompt_yes_no("  Iniciar agora?", True):
+            try:
+                if supports_systemd_services():
+                    systemd_start()
+                elif is_macos():
+                    launchd_start()
+            except UserSystemdUnavailableError as e:
+                print_error("  Falha ao iniciar — systemd do usuário não alcançável:")
+                for line in str(e).splitlines():
+                    print(f"  {line}")
+            except subprocess.CalledProcessError as e:
+                print_error(f"  Falha ao iniciar: {e}")
+    else:
+        print_info("O serviço do gateway ainda não está instalado.")
+        print_info("Você poderá instalá-lo após configurar as plataformas.")
+
+    # ── Platform configuration loop ──
+    while True:
+        print()
+        print(color("Plataformas de Mensagens", Colors.CYAN, Colors.BOLD))
+
+        menu_items = []
+        for plat in _PLATFORMS:
+            status = _platform_status(plat)
+            menu_items.append(f"{plat['label']}  ({status})")
+        menu_items.append("Concluído")
+
+        choice = prompt_choice("Selecione uma plataforma para configurar:", menu_items, len(menu_items) - 1)
+
+        if choice == len(_PLATFORMS):
+            break
+
+        platform = _PLATFORMS[choice]
+
+        if platform["key"] == "whatsapp":
+            _setup_whatsapp()
+        else:
+            _setup_standard_platform(platform)
+
+    # ── Post-setup: offer to install/restart gateway ──
+    if any_gateway_platform_configured():
+        print()
+        print(color("─" * 58, Colors.DIM))
+        offer_gateway_service_actions()
+    else:
+        print()
+        print_info("Nenhuma plataforma configurada. Execute 'ector gateway setup' quando estiver pronto.")
+
+    print()
+
+
+# =============================================================================
+# Main Command Handler
+# =============================================================================
+
+def gateway_command(args):
+    """Handle gateway subcommands."""
+    try:
+        return _gateway_command_inner(args)
+    except UserSystemdUnavailableError as e:
+        # Clean, actionable message instead of a traceback when the user D-Bus
+        # session is unreachable (fresh SSH shell, no linger, container, etc.).
+        print_error("Systemd do usuário não alcançável:")
+        for line in str(e).splitlines():
+            print(f"  {line}")
+        sys.exit(1)
+
+
+def _gateway_command_inner(args):
+    subcmd = getattr(args, 'gateway_command', None)
+    
+    # Default to run if no subcommand
+    if subcmd is None or subcmd == "run":
+        verbose = getattr(args, 'verbose', 0)
+        quiet = getattr(args, 'quiet', False)
+        replace = getattr(args, 'replace', False)
+        run_gateway(verbose, quiet=quiet, replace=replace)
+        return
+
+    if subcmd == "setup":
+        gateway_setup()
+        return
+
+    # Service management commands
+    if subcmd == "install":
+        if is_managed():
+            managed_error("instalar o serviço do gateway (gerenciado pelo NixOS)")
+            return
+        force = getattr(args, 'force', False)
+        system = getattr(args, 'system', False)
+        run_as_user = getattr(args, 'run_as_user', None)
+        if is_termux():
+            print("A instalação do serviço do gateway não é suportada no Termux.")
+            print("Inicie manualmente: ector gateway")
+            sys.exit(1)
+        if supports_systemd_services():
+            if is_wsl():
+                print_warning("WSL detectado — serviços systemd podem não sobreviver a reinicializações do WSL.")
+                print_info("  Considere executar em primeiro plano: ector gateway run")
+                print_info("  Ou use tmux/screen para persistência: tmux new -s ector 'ector gateway run'")
+                print()
+            systemd_install(force=force, system=system, run_as_user=run_as_user)
+        elif is_macos():
+            launchd_install(force)
+        elif is_wsl():
+            print("WSL detectado, mas o systemd não está rodando.")
+            print("Habilite o systemd (adicione systemd=true em /etc/wsl.conf e reinicie o WSL)")
+            print("ou execute o gateway em modo de primeiro plano:")
+            print()
+            print("  ector gateway run                              # direto em primeiro plano")
+            print("  tmux new -s ector 'ector gateway run'         # persistente via tmux")
+            print("  nohup ector gateway run > ~/.ector/logs/gateway.log 2>&1 &  # segundo plano")
+            sys.exit(1)
+        elif is_container():
+            print("A instalação de serviço não é necessária dentro de um container Docker.")
+            print("O runtime do container é o seu gerenciador de serviços — use políticas de reinicialização do Docker:")
+            print()
+            print("  docker run --restart unless-stopped ...   # auto-reiniciar em falhas/reboot")
+            print("  docker restart <container>                # reinicialização manual")
+            print()
+            print("Para executar o gateway: ector gateway run")
+            sys.exit(0)
+        else:
+            print("Instalação de serviço não suportada nesta plataforma.")
+            print("Inicie manualmente: ector gateway run")
+            sys.exit(1)
+    
+    elif subcmd == "uninstall":
+        if is_managed():
+            managed_error("desinstalar o serviço do gateway (gerenciado pelo NixOS)")
+            return
+        system = getattr(args, 'system', False)
+        if is_termux():
+            print("A desinstalação do serviço do gateway não é suportada no Termux pois não há um serviço gerenciado para remover.")
+            print("Pare execuções manuais com: ector gateway stop")
+            sys.exit(1)
+        if supports_systemd_services():
+            systemd_uninstall(system=system)
+        elif is_macos():
+            launchd_uninstall()
+        elif is_container():
+            print("A desinstalação de serviço não é aplicável dentro de um container Docker.")
+            print("Para parar o gateway, pare ou remova o container:")
+            print()
+            print("  docker stop <container>")
+            print("  docker rm <container>")
+            sys.exit(0)
+        else:
+            print("Não suportado nesta plataforma.")
+            sys.exit(1)
+
+    elif subcmd == "start":
+        system = getattr(args, 'system', False)
+        start_all = getattr(args, 'all', False)
+
+        if start_all:
+            # Kill all stale gateway processes across all profiles before starting
+            killed = kill_gateway_processes(all_profiles=True)
+            if killed:
+                print(f"✔ Encerrados {killed} processos antigos do gateway em todos os perfis")
+                _wait_for_gateway_exit(timeout=10.0, force_after=5.0)
+
+        if is_termux():
+            print("O início do serviço do gateway não é suportado no Termux porque não há um gerenciador de serviços do sistema.")
+            print("Inicie manualmente: ector gateway")
+            sys.exit(1)
+        if supports_systemd_services():
+            systemd_start(system=system)
+        elif is_macos():
+            launchd_start()
+        elif is_wsl():
+            print("WSL detectado, mas o systemd não está disponível.")
+            print("Execute o gateway em modo de primeiro plano:")
+            print()
+            print("  ector gateway run                              # direto em primeiro plano")
+            print("  tmux new -s ector 'ector gateway run'         # persistente via tmux")
+            print("  nohup ector gateway run > ~/.ector/logs/gateway.log 2>&1 &  # segundo plano")
+            print()
+            print("Para habilitar o systemd: adicione systemd=true em /etc/wsl.conf e execute 'wsl --shutdown' do PowerShell.")
+            sys.exit(1)
+        elif is_container():
+            print("O início de serviço não é aplicável dentro de um container Docker.")
+            print("O gateway roda como o processo principal do container.")
+            print()
+            print("  docker start <container>     # inicia um container parado")
+            print("  docker restart <container>   # reinicia um container em execução")
+            print()
+            print("Ou execute o gateway diretamente: ector gateway run")
+            sys.exit(0)
+        else:
+            print("Não suportado nesta plataforma.")
+            sys.exit(1)
+
+    elif subcmd == "stop":
+        stop_all = getattr(args, 'all', False)
+        system = getattr(args, 'system', False)
+
+        if stop_all:
+            # --all: kill every gateway process on the machine
+            service_available = False
+            if supports_systemd_services() and (get_systemd_unit_path(system=False).exists() or get_systemd_unit_path(system=True).exists()):
+                try:
+                    systemd_stop(system=system)
+                    service_available = True
+                except subprocess.CalledProcessError:
+                    pass
+            elif is_macos() and get_launchd_plist_path().exists():
+                try:
+                    launchd_stop()
+                    service_available = True
+                except subprocess.CalledProcessError:
+                    pass
+            killed = kill_gateway_processes(all_profiles=True)
+            total = killed + (1 if service_available else 0)
+            if total:
+                print(f"✔ Parados {total} processos do gateway em todos os perfis")
+            else:
+                print("✖ Nenhum processo do gateway encontrado")
+        else:
+            # Default: stop only the current profile's gateway
+            service_available = False
+            if supports_systemd_services() and (get_systemd_unit_path(system=False).exists() or get_systemd_unit_path(system=True).exists()):
+                try:
+                    systemd_stop(system=system)
+                    service_available = True
+                except subprocess.CalledProcessError:
+                    pass
+            elif is_macos() and get_launchd_plist_path().exists():
+                try:
+                    launchd_stop()
+                    service_available = True
+                except subprocess.CalledProcessError:
+                    pass
+
+            if not service_available:
+                # No systemd/launchd — use profile-scoped PID file
+                if stop_profile_gateway():
+                    print("✔ Parado o gateway para este perfil")
+                else:
+                    print("✖ Nenhum gateway rodando para este perfil")
+            else:
+                print(f"✔ Parado o serviço {get_service_name()}")
+    
+    elif subcmd == "restart":
+        # Tenta o serviço primeiro, fallback para encerrar e reiniciar
+        service_available = False
+        system = getattr(args, 'system', False)
+        restart_all = getattr(args, 'all', False)
+        service_configured = False
+
+        if restart_all:
+            # --all: stop every gateway process across all profiles, then start fresh
+            service_stopped = False
+            if supports_systemd_services() and (get_systemd_unit_path(system=False).exists() or get_systemd_unit_path(system=True).exists()):
+                try:
+                    systemd_stop(system=system)
+                    service_stopped = True
+                except subprocess.CalledProcessError:
+                    pass
+            elif is_macos() and get_launchd_plist_path().exists():
+                try:
+                    launchd_stop()
+                    service_stopped = True
+                except subprocess.CalledProcessError:
+                    pass
+            killed = kill_gateway_processes(all_profiles=True)
+            total = killed + (1 if service_stopped else 0)
+            if total:
+                print(f"✔ Parados {total} processos do gateway em todos os perfis")
+            _wait_for_gateway_exit(timeout=10.0, force_after=5.0)
+
+            # Start the current profile's service fresh
+            print("Iniciando gateway...")
+            if supports_systemd_services() and (get_systemd_unit_path(system=False).exists() or get_systemd_unit_path(system=True).exists()):
+                systemd_start(system=system)
+            elif is_macos() and get_launchd_plist_path().exists():
+                launchd_start()
+            else:
+                run_gateway(verbose=0)
+            return
+        
+        if supports_systemd_services() and (get_systemd_unit_path(system=False).exists() or get_systemd_unit_path(system=True).exists()):
+            service_configured = True
+            try:
+                systemd_restart(system=system)
+                service_available = True
+            except subprocess.CalledProcessError:
+                pass
+        elif is_macos() and get_launchd_plist_path().exists():
+            service_configured = True
+            try:
+                launchd_restart()
+                service_available = True
+            except subprocess.CalledProcessError:
+                pass
+        
+        if not service_available:
+            # systemd/launchd restart failed — check if linger is the issue
+            if supports_systemd_services():
+                linger_ok, _detail = get_systemd_linger_status()
+                if linger_ok is not True:
+                    import getpass
+                    _username = getpass.getuser()
+                    print()
+                    print("▲ Não é possível reiniciar o gateway como um serviço — linger não está habilitado.")
+                    print("  O serviço de usuário do gateway requer linger para funcionar em servidores sem interface gráfica.")
+                    print()
+                    print(f"  Execute:  sudo loginctl enable-linger {_username}")
+                    print()
+                    print("  Depois reinicie o gateway:")
+                    print("    ector gateway restart")
+                    return
+
+            if service_configured:
+                print()
+                print("✖ A reinicialização do serviço do gateway falhou.")
+                print("  A definição do serviço existe, mas o gerenciador de serviços não o recuperou.")
+                print("  Corrija o serviço e tente novamente: ector gateway start")
+                sys.exit(1)
+
+            # Manual restart: stop only this profile's gateway
+            if stop_profile_gateway():
+                print("✔ Parado o gateway para este perfil")
+
+            _wait_for_gateway_exit(timeout=10.0, force_after=5.0)
+
+            # Start fresh
+            print("Iniciando gateway...")
+            run_gateway(verbose=0)
+    
+    elif subcmd == "status":
+        deep = getattr(args, 'deep', False)
+        full = getattr(args, 'full', False)
+        system = getattr(args, 'system', False)
+        snapshot = get_gateway_runtime_snapshot(system=system)
+        
+        # Check for service first
+        if supports_systemd_services() and (get_systemd_unit_path(system=False).exists() or get_systemd_unit_path(system=True).exists()):
+            systemd_status(deep, system=system, full=full)
+            _print_gateway_process_mismatch(snapshot)
+        elif is_macos() and get_launchd_plist_path().exists():
+            launchd_status(deep)
+            _print_gateway_process_mismatch(snapshot)
+        else:
+            # Check for manually running processes
+            pids = list(snapshot.gateway_pids)
+            if pids:
+                print(f"✔ O gateway está em execução (PID: {', '.join(map(str, pids))})")
+                print("  (Executando manualmente, não como um serviço do sistema)")
+                runtime_lines = _runtime_health_lines()
+                if runtime_lines:
+                    print()
+                    print("Saúde recente do gateway:")
+                    for line in runtime_lines:
+                        print(f"  {line}")
+                print()
+                if is_termux():
+                    print("Nota do Termux:")
+                    print("  O Android pode parar tarefas em segundo plano quando o Termux é suspenso")
+                elif is_wsl():
+                    print("Nota do WSL:")
+                    print("  O gateway está executando em modo de primeiro plano/manual (recomendado para WSL).")
+                    print("  Use tmux ou screen para persistência ao fechar o terminal.")
+                else:
+                    print("Para instalar como um serviço:")
+                    print("  ector gateway install")
+                    print("  sudo ector gateway install --system")
+            else:
+                print("✖ O gateway não está em execução")
+                runtime_lines = _runtime_health_lines()
+                if runtime_lines:
+                    print()
+                    print("Saúde recente do gateway:")
+                    for line in runtime_lines:
+                        print(f"  {line}")
+                print()
+                print("Para iniciar:")
+                print("  ector gateway run      # Executar em primeiro plano")
+                if is_termux():
+                    print("  nohup ector gateway run > ~/.ector/logs/gateway.log 2>&1 &  # Início em segundo plano (esforço máximo)")
+                elif is_wsl():
+                    print("  tmux new -s ector 'ector gateway run'         # persistente via tmux")
+                    print("  nohup ector gateway run > ~/.ector/logs/gateway.log 2>&1 &  # segundo plano")
+                else:
+                    print("  ector gateway install  # Instalar como serviço de usuário")
+                    print("  sudo ector gateway install --system  # Instalar como serviço de sistema no boot")
+
+    elif subcmd == "migrate-legacy":
+        # Stop, disable, and remove legacy Ector gateway unit files from
+        # pre-rename installs (e.g. ector.service). Profile units and
+        # unrelated third-party services are never touched.
+        dry_run = getattr(args, 'dry_run', False)
+        yes = getattr(args, 'yes', False)
+        if not supports_systemd_services() and not is_macos():
+            print("A migração de unidades legadas só se aplica a hosts Linux baseados em systemd.")
+            return
+        remove_legacy_ector_units(interactive=not yes, dry_run=dry_run)

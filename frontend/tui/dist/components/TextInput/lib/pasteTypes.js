@@ -1,0 +1,1 @@
+export const isPasteResultPromise = value => !!value && typeof value.then === 'function';

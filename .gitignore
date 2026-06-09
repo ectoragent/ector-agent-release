@@ -1,0 +1,78 @@
+.DS_Store
+.pnpm-store/
+/venv/
+/_pycache/
+*.pyc*
+__pycache__/
+.venv/
+.vscode/*
+!.vscode/settings.json
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.env.development
+.env.test
+export*
+__pycache__/model_tools.cpython-310.pyc
+__pycache__/web_tools.cpython-310.pyc
+logs/
+data/
+.pytest_cache/
+tmp/
+temp_vision_images/
+ector-*/*
+ector-*/*
+examples/
+tests/quick_test_dataset.jsonl
+tests/sample_dataset.jsonl
+run_datagen_kimik2-thinking.sh
+run_datagen_megascience_glm4-6.sh
+run_datagen_sonnet.sh
+source-data/*
+run_datagen_megascience_glm4-6.sh
+data/*
+node_modules/
+browser-use/
+agent-browser/
+# Private keys
+*.ppk
+*.pem
+privvy*
+images/
+__pycache__/
+*.egg-info/
+wandb/
+testlogs
+
+# CLI config (may contain sensitive SSH paths)
+cli-config.yaml
+
+# Skills Hub state (em runtime: ~/.ector/skills/.hub/ — por garantia)
+skills/.hub/
+
+# Skills indexes/caches (gerados)
+skills/index-cache/
+ignored/
+.worktrees/
+environments/benchmarks/evals/
+
+# Web UI build output
+ector_cli/web_dist/
+
+# Web UI assets — `frontend/dashboard` prebuild ensures dirs exist (see sync-assets in frontend/dashboard/package.json).
+frontend/dashboard/public/fonts/
+frontend/dashboard/public/ds-assets/
+
+# Release script temp files
+.release_notes.md
+mini-swe-agent/
+
+# Nix
+.direnv/
+.nix-stamps/
+result
+website/static/api/skills-index.json
+.cursor/
+.release-sync/
