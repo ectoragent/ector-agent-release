@@ -2726,6 +2726,92 @@ def offer_gateway_service_actions() -> None:
         print_info("  Execute em primeiro plano: ector gateway run")
 
 
+def gateway_is_active(*, all_profiles: bool = False) -> bool:
+    """Return True when a gateway service or process is running."""
+    if _is_service_running():
+        return True
+    return bool(find_gateway_pids(all_profiles=all_profiles))
+
+
+def _wait_for_gateway_active(*, timeout: float = 30.0, all_profiles: bool = False) -> bool:
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if gateway_is_active(all_profiles=all_profiles):
+            return True
+        time.sleep(0.5)
+    return gateway_is_active(all_profiles=all_profiles)
+
+
+def _start_gateway_background() -> bool:
+    import time
+
+    from ector_constants import get_ector_home
+
+    home = get_ector_home()
+    log_path = home / "logs" / "gateway.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    ector_cmd = shutil.which("ector") or "ector"
+    try:
+        with open(log_path, "a", encoding="utf-8") as logf:
+            proc = subprocess.Popen(
+                [ector_cmd, "gateway", "run", "-q"],
+                stdin=subprocess.DEVNULL,
+                stdout=logf,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+    except OSError:
+        return False
+
+    for _ in range(40):
+        if find_gateway_pids(all_profiles=False):
+            return True
+        if proc.poll() is not None:
+            return False
+        time.sleep(0.5)
+    return bool(find_gateway_pids(all_profiles=False))
+
+
+def restart_gateway_after_update() -> bool:
+    """Best-effort gateway restart used after ``ector update``."""
+    system = _select_systemd_scope(False)
+
+    if supports_systemd_services() and (
+        get_systemd_unit_path(system=False).exists()
+        or get_systemd_unit_path(system=True).exists()
+    ):
+        try:
+            systemd_restart(system=system)
+            if _wait_for_gateway_active():
+                return True
+        except (subprocess.CalledProcessError, UserSystemdUnavailableError):
+            pass
+        try:
+            systemd_start(system=system)
+            if _wait_for_gateway_active():
+                return True
+        except (subprocess.CalledProcessError, UserSystemdUnavailableError):
+            pass
+
+    if is_macos() and get_launchd_plist_path().exists():
+        try:
+            launchd_restart()
+            if _wait_for_gateway_active():
+                return True
+        except subprocess.CalledProcessError:
+            pass
+        try:
+            launchd_start()
+            if _wait_for_gateway_active():
+                return True
+        except subprocess.CalledProcessError:
+            pass
+
+    return _start_gateway_background()
+
+
 def _is_service_installed() -> bool:
     """Verifica se o gateway está instalado como um serviço do sistema."""
     if supports_systemd_services():

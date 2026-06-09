@@ -203,11 +203,29 @@ def _stop_gateways_quietly() -> None:
     _ok(f"Gateway: {n} {word} parado(s)")
 
 
-def _restart_gateways_hint() -> None:
+def _restart_gateway_if_needed(was_active: bool) -> None:
+    if not was_active:
+        return
+
     print()
-    _info("Reinicie o gateway quando quiser:")
-    print(color("    ector gateway restart", Colors.DIM))
-    print(color("    ector gateway start   # se não usa serviço", Colors.DIM))
+    _info("Reiniciando gateway...")
+    sys.stdout.flush()
+    try:
+        from ector_cli.gateway import restart_gateway_after_update
+
+        if restart_gateway_after_update():
+            _ok("Gateway reiniciado")
+            return
+    except Exception as exc:
+        logger.debug("Gateway restart after update failed: %s", exc)
+
+    _warn("Não foi possível reiniciar o gateway automaticamente")
+
+
+def _print_version_screen() -> None:
+    from ector_cli.presentation import print_version_screen
+
+    print_version_screen()
 
 
 def _resolve_update_install_dir() -> Path:
@@ -767,6 +785,14 @@ def cmd_update(args) -> None:
 
     _run_pre_update_backup(args)
 
+    was_gateway_active = False
+    try:
+        from ector_cli.gateway import gateway_is_active
+
+        was_gateway_active = gateway_is_active(all_profiles=True)
+    except Exception as exc:
+        logger.debug("Could not detect gateway state before update: %s", exc)
+
     _info("Preparando atualização...")
     sys.stdout.flush()
     _stop_gateways_quietly()
@@ -790,4 +816,5 @@ def cmd_update(args) -> None:
         if updated:
             _ok(f"Atualizado para {updated}")
 
-    _restart_gateways_hint()
+    _restart_gateway_if_needed(was_gateway_active)
+    _print_version_screen()
