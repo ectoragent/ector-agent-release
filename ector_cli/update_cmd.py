@@ -17,24 +17,28 @@ logger = logging.getLogger(__name__)
 _MAX_INSTALL_ATTEMPTS = 2
 
 
+def _status_line(icon: str, icon_color: str, msg: str) -> None:
+    print(f"{color(icon, icon_color)} {msg}")
+
+
 def _ok(msg: str) -> None:
-    print(color(f"✔ {msg}", Colors.GREEN))
+    _status_line("✔", Colors.GREEN, msg)
 
 
 def _warn(msg: str) -> None:
-    print(color(f"▲ {msg}", Colors.YELLOW))
+    _status_line("▲", Colors.YELLOW, msg)
 
 
 def _info(msg: str) -> None:
-    print(color(f"→ {msg}", Colors.CYAN))
+    print(f"→ {msg}")
 
 
 def _fail(msg: str) -> None:
-    print(color(f"✗ {msg}", Colors.RED))
+    _status_line("✗", Colors.RED, msg)
 
 
 def _title(text: str) -> None:
-    print(color(text, Colors.CYAN, Colors.BOLD))
+    print(text)
     print()
 
 
