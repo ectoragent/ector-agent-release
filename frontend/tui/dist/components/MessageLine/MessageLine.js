@@ -7,6 +7,7 @@ import { backgroundMessageParts, userDisplay } from '../../domain/messages.js';
 import { ROLE } from '../../domain/roles.js';
 import { TOOL_BLOCK_MARGIN_LEFT, TRANSCRIPT_BUBBLE_PAD_X, TRANSCRIPT_BUBBLE_PAD_Y, transcriptContentCols } from '../../domain/transcriptLayout.js';
 import { boundedHistoryRenderText, boundedLiveRenderText, compactPreview, hasAnsi, isPasteBackedText, stripAnsi } from '../../lib/text.js';
+import { isHeavyTranscriptMessage } from '../../lib/virtualHeights.js';
 import { Md } from '../Markdown/index.js';
 import { StreamingMd } from '../StreamingMarkdown/index.js';
 import { ToolTrail } from '../Thinking/index.js';
@@ -26,6 +27,7 @@ export const MessageLine = memo(function MessageLine({
   toolTrailLive,
   tools = []
 }) {
+  const boundedRender = limitHistoryRender || isHeavyTranscriptMessage(msg.text, cols);
   const trailExtras = toolTrailLive ?? {};
   const liveTools = trailExtras.tools ?? tools;
   const liveTrail = trailExtras.trail ?? msg.tools ?? [];
@@ -149,7 +151,7 @@ export const MessageLine = memo(function MessageLine({
     }
     if (msg.kind === 'background') {
       const mdWidth = Math.max(24, contentCols - 4);
-      const mdText = limitHistoryRender ? boundedHistoryRenderText(msg.text) : msg.text;
+      const mdText = boundedRender ? boundedHistoryRenderText(msg.text) : msg.text;
       return _jsx(Md, {
         compact: compact,
         t: t,
@@ -160,7 +162,7 @@ export const MessageLine = memo(function MessageLine({
     const legacyBg = msg.role === 'system' ? backgroundMessageParts(msg.text) : null;
     if (legacyBg) {
       const mdWidth = Math.max(24, contentCols - 4);
-      const mdText = limitHistoryRender ? boundedHistoryRenderText(legacyBg.body) : legacyBg.body;
+      const mdText = boundedRender ? boundedHistoryRenderText(legacyBg.body) : legacyBg.body;
       return _jsx(Md, {
         compact: compact,
         t: t,
@@ -181,7 +183,7 @@ export const MessageLine = memo(function MessageLine({
       }) : _jsx(Md, {
         compact: compact,
         t: t,
-        text: limitHistoryRender ? boundedHistoryRenderText(msg.text) : msg.text,
+        text: boundedRender ? boundedHistoryRenderText(msg.text) : msg.text,
         width: Math.max(24, contentCols - 4)
       });
     }

@@ -30,6 +30,7 @@ import { jsx as _jsx, jsxs as _jsxs } from "react/jsx-runtime";
 // affected.
 import { Box } from '@ector/ink';
 import { memo, useRef } from 'react';
+import { isTableDivider } from '../Markdown/lib/blockRegex.js';
 import { Md } from '../Markdown/index.js';
 // Count ``` or ~~~ fence toggles in `s` up to `end`. Odd = currently inside
 // a fenced block; we can't split the prefix there or we'd orphan the fence.
@@ -53,7 +54,7 @@ const fenceOpenAt = (s, end) => {
 // Find the last "\n\n" boundary before `end` that is OUTSIDE a fenced code
 // block. Returns the index AFTER the second newline (start of the next
 // block), or -1 if no safe boundary exists yet.
-export const findStableBoundary = text => {
+const findBlankLineBoundary = text => {
   let idx = text.length;
   while (idx > 0) {
     const boundary = text.lastIndexOf('\n\n', idx - 1);
@@ -69,6 +70,45 @@ export const findStableBoundary = text => {
     idx = boundary;
   }
   return -1;
+};
+/** Tabelas GFM não têm linha em branco entre linhas — congelar prefixo a cada linha completa. */
+export const findTableRowBoundary = text => {
+  if (!text || fenceOpenAt(text, text.length)) {
+    return -1;
+  }
+  const lines = text.split('\n');
+  const gfm = lines.length >= 2 && lines[0].includes('|') && isTableDivider(lines[1]);
+  const pipe = !gfm && Boolean(lines[0]?.trim().startsWith('|'));
+  if (!gfm && !pipe) {
+    return -1;
+  }
+  const endsWithNewline = text.endsWith('\n');
+  let lastComplete = endsWithNewline ? lines.length - 1 : lines.length - 2;
+  // split('\n') on a trailing newline adds a final '' — don't treat it as a row.
+  if (endsWithNewline && lines[lastComplete] === '') {
+    lastComplete -= 1;
+  }
+  if (gfm && lastComplete < 1) {
+    return -1;
+  }
+  if (pipe && lastComplete < 0) {
+    return -1;
+  }
+  const prefix = lines.slice(0, lastComplete + 1).join('\n');
+  if (lastComplete < lines.length - 1) {
+    return prefix.length + 1;
+  }
+  if (endsWithNewline) {
+    return prefix.length + 1;
+  }
+  return prefix.length > 0 ? prefix.length : -1;
+};
+export const findStableBoundary = text => {
+  const blank = findBlankLineBoundary(text);
+  if (blank >= 0) {
+    return blank;
+  }
+  return findTableRowBoundary(text);
 };
 export const StreamingMd = memo(function StreamingMd({
   compact,

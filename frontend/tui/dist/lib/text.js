@@ -1,4 +1,4 @@
-import { HISTORY_RENDER_MAX_CHARS, HISTORY_RENDER_MAX_LINES, LIVE_RENDER_MAX_CHARS, LIVE_RENDER_MAX_LINES, THINKING_COT_MAX } from '../config/limits.js';
+import { HISTORY_RENDER_MAX_CHARS, HISTORY_RENDER_MAX_LINES, LIVE_RENDER_MAX_CHARS, LIVE_RENDER_MAX_LINES, LIVE_RENDER_TABLE_MAX_CHARS, LIVE_RENDER_TABLE_MAX_LINES, THINKING_COT_MAX } from '../config/limits.js';
 /** PT — linhas de status removidas por `cleanThinkingText`. */
 const THINKING_STRIP_VERBS_PT = ['pensando', 'refletindo', 'considerando', 'cogitando', 'deliberando', 'matutando', 'processando', 'raciocinando', 'analisando', 'computando', 'sintetizando', 'formulando', 'estruturando ideias'];
 /** EN legado em trilhas de raciocínio do modelo. */
@@ -40,13 +40,17 @@ export const thinkingPreview = (reasoning, mode, max = THINKING_COT_MAX) => {
   const raw = cleanThinkingText(reasoning);
   return !raw || mode === 'collapsed' ? '' : mode === 'full' ? raw : compactPreview(raw.replace(WS_RE, ' '), max);
 };
+const looksLikeMarkdownTable = text => text.includes('|') && /^\s*\|.+\|/m.test(text);
 export const boundedLiveRenderText = (text, {
   maxChars = LIVE_RENDER_MAX_CHARS,
   maxLines = LIVE_RENDER_MAX_LINES
-} = {}) => boundedRenderText(text, 'trecho ao vivo', {
-  maxChars,
-  maxLines
-});
+} = {}) => {
+  const table = looksLikeMarkdownTable(text);
+  return boundedRenderText(text, 'trecho ao vivo', {
+    maxChars: table ? Math.min(maxChars, LIVE_RENDER_TABLE_MAX_CHARS) : maxChars,
+    maxLines: table ? Math.min(maxLines, LIVE_RENDER_TABLE_MAX_LINES) : maxLines
+  });
+};
 export const boundedHistoryRenderText = (text, {
   maxChars = HISTORY_RENDER_MAX_CHARS,
   maxLines = HISTORY_RENDER_MAX_LINES

@@ -1,1 +1,0 @@
-import{a as r}from"./markdown-vendor-BGdkdoNG.js";import{P as t}from"./index-BTfMqISy.js";function s(){const e=r.useContext(t);if(!e)throw new Error("usePageHeader must be used within a PageHeaderProvider");return e}export{s as u};

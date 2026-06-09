@@ -1,4 +1,5 @@
-import { REASONING_PULSE_MS, STREAM_BATCH_MS, STREAM_IDLE_BATCH_MS, STREAM_SCROLL_BATCH_MS, STREAM_TYPING_BATCH_MS } from '../../config/timing.js';
+import { REASONING_PULSE_MS, STREAM_BATCH_MS, STREAM_HEAVY_BATCH_MS, STREAM_HEAVY_CHARS, STREAM_IDLE_BATCH_MS, STREAM_SCROLL_BATCH_MS, STREAM_TYPING_BATCH_MS } from '../../config/timing.js';
+import { estimateMarkdownBodyLines } from '../../lib/virtualHeights.js';
 import { INTERRUPT_USER_LABEL, STATUS } from '../../content/uiStatus.js';
 import { appendToolShelfMessage, isToolShelfMessage } from '../../lib/liveProgress.js';
 import { hasReasoningTag, splitReasoning } from '../../lib/reasoning.js';
@@ -585,18 +586,31 @@ export class TurnController {
       });
     }, STREAM_BATCH_MS);
   }
+  streamingPaintDelay(visible) {
+    let delay = this.streamDelay;
+    if (visible.length >= STREAM_HEAVY_CHARS) {
+      delay = Math.max(delay, STREAM_HEAVY_BATCH_MS);
+    }
+    if (visible.includes('|') && estimateMarkdownBodyLines(visible, 80) > 36) {
+      delay = Math.max(delay, STREAM_HEAVY_BATCH_MS);
+    }
+    return delay;
+  }
   scheduleStreaming() {
     if (this.streamTimer) {
       return;
     }
+    const raw = this.bufRef.trimStart();
+    const visible = hasReasoningTag(raw) ? splitReasoning(raw).text : raw;
+    const delay = this.streamingPaintDelay(visible);
     this.streamTimer = setTimeout(() => {
       this.streamTimer = null;
-      const raw = this.bufRef.trimStart();
-      const visible = hasReasoningTag(raw) ? splitReasoning(raw).text : raw;
+      const nextRaw = this.bufRef.trimStart();
+      const nextVisible = hasReasoningTag(nextRaw) ? splitReasoning(nextRaw).text : nextRaw;
       patchTurnState({
-        streaming: boundedLiveRenderText(visible)
+        streaming: boundedLiveRenderText(nextVisible)
       });
-    }, this.streamDelay);
+    }, delay);
   }
   startMessage() {
     this.endReasoningPhase();

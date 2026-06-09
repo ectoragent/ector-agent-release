@@ -4,6 +4,13 @@ export const LARGE_PASTE = {
 };
 export const LIVE_RENDER_MAX_CHARS = 16_000;
 export const LIVE_RENDER_MAX_LINES = 240;
+// Tabelas markdown expandem ~2× em linhas com bordas; limites mais baixos
+// evitam re-tokenizar dezenas de linhas a cada delta de stream (travamento).
+export const LIVE_RENDER_TABLE_MAX_CHARS = 6_000;
+export const LIVE_RENDER_TABLE_MAX_LINES = 40;
+// Mensagens acima disto renderizam truncadas mesmo no tail do transcript.
+export const HEAVY_MSG_MAX_CHARS = 6_000;
+export const HEAVY_MSG_MAX_RENDERED_LINES = 72;
 // History-render bounds for messages outside FULL_RENDER_TAIL. Each rendered
 // line ≈ 1 Yoga/Text node + inline spans, so this is the dominant lever on
 // cold-mount cost during PageUp catch-up. 16 lines × 25 mounted ≈ 400 nodes

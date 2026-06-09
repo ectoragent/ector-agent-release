@@ -1,1 +1,1 @@
-export { findStableBoundary, StreamingMd } from './StreamingMarkdown.js';
+export { findStableBoundary, findTableRowBoundary, StreamingMd } from './StreamingMarkdown.js';

@@ -1,3 +1,6 @@
+import { isTableDivider, splitRow } from '../components/Markdown/lib/blockRegex.js';
+import { buildTableLines } from '../components/Markdown/lib/tableLayout.js';
+import { HEAVY_MSG_MAX_CHARS, HEAVY_MSG_MAX_RENDERED_LINES } from '../config/limits.js';
 import { backgroundMessageParts } from '../domain/messages.js';
 import { SPEAKER_LINE_RESERVE_COLS, TOOL_BLOCK_MARGIN_LEFT, TRANSCRIPT_CARD_HORIZONTAL_GUTTER, TRANSCRIPT_CARD_VERTICAL_PAD, transcriptContentCols } from '../domain/transcriptLayout.js';
 import { boundedHistoryRenderText, stripAnsi } from './text.js';
@@ -17,6 +20,49 @@ export const messageHeightKey = msg => {
 export const wrappedLines = (text, width) => {
   const w = Math.max(1, width);
   return text.split('\n').reduce((n, line) => n + Math.max(1, Math.ceil(line.length / w)), 0);
+};
+/** Matches {@link Markdown} table blocks — box-drawing expands row count vs source lines. */
+export const estimateMarkdownBodyLines = (text, bodyWidth) => {
+  const lines = text.split('\n');
+  const wrapW = Math.max(1, bodyWidth);
+  const tableMaxWidth = Math.max(24, Math.min(bodyWidth, 88));
+  let total = 0;
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (line.includes('|') && i + 1 < lines.length && isTableDivider(lines[i + 1])) {
+      const rows = [splitRow(line)];
+      for (i += 2; i < lines.length && lines[i].includes('|') && lines[i].trim(); i++) {
+        rows.push(splitRow(lines[i]));
+      }
+      total += buildTableLines(rows, tableMaxWidth).length;
+      continue;
+    }
+    if (line.includes('|') && line.trim().startsWith('|')) {
+      const rows = [];
+      while (i < lines.length && lines[i].trim().startsWith('|')) {
+        const row = lines[i].trim();
+        if (!/^[|\s:-]+$/.test(row)) {
+          rows.push(splitRow(row));
+        }
+        i++;
+      }
+      if (rows.length) {
+        total += buildTableLines(rows, tableMaxWidth).length;
+      }
+      continue;
+    }
+    total += Math.max(1, Math.ceil(line.length / wrapW));
+    i++;
+  }
+  return total;
+};
+export const isHeavyTranscriptMessage = (text, cols) => {
+  if (!text || text.length <= HEAVY_MSG_MAX_CHARS) {
+    const bodyWidth = Math.max(20, transcriptContentCols(cols) - SPEAKER_LINE_RESERVE_COLS);
+    return estimateMarkdownBodyLines(text, bodyWidth) > HEAVY_MSG_MAX_RENDERED_LINES;
+  }
+  return true;
 };
 export const estimatedMsgHeight = (msg, cols, {
   compact,
@@ -45,7 +91,7 @@ export const estimatedMsgHeight = (msg, cols, {
   const mdBody = msg.kind === 'background' ? limitHistory ? boundedHistoryRenderText(msg.text) : msg.text : legacyBg ? limitHistory ? boundedHistoryRenderText(legacyBg.body) : legacyBg.body : text;
   // Slash vindo do Rich: medir sem ANSI para o virtualizer não subestimar linhas (scroll cortado).
   const wrapSource = msg.kind === 'slash' ? stripAnsi(text || '').replace(/\r\n/g, '\n') : mdBody || ' ';
-  let h = wrappedLines(wrapSource, bodyWidth);
+  let h = estimateMarkdownBodyLines(wrapSource, bodyWidth);
   if (!compact && (msg.role === 'assistant' || msg.kind === 'background' || legacyBg)) {
     h += Math.min(6, (mdBody.match(/\n\s*\n/g) ?? []).length);
   }
