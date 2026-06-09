@@ -232,7 +232,7 @@ import logging
 import time as _time
 from datetime import datetime
 
-from ector_cli import __version__, __version_code__, __version_name__
+from ector_cli import __version__
 from ector_constants import AI_GATEWAY_BASE_URL, OPENROUTER_BASE_URL, safe_getcwd
 
 logger = logging.getLogger(__name__)

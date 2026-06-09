@@ -23,11 +23,33 @@ from rich.console import Console
 
 from ector_constants import get_ector_home
 from ector_cli import __version__ as VERSION
-from ector_cli import __version_code__ as VERSION_CODE
-from ector_cli import __version_name__ as VERSION_NAME
-from ector_cli.version_info import format_version_label as _format_version_label
 
 logger = logging.getLogger(__name__)
+
+
+def _package_version_meta() -> tuple[str, int]:
+    """Read versionName/versionCode from the loaded package (no extra module)."""
+    try:
+        import ector_cli as pkg
+
+        name = (
+            getattr(pkg, "__version_name__", None)
+            or getattr(pkg, "__version__", None)
+            or VERSION
+            or ""
+        )
+        code = int(getattr(pkg, "__version_code__", 0) or 0)
+        return str(name).strip(), code
+    except Exception:
+        return (str(VERSION or "").strip(), 0)
+
+
+def _format_version_label(version_name: str, version_code: int = 0) -> str:
+    name = (version_name or "").strip().lstrip("vV")
+    if not name:
+        return ""
+    label = f"v{name}"
+    return f"{label} ({version_code})" if version_code > 0 else label
 
 
 # =========================================================================
@@ -253,8 +275,8 @@ def get_latest_release_tag(repo_dir: Optional[Path] = None) -> Optional[tuple]:
 
 def format_version_label() -> str:
     """Version line aligned with the Ink TUI (``formatBannerVersion``)."""
-    name = (VERSION_NAME or VERSION or "").strip()
-    return _format_version_label(name, VERSION_CODE)
+    name, code = _package_version_meta()
+    return _format_version_label(name, code)
 
 
 def _parse_hex_color(value: str) -> Optional[Tuple[int, int, int]]:
