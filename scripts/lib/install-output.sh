@@ -6,12 +6,24 @@ _install_verbose() {
     [ "${ECTOR_INSTALL_VERBOSE:-0}" = 1 ] || [ "${ECTOR_INSTALL_VERBOSE:-}" = true ]
 }
 
+def _install_update_progress() {
+    [ -n "${ECTOR_UPDATE_PROGRESS:-}" ]
+}
+
 _install_step_ok() {
-    printf '✔ %s\n' "$1"
+    if _install_update_progress; then
+        printf 'ECTOR_UPDATE:ok:%s\n' "$1"
+    else
+        printf '✔ %s\n' "$1"
+    fi
 }
 
 _install_step_fail() {
-    printf '✗ %s\n' "$1" >&2
+    if _install_update_progress; then
+        printf 'ECTOR_UPDATE:fail:%s\n' "$1" >&2
+    else
+        printf '✗ %s\n' "$1" >&2
+    fi
 }
 
 _install_step_warn() {
@@ -31,8 +43,12 @@ _install_step() {
     shift
     local log rc=0
 
-    if [ -n "${ECTOR_NONINTERACTIVE:-}" ] && ! _install_verbose; then
+    if [ -n "${ECTOR_NONINTERACTIVE:-}" ] && ! _install_verbose && ! _install_update_progress; then
         printf '→ %s...\n' "$label"
+    fi
+
+    if _install_update_progress; then
+        printf 'ECTOR_UPDATE:start:%s\n' "$label"
     fi
 
     log="$(mktemp "${TMPDIR:-/tmp}/ector-install.XXXXXX")"

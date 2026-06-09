@@ -161,6 +161,10 @@ log_info() {
 }
 
 log_success() {
+    if [ -n "${ECTOR_UPDATE_PROGRESS:-}" ]; then
+        printf 'ECTOR_UPDATE:ok:%s\n' "$1"
+        return 0
+    fi
     if declare -F _install_step_ok >/dev/null 2>&1; then
         _install_step_ok "$1"
     else
