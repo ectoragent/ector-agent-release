@@ -746,7 +746,6 @@ def cmd_update(args) -> None:
         looks_like_release_install_remote,
     )
 
-    _title("Atualização do Ector Agent")
     if is_package_tree_install_dir(install_dir) and not looks_like_release_install_remote(
         install_dir
     ):
