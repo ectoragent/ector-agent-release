@@ -6,7 +6,7 @@ _install_verbose() {
     [ "${ECTOR_INSTALL_VERBOSE:-0}" = 1 ] || [ "${ECTOR_INSTALL_VERBOSE:-}" = true ]
 }
 
-def _install_update_progress() {
+_install_update_progress() {
     [ -n "${ECTOR_UPDATE_PROGRESS:-}" ]
 }
 
