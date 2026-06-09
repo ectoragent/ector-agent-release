@@ -79,13 +79,32 @@ class UpdateProgressUI:
             return self
         from rich.console import Console
         from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
+        from rich.style import Style
+        from rich.theme import Theme
 
+        # Rich default bar.complete is pink/red — use Ector accent (#00D1FF).
+        _accent = "rgb(0,209,255)"
+        console = Console(
+            stderr=True,
+            theme=Theme(
+                {
+                    "bar.back": "grey30",
+                    "bar.complete": _accent,
+                    "bar.finished": "green",
+                }
+            ),
+        )
         self._progress = Progress(
             SpinnerColumn(),
             TextColumn("{task.description}"),
-            BarColumn(bar_width=28),
-            TextColumn("{task.percentage:>3.0f}%"),
-            console=Console(stderr=True),
+            BarColumn(
+                bar_width=28,
+                style=Style(color="grey30"),
+                complete_style=Style(color=_accent),
+                finished_style=Style(color="green"),
+            ),
+            TextColumn(f"[{_accent}]{{task.percentage:>3.0f}}%"),
+            console=console,
             transient=True,
         )
         self._progress.__enter__()
