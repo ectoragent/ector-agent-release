@@ -520,19 +520,10 @@ def _check_updates_available(install_dir: Path) -> int:
 
     upstream = get_cached_update_upstream_label()
     remote = _remote_version_label(install_dir, upstream)
-    commits_word = "commit" if behind == 1 else "commits"
-    if remote and current and remote != current:
-        _ok(
-            f"Atualização disponível: {remote} "
-            f"(instalado: {current}; {behind} {commits_word} atrás de {upstream})"
-        )
-    elif remote:
-        _ok(
-            f"Atualização disponível: {remote} "
-            f"({behind} {commits_word} atrás de {upstream})"
-        )
+    if remote:
+        _ok(f"Atualização disponível: {remote}")
     else:
-        _ok(f"Atualização disponível: {behind} {commits_word} atrás de {upstream}")
+        _ok("Atualização disponível")
     print()
     return behind
 
@@ -1025,21 +1016,10 @@ def cmd_update_check() -> None:
 
     upstream = get_cached_update_upstream_label()
     remote = _remote_version_label(install_dir, upstream)
-    commits_word = "commit" if behind == 1 else "commits"
-    if remote and current and remote != current:
-        print(
-            f"Atualização disponível: {remote} "
-            f"(instalado: {current}; {behind} {commits_word} atrás de {upstream})."
-        )
-    elif remote:
-        print(
-            f"Atualização disponível: {remote} "
-            f"({behind} {commits_word} atrás de {upstream})."
-        )
+    if remote:
+        print(f"Atualização disponível: {remote}.")
     else:
-        print(
-            f"Atualização disponível: {behind} {commits_word} atrás de {upstream}."
-        )
+        print("Atualização disponível.")
     print(color("  Execute: ector update", Colors.DIM))
 
 
