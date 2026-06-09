@@ -907,11 +907,7 @@ clone_repo() {
     fi
 }
 
-setup_venv() {
-    if [ "$USE_VENV" = false ]; then
-        return 0
-    fi
-
+_recreate_venv() {
     if [ -d "venv" ]; then
         rm -rf venv
     fi
@@ -919,8 +915,21 @@ setup_venv() {
     if [ "$DISTRO" = "termux" ]; then
         "$PYTHON_PATH" -m venv venv
     else
-        $UV_CMD venv venv --python "$PYTHON_VERSION" >/dev/null 2>&1
+        $UV_CMD venv venv --python "$PYTHON_VERSION"
     fi
+}
+
+setup_venv() {
+    if [ "$USE_VENV" = false ]; then
+        return 0
+    fi
+
+    if _is_update_mode && declare -F _install_step >/dev/null 2>&1; then
+        _install_step "Ambiente virtual Python" _recreate_venv || exit 1
+        return 0
+    fi
+
+    _recreate_venv || exit 1
     log_success "Ambiente virtual Python"
 }
 
@@ -1530,7 +1539,11 @@ main() {
     if [ -f "$_INSTALL_RUNTIME_LIB" ]; then
         # shellcheck source=scripts/lib/install-runtime-check.sh
         source "$_INSTALL_RUNTIME_LIB"
-        verify_ector_install_core "$INSTALL_DIR"
+        if _is_update_mode && declare -F _install_step >/dev/null 2>&1; then
+            _install_step "Verificação do release" verify_ector_install_core "$INSTALL_DIR" || exit 1
+        else
+            verify_ector_install_core "$INSTALL_DIR" || exit 1
+        fi
     else
         log_warn "install-runtime-check.sh não encontrado — pulando verificação da árvore"
     fi

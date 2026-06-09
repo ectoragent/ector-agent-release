@@ -372,9 +372,63 @@ def _attempt_recovery(install_dir: Path, log: str, env: dict[str, str]) -> bool:
     return recovered
 
 
-def _tail_log_lines(log: str, limit: int = 20) -> list[str]:
+_INSTALL_CHECK_MARKERS = (
+    "Sistema:",
+    "Gerenciador Python (uv)",
+    "Python ",
+    "Git",
+    "Node.js",
+)
+
+
+def _is_install_check_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped.startswith("✔"):
+        return False
+    body = stripped[1:].strip()
+    return any(marker in body for marker in _INSTALL_CHECK_MARKERS)
+
+
+def _extract_install_failure_lines(log: str, *, limit: int = 20) -> list[str]:
+    """Prefer actionable errors over repeated prerequisite check lines."""
     lines = [ln.rstrip() for ln in log.splitlines() if ln.strip()]
+    if not lines:
+        return []
+
+    error_markers = (
+        "✗",
+        "instalação incompleta",
+        "pacote clonado",
+        "failed",
+        "error:",
+        "fatal:",
+        "ff-only",
+        "not possible to fast-forward",
+        "could not read from remote",
+        "gerenciador python (uv) —",
+        "git not found",
+    )
+    hits: list[str] = []
+    for idx, line in enumerate(lines):
+        lower = line.lower()
+        if line.strip().startswith("✗") or any(marker in lower for marker in error_markers):
+            hits.append(line)
+            for follow in lines[idx + 1 : idx + 6]:
+                if follow.startswith("  ") or follow.lstrip().startswith("- "):
+                    hits.append(follow)
+                else:
+                    break
+    if hits:
+        return hits[-limit:]
+
+    non_check = [ln for ln in lines if not _is_install_check_line(ln)]
+    if non_check:
+        return non_check[-limit:]
     return lines[-limit:]
+
+
+def _tail_log_lines(log: str, limit: int = 20) -> list[str]:
+    return _extract_install_failure_lines(log, limit=limit)
 
 
 def _diagnose_failure(log: str) -> str | None:

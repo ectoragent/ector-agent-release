@@ -18,6 +18,14 @@ _install_step_warn() {
     printf '▲ %s\n' "$1" >&2
 }
 
+_install_show_fail_log() {
+    local log="$1"
+    [ -f "$log" ] || return 0
+    if _install_verbose || [ -n "${ECTOR_NONINTERACTIVE:-}" ]; then
+        tail -30 "$log" >&2 || true
+    fi
+}
+
 _install_step() {
     local label="$1"
     shift
@@ -30,9 +38,7 @@ _install_step() {
     fi
     rc=$?
     _install_step_fail "$label"
-    if _install_verbose; then
-        tail -30 "$log" >&2 || true
-    fi
+    _install_show_fail_log "$log"
     rm -f "$log"
     return "$rc"
 }
