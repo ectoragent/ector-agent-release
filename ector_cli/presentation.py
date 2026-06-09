@@ -25,6 +25,7 @@ from ector_constants import get_ector_home
 from ector_cli import __version__ as VERSION
 from ector_cli import __version_code__ as VERSION_CODE
 from ector_cli import __version_name__ as VERSION_NAME
+from ector_cli.version_info import format_version_label as _format_version_label
 
 logger = logging.getLogger(__name__)
 
@@ -248,10 +249,8 @@ def get_latest_release_tag(repo_dir: Optional[Path] = None) -> Optional[tuple]:
 
 def format_version_label() -> str:
     """Version line aligned with the Ink TUI (``formatBannerVersion``)."""
-    name = (VERSION_NAME or VERSION or "").strip().lstrip("vV")
-    code = VERSION_CODE
-    label = f"v{name}"
-    return f"{label} ({code})" if code else label
+    name = (VERSION_NAME or VERSION or "").strip()
+    return _format_version_label(name, VERSION_CODE)
 
 
 def _parse_hex_color(value: str) -> Optional[Tuple[int, int, int]]:

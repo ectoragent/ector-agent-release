@@ -193,7 +193,25 @@ def _resolve_update_install_dir() -> Path:
     return install_dir
 
 
-def _check_updates_available() -> int:
+def _installed_version_label(install_dir: Path) -> str | None:
+    from ector_cli.version_info import format_version_label, read_install_version
+
+    meta = read_install_version(install_dir)
+    if meta is None:
+        return None
+    return format_version_label(*meta)
+
+
+def _remote_version_label(install_dir: Path, upstream_label: str) -> str | None:
+    from ector_cli.version_info import format_version_label, read_git_ref_version
+
+    meta = read_git_ref_version(install_dir, upstream_label)
+    if meta is None:
+        return None
+    return format_version_label(*meta)
+
+
+def _check_updates_available(install_dir: Path) -> int:
     """Return commits behind upstream, or exit on failure / already up to date."""
     from ector_cli.presentation import check_for_updates, get_cached_update_upstream_label
 
@@ -202,13 +220,30 @@ def _check_updates_available() -> int:
     if behind is None:
         _fail("Não foi possível verificar atualizações (rede ou git).")
         sys.exit(1)
+
+    current = _installed_version_label(install_dir)
     if behind == 0:
-        _ok("Já está na versão mais recente")
+        if current:
+            _ok(f"Já está na versão mais recente — {current}")
+        else:
+            _ok("Já está na versão mais recente")
         sys.exit(0)
 
     upstream = get_cached_update_upstream_label()
+    remote = _remote_version_label(install_dir, upstream)
     commits_word = "commit" if behind == 1 else "commits"
-    _ok(f"Atualização disponível: {behind} {commits_word} atrás de {upstream}")
+    if remote and current and remote != current:
+        _ok(
+            f"Atualização disponível: {remote} "
+            f"(instalado: {current}; {behind} {commits_word} atrás de {upstream})"
+        )
+    elif remote:
+        _ok(
+            f"Atualização disponível: {remote} "
+            f"({behind} {commits_word} atrás de {upstream})"
+        )
+    else:
+        _ok(f"Atualização disponível: {behind} {commits_word} atrás de {upstream}")
     print()
     return behind
 
@@ -390,7 +425,7 @@ def _run_installer_update(installer: Path, install_dir: Path, env: dict[str, str
 
 
 def cmd_update_check() -> None:
-    _resolve_update_install_dir()
+    install_dir = _resolve_update_install_dir()
 
     from ector_cli.presentation import check_for_updates, get_cached_update_upstream_label
 
@@ -398,15 +433,32 @@ def cmd_update_check() -> None:
     if behind is None:
         _fail("Não foi possível verificar atualizações (rede ou git).")
         sys.exit(1)
+
+    current = _installed_version_label(install_dir)
     if behind == 0:
-        _ok("Já está na versão mais recente")
+        if current:
+            _ok(f"Já está na versão mais recente — {current}")
+        else:
+            _ok("Já está na versão mais recente")
         return
 
     upstream = get_cached_update_upstream_label()
+    remote = _remote_version_label(install_dir, upstream)
     commits_word = "commit" if behind == 1 else "commits"
-    print(
-        f"Atualização disponível: {behind} {commits_word} atrás de {upstream}."
-    )
+    if remote and current and remote != current:
+        print(
+            f"Atualização disponível: {remote} "
+            f"(instalado: {current}; {behind} {commits_word} atrás de {upstream})."
+        )
+    elif remote:
+        print(
+            f"Atualização disponível: {remote} "
+            f"({behind} {commits_word} atrás de {upstream})."
+        )
+    else:
+        print(
+            f"Atualização disponível: {behind} {commits_word} atrás de {upstream}."
+        )
     print(color("  Execute: ector update", Colors.DIM))
 
 
@@ -435,7 +487,9 @@ def cmd_update(args) -> None:
     )
 
     _title("Atualização do Ector Agent")
-    print(color(f"  Instalação: {install_dir}", Colors.DIM))
+    current = _installed_version_label(install_dir)
+    if current:
+        print(color(f"  Versão instalada: {current}", Colors.DIM))
     if is_package_tree_install_dir(install_dir) and not looks_like_release_install_remote(
         install_dir
     ):
@@ -453,7 +507,7 @@ def cmd_update(args) -> None:
         )
     print()
 
-    _check_updates_available()
+    _check_updates_available(install_dir)
 
     _run_pre_update_backup(args)
     _stop_gateways_quietly()
@@ -465,5 +519,9 @@ def cmd_update(args) -> None:
 
     if result != 0:
         sys.exit(result)
+
+    updated = _installed_version_label(install_dir)
+    if updated:
+        _ok(f"Atualizado para {updated}")
 
     _restart_gateways_hint()
