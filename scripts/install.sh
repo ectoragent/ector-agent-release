@@ -1039,8 +1039,9 @@ install_deps() {
         _install_step "Pacote Python e dependências" bash -c \
             "cd \"$(printf '%q' "$INSTALL_DIR")\" && \
              export VIRTUAL_ENV=\"$(printf '%q' "$INSTALL_DIR/venv")\" && \
-             $UV_CMD pip install --python venv/bin/python --upgrade '.[all]' || \
-             $UV_CMD pip install --python venv/bin/python --upgrade '.'" || exit 1
+             export UV_NO_PROGRESS=1 UV_COLOR=never && \
+             $UV_CMD pip install -q --no-progress --python venv/bin/python --upgrade '.[all]' || \
+             $UV_CMD pip install -q --no-progress --python venv/bin/python --upgrade '.'" || exit 1
     else
         _install_step "Pacote Python e dependências" bash -c \
             "$UV_CMD pip install '.[all]' 2>/dev/null || $UV_CMD pip install '.'" || exit 1

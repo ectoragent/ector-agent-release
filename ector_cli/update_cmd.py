@@ -70,9 +70,11 @@ class UpdateProgressUI:
 
     @staticmethod
     def _should_enable() -> bool:
-        from ector_cli.colors import should_use_color
-
-        return sys.stderr.isatty() and should_use_color()
+        if os.environ.get("NO_COLOR") is not None:
+            return False
+        if os.environ.get("TERM") == "dumb":
+            return False
+        return sys.stderr.isatty()
 
     def __enter__(self) -> UpdateProgressUI:
         if not self.enabled:
@@ -171,6 +173,36 @@ class UpdateProgressUI:
             self._progress.update(self._task_id, description="Tentando novamente...")
 
 
+def _emit_update_install_line(line: str, progress: UpdateProgressUI | None) -> None:
+    """Map install protocol lines to UI; drop tool noise (uv, npm, …)."""
+    if progress is not None and progress.enabled:
+        progress.handle_install_line(line)
+        return
+
+    stripped = line.strip()
+    if not stripped:
+        return
+
+    if stripped.startswith(_UPDATE_EVENT_OK):
+        _ok(_friendly_install_step(stripped[len(_UPDATE_EVENT_OK) :]))
+        return
+    if stripped.startswith(_UPDATE_EVENT_FAIL):
+        body = stripped[len(_UPDATE_EVENT_FAIL) :].strip() or stripped
+        _fail(body)
+        return
+    if stripped.startswith(_UPDATE_EVENT_START):
+        _info(_friendly_install_step(stripped[len(_UPDATE_EVENT_START) :]))
+        return
+    if stripped.startswith("✔ "):
+        _ok(stripped[2:])
+        return
+    if stripped.startswith("✗ "):
+        _fail(stripped[2:])
+        return
+    if stripped.startswith("▲ "):
+        _warn(stripped[2:])
+
+
 def _status_line(icon: str, icon_color: str, msg: str) -> None:
     print(f"{color(icon, icon_color)} {msg}")
 
@@ -236,6 +268,8 @@ def _install_env(install_dir: Path) -> dict[str, str]:
         "ECTOR_NONINTERACTIVE": "1",
         "ECTOR_INSTALL_COMPACT": "1",
         "ECTOR_UPDATE_PROGRESS": "1",
+        "UV_NO_PROGRESS": "1",
+        "UV_COLOR": "never",
         "GIT_TERMINAL_PROMPT": "0",
         "GIT_PAGER": "cat",
         "GCM_INTERACTIVE": "Never",
@@ -514,6 +548,7 @@ def _run_shell(
     env: dict | None = None,
     stream: bool = False,
     log_file: Path | None = None,
+    silent: bool = False,
 ) -> tuple[int, str]:
     """Run a shell command.
 
@@ -564,10 +599,11 @@ def _run_shell(
         check=False,
     )
     combined = f"{proc.stdout or ''}{proc.stderr or ''}"
-    if proc.stdout:
-        print(proc.stdout, end="")
-    if proc.stderr:
-        print(proc.stderr, end="", file=sys.stderr)
+    if not silent:
+        if proc.stdout:
+            print(proc.stdout, end="")
+        if proc.stderr:
+            print(proc.stderr, end="", file=sys.stderr)
     return proc.returncode, combined
 
 
@@ -697,11 +733,11 @@ def _retry_pip_install(install_dir: Path, env: dict[str, str]) -> tuple[bool, st
     py = shlex.quote(str(venv_python))
     venv = shlex.quote(str(install_dir / "venv"))
     shell = (
-        f"cd {root} && export VIRTUAL_ENV={venv} && "
-        f"{uv} pip install --python {py} --upgrade '.[all]' || "
-        f"{uv} pip install --python {py} --upgrade '.'"
+        f"cd {root} && export VIRTUAL_ENV={venv} UV_NO_PROGRESS=1 UV_COLOR=never && "
+        f"{uv} pip install -q --no-progress --python {py} --upgrade '.[all]' || "
+        f"{uv} pip install -q --no-progress --python {py} --upgrade '.'"
     )
-    rc, log = _run_shell(["bash", "-c", shell], cwd=install_dir, env=env)
+    rc, log = _run_shell(["bash", "-c", shell], cwd=install_dir, env=env, silent=True)
     return rc == 0, log
 
 
@@ -902,7 +938,7 @@ def _run_installer_update(
     progress: UpdateProgressUI | None = None,
 ) -> tuple[int, bool]:
     """Return ``(exit_code, success_already_reported)``."""
-    quiet = progress is not None and progress.enabled
+    use_bar = progress is not None and progress.enabled
     if installer.suffix.lower() == ".ps1":
         cmd = [
             "powershell",
@@ -918,34 +954,28 @@ def _run_installer_update(
     last_rc = 1
     last_log = ""
 
-    if not quiet:
+    if not use_bar:
         _info("Aplicando atualização...")
-        print()
 
     log_fd, log_path_str = tempfile.mkstemp(prefix="ector-update-", suffix=".log")
     os.close(log_fd)
     log_path = Path(log_path_str)
 
+    def _on_install_line(line: str) -> None:
+        _emit_update_install_line(line, progress)
+
     def _run_attempt() -> tuple[int, str]:
-        if quiet:
-            return _run_installer_streaming(
-                cmd,
-                cwd=install_dir,
-                env=env,
-                on_line=progress.handle_install_line,
-            )
-        return _run_shell(
+        return _run_installer_streaming(
             cmd,
             cwd=install_dir,
             env=env,
-            stream=True,
-            log_file=log_path,
+            on_line=_on_install_line,
         )
 
     try:
         for attempt in range(1, _MAX_INSTALL_ATTEMPTS + 1):
             if attempt > 1:
-                if quiet:
+                if use_bar:
                     progress.note_retry()
                 else:
                     print()
