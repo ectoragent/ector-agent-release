@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import logging
 import os
+import shlex
 import subprocess
 import sys
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from pathlib import Path
 
@@ -305,17 +307,37 @@ def _run_shell(
     cwd: Path | None = None,
     env: dict | None = None,
     stream: bool = False,
+    log_file: Path | None = None,
 ) -> tuple[int, str]:
     """Run a shell command.
 
-    ``stream=True`` attaches stdout/stderr to the terminal (no pipe capture).
-    Piping install.sh stdout causes block-buffering stalls that make ``ector
-    update`` look hung unless ``ECTOR_INSTALL_VERBOSE=1`` adds enough traffic
-    to flush the buffer.
+    ``stream=True`` attaches stdout/stderr to the terminal. When ``log_file`` is
+    set, output is also tee'd there for post-mortem analysis on failure.
     """
     run_cwd = str(cwd) if cwd else None
     if stream:
         try:
+            if log_file is not None:
+                log_file.parent.mkdir(parents=True, exist_ok=True)
+                log_q = shlex.quote(str(log_file))
+                inner = " ".join(shlex.quote(part) for part in cmd)
+                script = (
+                    f"set -o pipefail; {inner} 2>&1 | tee {log_q}; "
+                    "exit ${PIPESTATUS[0]}"
+                )
+                proc = subprocess.run(
+                    ["bash", "-c", script],
+                    cwd=run_cwd,
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    check=False,
+                )
+                log = (
+                    log_file.read_text(encoding="utf-8", errors="replace")
+                    if log_file.is_file()
+                    else ""
+                )
+                return proc.returncode, log
             proc = subprocess.run(
                 cmd,
                 cwd=run_cwd,
@@ -402,6 +424,75 @@ def _sync_git(install_dir: Path, env: dict[str, str]) -> bool:
     return rc == 0
 
 
+def _install_git_pull_ok(log: str) -> bool:
+    return "✔ Código do Ector (git pull)" in log
+
+
+def _resolve_uv_cmd(env: dict[str, str]) -> str:
+    for candidate in ("uv", str(Path.home() / ".local" / "bin" / "uv")):
+        if subprocess.run(
+            [candidate, "--version"],
+            env=env,
+            capture_output=True,
+            check=False,
+        ).returncode == 0:
+            return candidate
+    return "uv"
+
+
+def _retry_pip_install(install_dir: Path, env: dict[str, str]) -> tuple[bool, str]:
+    """Re-run ``uv pip install`` into the install venv after a partial update."""
+    venv_python = install_dir / "venv" / "bin" / "python"
+    if not venv_python.is_file():
+        return False, "venv/bin/python não encontrado"
+
+    uv = _resolve_uv_cmd(env)
+    root = shlex.quote(str(install_dir))
+    py = shlex.quote(str(venv_python))
+    venv = shlex.quote(str(install_dir / "venv"))
+    shell = (
+        f"cd {root} && export VIRTUAL_ENV={venv} && "
+        f"{uv} pip install --python {py} --upgrade '.[all]' || "
+        f"{uv} pip install --python {py} --upgrade '.'"
+    )
+    rc, log = _run_shell(["bash", "-c", shell], cwd=install_dir, env=env)
+    return rc == 0, log
+
+
+def _try_recover_partial_update(
+    install_dir: Path,
+    env: dict[str, str],
+    log: str,
+) -> bool:
+    """When git already moved forward, finish deps instead of leaving a false failure."""
+    behind = _commits_behind(install_dir, force_refresh=True)
+    git_ok = _install_git_pull_ok(log)
+    if not git_ok and (behind is None or behind > 0):
+        return False
+
+    print()
+    _warn("Código já atualizado; concluindo dependências Python...")
+    current = _installed_version_label(install_dir)
+    if current:
+        print(color(f"  Versão no disco: {current}", Colors.DIM))
+
+    ok, pip_log = _retry_pip_install(install_dir, env)
+    if ok:
+        label = _installed_version_label(install_dir) or current
+        if label:
+            _ok(f"Atualizado para {label}")
+        else:
+            _ok("Atualização concluída")
+        return True
+
+    if pip_log.strip():
+        print()
+        print(color("  Erro ao instalar dependências:", Colors.DIM))
+        for line in _tail_log_lines(pip_log, limit=12):
+            print(color(f"    {line}", Colors.DIM))
+    return False
+
+
 def _attempt_recovery(install_dir: Path, log: str, env: dict[str, str]) -> bool:
     text = log.lower()
     recovered = False
@@ -423,6 +514,9 @@ def _attempt_recovery(install_dir: Path, log: str, env: dict[str, str]) -> bool:
         )
     ):
         recovered = _sync_git(install_dir, env) or recovered
+
+    if _install_git_pull_ok(log):
+        recovered = _retry_pip_install(install_dir, env)[0] or recovered
 
     return recovered
 
@@ -488,6 +582,11 @@ def _tail_log_lines(log: str, limit: int = 20) -> list[str]:
 
 def _diagnose_failure(log: str) -> str | None:
     text = log.lower()
+    if "pacote python" in text and "✗" in log:
+        return (
+            "Falha ao instalar dependências Python. "
+            "O código git já pode estar atualizado — tente `ector update` de novo."
+        )
     if "instalação incompleta" in text or "pacote clonado" in text:
         return (
             "O release público está incompleto (faltam artefactos de UI ou runtime). "
@@ -529,7 +628,8 @@ def _report_update_cancelled() -> None:
     _warn("Atualização cancelada.")
 
 
-def _run_installer_update(installer: Path, install_dir: Path, env: dict[str, str]) -> int:
+def _run_installer_update(installer: Path, install_dir: Path, env: dict[str, str]) -> tuple[int, bool]:
+    """Return ``(exit_code, success_already_reported)``."""
     if installer.suffix.lower() == ".ps1":
         cmd = [
             "powershell",
@@ -548,23 +648,40 @@ def _run_installer_update(installer: Path, install_dir: Path, env: dict[str, str
     _info("Aplicando atualização...")
     print()
 
-    for attempt in range(1, _MAX_INSTALL_ATTEMPTS + 1):
-        if attempt > 1:
-            print()
-            _info("Tentando atualização novamente...")
-        try:
-            last_rc, last_log = _run_shell(cmd, cwd=install_dir, env=env, stream=True)
-        except UpdateCancelled:
-            _report_update_cancelled()
-            return 130
-        if last_rc == 0:
-            return 0
-        if attempt < _MAX_INSTALL_ATTEMPTS and _attempt_recovery(install_dir, last_log, env):
-            continue
-        break
+    log_fd, log_path_str = tempfile.mkstemp(prefix="ector-update-", suffix=".log")
+    os.close(log_fd)
+    log_path = Path(log_path_str)
 
-    _report_install_failure(last_rc, last_log)
-    return last_rc
+    try:
+        for attempt in range(1, _MAX_INSTALL_ATTEMPTS + 1):
+            if attempt > 1:
+                print()
+                _info("Tentando atualização novamente...")
+            try:
+                last_rc, last_log = _run_shell(
+                    cmd,
+                    cwd=install_dir,
+                    env=env,
+                    stream=True,
+                    log_file=log_path,
+                )
+            except UpdateCancelled:
+                _report_update_cancelled()
+                return 130, False
+            if last_rc == 0:
+                return 0, False
+            if _try_recover_partial_update(install_dir, env, last_log):
+                return 0, True
+            if attempt < _MAX_INSTALL_ATTEMPTS and _attempt_recovery(
+                install_dir, last_log, env
+            ):
+                continue
+            break
+
+        _report_install_failure(last_rc, last_log)
+        return last_rc, False
+    finally:
+        log_path.unlink(missing_ok=True)
 
 
 def cmd_update_check() -> None:
@@ -657,7 +774,7 @@ def cmd_update(args) -> None:
 
     env = _install_env(install_dir)
     try:
-        result = _run_installer_update(installer, install_dir, env)
+        result, success_reported = _run_installer_update(installer, install_dir, env)
     except KeyboardInterrupt:
         _report_update_cancelled()
         sys.exit(130)
@@ -669,8 +786,9 @@ def cmd_update(args) -> None:
     if result != 0:
         sys.exit(result)
 
-    updated = _installed_version_label(install_dir)
-    if updated:
-        _ok(f"Atualizado para {updated}")
+    if not success_reported:
+        updated = _installed_version_label(install_dir)
+        if updated:
+            _ok(f"Atualizado para {updated}")
 
     _restart_gateways_hint()

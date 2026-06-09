@@ -853,8 +853,12 @@ clone_repo() {
                 if ! _is_update_mode; then
                     log_info "Local changes detected, stashing before update..."
                 fi
-                git stash push --include-untracked -m "$stash_name"
-                autostash_ref="$(git rev-parse --verify refs/stash)"
+                if _is_update_mode; then
+                    git stash push --include-untracked -m "$stash_name" >/dev/null 2>&1
+                else
+                    git stash push --include-untracked -m "$stash_name"
+                fi
+                autostash_ref="$(git rev-parse --verify refs/stash 2>/dev/null || true)"
             fi
 
             _git_update_pull() {
@@ -1029,7 +1033,10 @@ install_deps() {
 
     if _is_update_mode; then
         _install_step "Pacote Python e dependências" bash -c \
-            "$UV_CMD pip install --upgrade '.[all]' 2>/dev/null || $UV_CMD pip install --upgrade '.'" || exit 1
+            "cd \"$(printf '%q' "$INSTALL_DIR")\" && \
+             export VIRTUAL_ENV=\"$(printf '%q' "$INSTALL_DIR/venv")\" && \
+             $UV_CMD pip install --python venv/bin/python --upgrade '.[all]' || \
+             $UV_CMD pip install --python venv/bin/python --upgrade '.'" || exit 1
     else
         _install_step "Pacote Python e dependências" bash -c \
             "$UV_CMD pip install '.[all]' 2>/dev/null || $UV_CMD pip install '.'" || exit 1
