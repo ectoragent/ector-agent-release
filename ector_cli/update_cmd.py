@@ -33,7 +33,6 @@ def _fail(msg: str) -> None:
 
 
 def _title(text: str) -> None:
-    print()
     print(color(text, Colors.CYAN, Colors.BOLD))
     print()
 
@@ -579,7 +578,7 @@ def cmd_update(args) -> None:
                 Colors.DIM,
             )
         )
-    print()
+        print()
 
     _check_updates_available(install_dir)
 
