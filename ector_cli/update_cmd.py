@@ -194,7 +194,7 @@ def _resolve_update_install_dir() -> Path:
 
 
 def _installed_version_label(install_dir: Path) -> str | None:
-    from ector_cli.version_info import format_version_label, read_install_version
+    from ector_cli.install_paths import format_version_label, read_install_version
 
     meta = read_install_version(install_dir)
     if meta is None:
@@ -203,7 +203,7 @@ def _installed_version_label(install_dir: Path) -> str | None:
 
 
 def _remote_version_label(install_dir: Path, upstream_label: str) -> str | None:
-    from ector_cli.version_info import format_version_label, read_git_ref_version
+    from ector_cli.install_paths import format_version_label, read_git_ref_version
 
     meta = read_git_ref_version(install_dir, upstream_label)
     if meta is None:
@@ -217,8 +217,8 @@ def _commits_behind(install_dir: Path, *, force_refresh: bool = False) -> int | 
     When git reports ``0`` but ``versionCode`` on the remote is higher, treat
     as at least one pending update (same release branch, newer build).
     """
+    from ector_cli.install_paths import read_git_ref_version, read_install_version
     from ector_cli.presentation import check_for_updates, get_cached_update_upstream_label
-    from ector_cli.version_info import read_git_ref_version, read_install_version
 
     behind = check_for_updates(force_refresh=force_refresh)
     if behind is None:

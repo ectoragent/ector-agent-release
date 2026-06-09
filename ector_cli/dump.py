@@ -243,11 +243,16 @@ def collect_dump_snapshot(*, show_keys: bool = False) -> DumpSnapshot:
     ector_home = get_ector_home()
 
     try:
-        from ector_cli import __version__, __version_code__, __version_name__
-    except ImportError:
-        __version__ = "(unknown)"
-        __version_name__ = "(unknown)"
-        __version_code__ = 0
+        from ector_cli.install_paths import running_version_label
+
+        ver_str = running_version_label()
+    except Exception:
+        try:
+            from ector_cli import __version__
+
+            ver_str = str(__version__)
+        except ImportError:
+            ver_str = "(unknown)"
 
     commit = _get_git_commit(project_root)
 
@@ -275,9 +280,6 @@ def collect_dump_snapshot(*, show_keys: bool = False) -> DumpSnapshot:
     except ImportError:
         openai_ver = "not installed"
 
-    ver_str = f"{__version_name__ or __version__}"
-    if __version_code__:
-        ver_str += f" ({__version_code__})"
     ver_str += f" [{commit}]"
 
     api_keys: list[tuple[str, str]] = []
