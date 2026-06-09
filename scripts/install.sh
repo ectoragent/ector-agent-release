@@ -182,6 +182,14 @@ prompt_yes_no() {
     local prompt_suffix
     local answer=""
 
+    # ector update / curl | bash: never block on /dev/tty — honour the default.
+    if [ -n "${ECTOR_NONINTERACTIVE:-}" ]; then
+        case "$default" in
+            [yY]|[yY][eE][sS]|[sS]|[sS][iI][mM]|[tT][rR][uU][eE]|1) return 0 ;;
+            *) return 1 ;;
+        esac
+    fi
+
     # Use case patterns (not ${var,,}) so this works on bash 3.2 (macOS /bin/bash).
     case "$default" in
         [yY]|[yY][eE][sS]|[sS]|[sS][iI][mM]|[tT][rR][uU][eE]|1) prompt_suffix="(s/n)" ;;
@@ -599,6 +607,19 @@ install_node() {
 
 check_bun() {
     HAS_BUN=false
+
+    if _is_update_mode; then
+        if command -v bun &>/dev/null; then
+            HAS_BUN=true
+            return 0
+        fi
+        if [ -x "$ECTOR_HOME/bun/bin/bun" ]; then
+            export PATH="$ECTOR_HOME/bun/bin:$PATH"
+            HAS_BUN=true
+        fi
+        return 0
+    fi
+
     log_info "Checking Bun (TUI / ector chat)..."
 
     local helper="$INSTALL_DIR/scripts/lib/bun-bootstrap.sh"
@@ -618,6 +639,14 @@ check_bun() {
 }
 
 install_system_packages() {
+    if _is_update_mode; then
+        HAS_RIPGREP=false
+        HAS_FFMPEG=false
+        command -v rg &>/dev/null && HAS_RIPGREP=true
+        command -v ffmpeg &>/dev/null && HAS_FFMPEG=true
+        return 0
+    fi
+
     # Detect what's missing
     HAS_RIPGREP=false
     HAS_FFMPEG=false
@@ -979,15 +1008,21 @@ install_deps() {
                 break
             fi
         done
-        if [ "$need_build_tools" = true ] && command -v sudo &> /dev/null; then
-            if sudo -n true 2>/dev/null; then
+        if [ "$need_build_tools" = true ]; then
+            if [ "$(id -u)" -eq 0 ]; then
+                DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get update -qq \
+                    && DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y -qq \
+                        build-essential python3-dev libffi-dev >/dev/null 2>&1 || true
+            elif command -v sudo &> /dev/null && sudo -n true 2>/dev/null; then
                 sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get update -qq \
                     && sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y -qq \
                         build-essential python3-dev libffi-dev >/dev/null 2>&1 || true
-            elif prompt_yes_no "Instalar build tools (gcc, python3-dev)?" "yes"; then
-                sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get update -qq \
-                    && sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y -qq \
-                        build-essential python3-dev libffi-dev >/dev/null 2>&1 || true
+            elif ! _is_update_mode && command -v sudo &> /dev/null; then
+                if prompt_yes_no "Instalar build tools (gcc, python3-dev)?" "yes"; then
+                    sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get update -qq \
+                        && sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y -qq \
+                            build-essential python3-dev libffi-dev >/dev/null 2>&1 || true
+                fi
             fi
         fi
     fi

@@ -6,6 +6,7 @@ import logging
 import os
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from pathlib import Path
 
 from ector_cli.colors import Colors, color
@@ -150,16 +151,16 @@ def _run_pre_update_backup(args) -> None:
     print()
 
 
-def _stop_gateways_quietly() -> None:
-    """Best-effort stop of gateway processes before mutating the install tree."""
-    try:
-        from ector_cli.gateway import find_gateway_pids
-    except Exception:
-        return
+_GATEWAY_STOP_TIMEOUT_SEC = 15.0
+
+
+def _stop_gateway_processes() -> int:
+    """Return number of gateway PIDs signalled, or 0 if none / unavailable."""
+    from ector_cli.gateway import find_gateway_pids
 
     pids = find_gateway_pids(all_profiles=True)
     if not pids:
-        return
+        return 0
 
     import signal
 
@@ -170,8 +171,25 @@ def _stop_gateways_quietly() -> None:
             pass
         except OSError as exc:
             logger.debug("Could not SIGTERM gateway pid %s: %s", pid, exc)
+    return len(pids)
 
-    n = len(pids)
+
+def _stop_gateways_quietly() -> None:
+    """Best-effort stop of gateway processes before mutating the install tree."""
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(_stop_gateway_processes)
+            n = future.result(timeout=_GATEWAY_STOP_TIMEOUT_SEC)
+    except FuturesTimeoutError:
+        _warn("Paragem do gateway demorou — continuando")
+        return
+    except Exception as exc:
+        logger.debug("Gateway stop skipped: %s", exc)
+        return
+
+    if n <= 0:
+        return
+
     word = "processo" if n == 1 else "processos"
     _ok(f"Gateway: {n} {word} parado(s)")
 
@@ -640,6 +658,9 @@ def cmd_update(args) -> None:
     _check_updates_available(install_dir)
 
     _run_pre_update_backup(args)
+
+    _info("Preparando atualização...")
+    sys.stdout.flush()
     _stop_gateways_quietly()
 
     env = _install_env(install_dir)
