@@ -1,4 +1,6 @@
+import { useStore } from '@nanostores/react';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef } from 'react';
+import { $uiState } from '../uiStore.js';
 import { FULL_RENDER_TAIL_ITEMS } from '../../config/limits.js';
 import { sectionMode } from '../../domain/details.js';
 import { useVirtualHistory } from '../../hooks/useVirtualHistory.js';
@@ -17,6 +19,10 @@ export function useTranscriptVirtual(opts) {
     sections,
     sid
   } = opts;
+  const {
+    busy
+  } = useStore($uiState);
+  const prevBusyRef = useRef(busy);
   const msgIdsRef = useRef(new WeakMap());
   const msgIdSeqRef = useRef(0);
   const heightCachesRef = useRef(new Map());
@@ -79,6 +85,19 @@ export function useTranscriptVirtual(opts) {
   const transcriptLenRef = useRef(0);
   const prevSidRef = useRef(undefined);
   const chaseBottomRef = useRef(false);
+  useEffect(() => {
+    const wasBusy = prevBusyRef.current;
+    prevBusyRef.current = busy;
+    if (wasBusy && !busy && sid) {
+      const prefix = `${sid}:`;
+      for (const key of heightCachesRef.current.keys()) {
+        if (key.startsWith(prefix)) {
+          heightCachesRef.current.delete(key);
+        }
+      }
+      scrollRef.current?.setClampBounds(undefined, undefined);
+    }
+  }, [busy, scrollRef, sid]);
   const scrollTranscriptToBottom = useCallback(contentHeight => {
     const s = scrollRef.current;
     if (!s) {
@@ -117,8 +136,11 @@ export function useTranscriptVirtual(opts) {
       return;
     }
     if (len > transcriptLenRef.current) {
+      const snap = getViewportSnapshot(scrollRef.current);
       transcriptLenRef.current = len;
-      scrollTranscriptToBottom(virtualHistory.offsets[len] ?? 0);
+      if (snap.atBottom || snap.viewportHeight <= 0) {
+        scrollTranscriptToBottom(virtualHistory.offsets[len] ?? 0);
+      }
     } else {
       transcriptLenRef.current = len;
     }
@@ -136,8 +158,8 @@ export function useTranscriptVirtual(opts) {
       }
       const total = virtualHistory.offsets[virtualRows.length] ?? 0;
       scrollTranscriptToBottom(total);
-      const snap = getViewportSnapshot(scrollRef.current);
-      if (snap.atBottom && snap.viewportHeight > 0) {
+      const snap_0 = getViewportSnapshot(scrollRef.current);
+      if (snap_0.atBottom && snap_0.viewportHeight > 0) {
         chaseBottomRef.current = false;
         return;
       }

@@ -16,9 +16,9 @@
 // Cursor) emit wheel events with different cadences, hence two paths.
 import { isXtermJs } from '@ector/ink';
 // ── Native (ghostty, iTerm2, WezTerm, …) ───────────────────────────────
-const WHEEL_ACCEL_WINDOW_MS = 40;
-const WHEEL_ACCEL_STEP = 0.3;
-const WHEEL_ACCEL_MAX = 6;
+const WHEEL_ACCEL_WINDOW_MS = 50;
+const WHEEL_ACCEL_STEP = 0.5;
+const WHEEL_ACCEL_MAX = 10;
 // ── Encoder bounce / wheel-mode (mechanical wheels) ────────────────────
 const WHEEL_BOUNCE_GAP_MAX_MS = 200;
 const WHEEL_MODE_STEP = 15;
@@ -26,12 +26,12 @@ const WHEEL_MODE_CAP = 15;
 const WHEEL_MODE_RAMP = 3;
 const WHEEL_MODE_IDLE_DISENGAGE_MS = 1500;
 // ── xterm.js (VS Code / Cursor / browser terminals) ────────────────────
-const WHEEL_DECAY_HALFLIFE_MS = 150;
-const WHEEL_DECAY_STEP = 5;
+const WHEEL_DECAY_HALFLIFE_MS = 140;
+const WHEEL_DECAY_STEP = 7;
 const WHEEL_BURST_MS = 5;
 const WHEEL_DECAY_GAP_MS = 80;
-const WHEEL_DECAY_CAP_SLOW = 3;
-const WHEEL_DECAY_CAP_FAST = 6;
+const WHEEL_DECAY_CAP_SLOW = 5;
+const WHEEL_DECAY_CAP_FAST = 12;
 const WHEEL_DECAY_IDLE_MS = 500;
 export function initWheelAccel(xtermJs = false, base = 1) {
   return {
@@ -132,8 +132,8 @@ function xtermJsStep(state, dir, now) {
     return 1;
   }
   if (!sameDir || gap > WHEEL_DECAY_IDLE_MS) {
-    // Reversal or long idle — start at 2 so first click after a pause moves visibly.
-    state.mult = 2;
+    // Reversal or long idle — start above 1 so the first tick after a pause moves visibly.
+    state.mult = 3;
     state.frac = 0;
   } else {
     const m = Math.pow(0.5, gap / WHEEL_DECAY_HALFLIFE_MS);

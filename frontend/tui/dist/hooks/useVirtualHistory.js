@@ -189,8 +189,10 @@ export function useVirtualHistory(scrollRef, items, columns, {
   const reportedScrollH = s_0?.getScrollHeight() ?? 0;
   const contentHeight = Math.max(total, reportedScrollH, vp);
   const viewBottom = target_0 + vp;
-  const nearBottom = contentHeight <= vp + 2 || viewBottom >= contentHeight - 2;
-  const stickyTailMount = forceTailFollowRef.current || sticky && nearBottom;
+  const nearBottom = vp > 0 && (contentHeight <= vp + 2 || viewBottom >= contentHeight - 2);
+  // Geometry only — isSticky() can lag after scroll-up and tail-mount would
+  // ignore scrollTop, painting an empty viewport (scroll feels "stuck").
+  const stickyTailMount = forceTailFollowRef.current || nearBottom;
   // During a freeze, drop the frozen range if items shrank past its start
   // (/clear, compaction) — clamping would collapse to an empty mount and
   // flash blank. Fall through to the normal path in that case.
@@ -392,8 +394,16 @@ export function useVirtualHistory(scrollRef, items, columns, {
       // sticky-break would then clamp below the real max and push
       // streaming text off-viewport.
       const clampMin = effStart === 0 ? 0 : effTopSpacer;
-      const clampMax = effEnd === n ? Infinity : Math.max(effTopSpacer, effBottom - vp);
-      s_1.setClampBounds(clampMin, clampMax);
+      const reportedMax = Math.max(0, reportedScrollH - vp);
+      const clampMax = effEnd === n ? Infinity : Math.max(effTopSpacer, effBottom - vp, reportedMax);
+      const scrollTop = Math.max(0, s_1.getScrollTop() + s_1.getPendingDelta());
+      // Stale height cache can set clampMax below the real scroll range — if
+      // the viewport is already past the clamp, drop it instead of trapping scroll.
+      if (clampMax !== Infinity && scrollTop > clampMax + 2) {
+        s_1.setClampBounds(undefined, undefined);
+      } else {
+        s_1.setClampBounds(clampMin, clampMax);
+      }
     } else {
       s_1?.setClampBounds(undefined, undefined);
     }

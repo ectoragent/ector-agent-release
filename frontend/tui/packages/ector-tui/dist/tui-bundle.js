@@ -507,11 +507,16 @@ var scrollViewportHeight = (sb) => {
   const termH = renderer2?.terminalHeight ?? process.stdout.rows ?? 24;
   return Math.max(6, termH - 10);
 };
-var syncStickyScroll = (sb) => {
+var MANUAL_SCROLL_GRACE_MS = 800;
+var syncStickyScroll = (sb, manualAt) => {
   const viewH = scrollViewportHeight(sb);
   const maxTop = maxScrollTop(sb.scrollHeight, viewH);
   if (viewH <= 0) {
     return sb.stickyScroll;
+  }
+  const manualGrace = Date.now() - manualAt < MANUAL_SCROLL_GRACE_MS;
+  if (manualGrace) {
+    return false;
   }
   if (!sb.stickyScroll && isNearScrollBottom(sb.scrollTop, sb.scrollHeight, viewH)) {
     sb.stickyScroll = true;
@@ -562,7 +567,7 @@ var ScrollBox = forwardRef3(function ScrollBox2({ children, stickyScroll, style:
           lastViewportHRef.current = vh;
           notify();
         }
-        syncStickyScroll(sb);
+        syncStickyScroll(sb, manualAtRef.current);
       }
       if (listenersRef.current.size === 0) {
         return;
@@ -595,10 +600,11 @@ var ScrollBox = forwardRef3(function ScrollBox2({ children, stickyScroll, style:
           return;
         }
         pendingRef.current += dy;
+        clampRef.current = {};
         sb.stickyScroll = false;
-        sb.scrollBy(dy);
-        syncStickyScroll(sb);
         manualAtRef.current = Date.now();
+        sb.scrollBy(dy);
+        syncStickyScroll(sb, manualAtRef.current);
         queueMicrotask(() => {
           pendingRef.current = 0;
           notify();
