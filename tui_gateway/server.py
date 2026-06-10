@@ -1261,7 +1261,22 @@ def _agent_cbs(sid: str) -> dict:
     )
 
 
+def _clear_callbacks() -> None:
+    """Drop per-thread sudo/secret callbacks after a turn finishes."""
+    from tools.terminal_tool import set_sudo_password_callback
+    from tools.skills_tool import set_secret_capture_callback
+
+    set_sudo_password_callback(None)
+    set_secret_capture_callback(None)
+
+
 def _wire_callbacks(sid: str):
+    """Register sudo/secret prompts for the current thread.
+
+    Callbacks are thread-local (ACP parity).  Must be called on the same
+    thread that runs agent.run_conversation — e.g. prompt.submit's worker —
+    not on the JSON-RPC handler or session-build threads.
+    """
     from tools.terminal_tool import set_sudo_password_callback
     from tools.skills_tool import set_secret_capture_callback
 
@@ -2367,6 +2382,7 @@ def _(rid, params: dict) -> dict:
 
             approval_token = set_current_session_key(session["session_key"])
             session_tokens = _set_session_context(session["session_key"])
+            _wire_callbacks(sid)
             session_key = session["session_key"]
             from agent.session_cwd import prime_session_cwd, resolve_chat_cwd
 
@@ -2540,6 +2556,7 @@ def _(rid, params: dict) -> dict:
                     reset_current_session_key(approval_token)
             except Exception:
                 pass
+            _clear_callbacks()
             _clear_session_context(session_tokens)
             with session["history_lock"]:
                 session["running"] = False
@@ -2750,6 +2767,7 @@ def _(rid, params: dict) -> dict:
 
     def run():
         session_tokens = _set_session_context(task_id)
+        _wire_callbacks(parent)
         try:
             from run_agent import AIAgent
 
@@ -2778,6 +2796,7 @@ def _(rid, params: dict) -> dict:
                 {"task_id": task_id, "text": f"error: {e}"},
             )
         finally:
+            _clear_callbacks()
             _clear_session_context(session_tokens)
 
     threading.Thread(target=run, daemon=True).start()

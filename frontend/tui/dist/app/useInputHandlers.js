@@ -136,6 +136,15 @@ export function useInputHandlers(ctx) {
       });
     }
   };
+  const overlayCtrlCOrQuit = () => {
+    const now = Date.now();
+    if (now - lastCtrlCRef.current < CTRL_C_DOUBLE_TAP_MS) {
+      actions.die();
+      return;
+    }
+    lastCtrlCRef.current = now;
+    cancelOverlayFromCtrlC();
+  };
   const cycleQueue = dir => {
     const len = cRefs.queueRef.current.length;
     if (!len) {
@@ -223,7 +232,7 @@ export function useInputHandlers(ctx) {
       // keys fall through to the component-level handlers.
       if (overlay.approval || overlay.wiser || overlay.confirm || overlay.sudo || overlay.secret) {
         if (isCtrl(key, ch, 'c')) {
-          cancelOverlayFromCtrlC();
+          overlayCtrlCOrQuit();
         }
         return;
       }
@@ -310,7 +319,7 @@ export function useInputHandlers(ctx) {
           return;
         }
         if (isCtrl(key, ch, 'c')) {
-          cancelOverlayFromCtrlC();
+          overlayCtrlCOrQuit();
           return;
         }
         // Setas/Enter/dígitos ficam com SessionPicker, ModelPicker e SkillsHub.
@@ -322,14 +331,9 @@ export function useInputHandlers(ctx) {
           return;
         }
         if (isCtrl(key, ch, 'c')) {
-          cancelOverlayFromCtrlC();
+          overlayCtrlCOrQuit();
           return;
         }
-      } else {
-        if (isCtrl(key, ch, 'c')) {
-          cancelOverlayFromCtrlC();
-        }
-        return;
       }
     }
     if (cState.completions.length && cState.input && cState.historyIdx === null && (key.upArrow || key.downArrow)) {
@@ -407,13 +411,13 @@ export function useInputHandlers(ctx) {
       }
     }
     if (key.ctrl && ch.toLowerCase() === 'c') {
-      const now = Date.now();
+      const now_0 = Date.now();
       const action_0 = resolveCtrlCAction({
         busy: live.busy,
         hasDraft: Boolean(cState.input || cState.inputBuf.length),
         hasSid: Boolean(live.sid),
         lastCtrlCAt: lastCtrlCRef.current,
-        now,
+        now: now_0,
         windowMs: CTRL_C_DOUBLE_TAP_MS
       });
       if (action_0 === 'clear_draft') {
@@ -423,7 +427,7 @@ export function useInputHandlers(ctx) {
         return actions.die();
       }
       if (action_0 === 'interrupt' && live.sid) {
-        lastCtrlCRef.current = now;
+        lastCtrlCRef.current = now_0;
         return turnController.interruptTurn({
           appendMessage: actions.appendMessage,
           appendMessages: actions.appendMessages,

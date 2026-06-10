@@ -11,6 +11,7 @@ import { compactCwd, statusBarCwd } from '../domain/paths.js';
 import { useGitBranch } from '../hooks/useGitBranch.js';
 import { appendTranscriptMessage } from '../lib/messages.js';
 import { asRpcResult, rpcErrorMessage } from '../lib/rpc.js';
+import { forceProcessExit } from '../lib/gracefulExit.js';
 import { terminalParityHints } from '../lib/terminalParity.js';
 import { createGatewayEventHandler } from './createGatewayEventHandler.js';
 import { createSlashHandler } from './createSlashHandler.js';
@@ -44,9 +45,7 @@ const statusColorOf = (status, t) => {
   return t.dim;
 };
 export function useMainApp(gw) {
-  const {
-    exit
-  } = useApp();
+  useApp();
   const {
     cols,
     stdout
@@ -198,9 +197,8 @@ export function useMainApp(gw) {
     rpc
   }), [gw, rpc]);
   const die = useCallback(() => {
-    gw.kill();
-    exit();
-  }, [exit, gw]);
+    forceProcessExit(130);
+  }, []);
   const session = useSessionLifecycle({
     colsRef,
     composerActions,

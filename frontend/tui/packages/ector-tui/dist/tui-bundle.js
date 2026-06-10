@@ -1143,11 +1143,24 @@ var BASE_KEY = {
   wheelDown: false,
   wheelUp: false
 };
+var wheelCoalesce = null;
+var wheelFlushQueued = false;
 var emitWheelInput = (direction) => {
+  wheelCoalesce = direction;
+  if (wheelFlushQueued) {
+    return;
+  }
+  wheelFlushQueued = true;
   queueMicrotask(() => {
+    wheelFlushQueued = false;
+    const dir = wheelCoalesce;
+    wheelCoalesce = null;
+    if (!dir) {
+      return;
+    }
     emitInput({
       input: "",
-      key: { ...BASE_KEY, wheelDown: direction === "down", wheelUp: direction === "up" },
+      key: { ...BASE_KEY, wheelDown: dir === "down", wheelUp: dir === "up" },
       keypress: { raw: "" }
     });
   });
@@ -1173,7 +1186,7 @@ var forceExit = (code = 130) => {
   forceExitImpl(code);
 };
 var forceQuitOnSecondCtrlC = (sequence) => {
-  if (sequence !== "") {
+  if (!sequence.includes("")) {
     return false;
   }
   if (rendererIsDead()) {
@@ -1349,6 +1362,16 @@ var stripMouseFromStdinChunk = (buffer) => {
   let pending = buffer;
   let forward = "";
   while (pending.length > 0) {
+    const ctrlAt = pending.indexOf("");
+    if (ctrlAt >= 0) {
+      const before = pending.slice(0, ctrlAt);
+      if (before && !isIncompleteMouseEscape(before)) {
+        forward += before;
+      }
+      forward += "";
+      pending = pending.slice(ctrlAt + 1);
+      continue;
+    }
     const mouse = pending.match(MOUSE_PREFIX_RE);
     if (mouse) {
       const frame = mouse[0];
@@ -1399,7 +1422,16 @@ var createMouseFilteredStdin = (source = process.stdin) => {
   const filtered = new PassThrough();
   let pending = "";
   const onData = (chunk) => {
-    const merged = pending + chunk.toString("latin1");
+    if (chunk.includes(3)) {
+      forceQuitOnSecondCtrlC("");
+    }
+    let merged;
+    if (chunk.includes(3) && pending) {
+      merged = pending + chunk.toString("latin1");
+      pending = "";
+    } else {
+      merged = pending + chunk.toString("latin1");
+    }
     const { forward, remainder } = stripMouseFromStdinChunk(merged);
     pending = remainder;
     if (forward) {
