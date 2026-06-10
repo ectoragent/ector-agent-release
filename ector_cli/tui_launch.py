@@ -576,8 +576,8 @@ def build_ector_tui_bundle(tui_dir: Path, pm_bin: str, pm_name: str) -> None:
         if not bundle.is_file():
             print(
                 "Pacote TUI incompleto — dist/tui-bundle.js ausente e não há "
-                "fontes para recompilar. Reinstale a partir de um release "
-                "completo (sync_public_release com pré-build)."
+                "fontes para recompilar. Execute `ector update` novamente ou "
+                "reinstale: curl -fsSL https://ector.cc/install.sh | bash"
             )
             sys.exit(1)
         return

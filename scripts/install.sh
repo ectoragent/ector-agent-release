@@ -858,7 +858,9 @@ clone_repo() {
                     log_info "Local changes detected, stashing before update..."
                 fi
                 if _is_update_mode; then
-                    git stash push --include-untracked -m "$stash_name" >/dev/null 2>&1
+                    # Não incluir untracked no update: dist/ pré-compilado pode
+                    # existir só localmente e sumir do disco após o stash+pull.
+                    git stash push -m "$stash_name" >/dev/null 2>&1
                 else
                     git stash push --include-untracked -m "$stash_name"
                 fi
@@ -1349,8 +1351,14 @@ install_node_deps() {
                 install_ector_bun "$INSTALL_DIR" && HAS_BUN=true || true
             fi
             if [ "$HAS_BUN" = true ]; then
-                install_ector_tui_deps "$INSTALL_DIR" || true
-                build_ector_tui "$INSTALL_DIR" || true
+                if _is_update_mode; then
+                    install_ector_tui_deps "$INSTALL_DIR" || return 1
+                    build_ector_tui "$INSTALL_DIR" || return 1
+                    finalize_ector_tui_after_update "$INSTALL_DIR" || return 1
+                else
+                    install_ector_tui_deps "$INSTALL_DIR" || true
+                    build_ector_tui "$INSTALL_DIR" || true
+                fi
             else
                 _install_step_warn "Runtime Bun (necessário para ector chat)"
             fi
@@ -1604,10 +1612,11 @@ main() {
     if [ -f "$_INSTALL_RUNTIME_LIB" ]; then
         # shellcheck source=scripts/lib/install-runtime-check.sh
         source "$_INSTALL_RUNTIME_LIB"
+        restore_ector_tui_prebuild_from_git "$INSTALL_DIR" || true
         if _is_update_mode && declare -F _install_step >/dev/null 2>&1; then
-            _install_step "Verificação do release" verify_ector_install_core "$INSTALL_DIR" || exit 1
+            _install_step "Verificação do release" verify_ector_install_tree "$INSTALL_DIR" || exit 1
         else
-            verify_ector_install_core "$INSTALL_DIR" || exit 1
+            verify_ector_install_tree "$INSTALL_DIR" || exit 1
         fi
     else
         log_warn "install-runtime-check.sh não encontrado — pulando verificação da árvore"
@@ -1618,7 +1627,11 @@ main() {
     check_bun
     install_node_deps
     if [ -f "$_INSTALL_RUNTIME_LIB" ]; then
-        warn_missing_ui_prebuild "$INSTALL_DIR" || true
+        if _is_update_mode; then
+            verify_ector_ui_prebuild "$INSTALL_DIR" || exit 1
+        else
+            warn_missing_ui_prebuild "$INSTALL_DIR" || true
+        fi
     fi
     setup_path
     copy_config_templates

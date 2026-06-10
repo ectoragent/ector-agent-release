@@ -338,6 +338,75 @@ build_ector_tui() {
     return 0
 }
 
+sync_ector_tui_ink_to_pnpm_store() {
+    local tui_dir="${1:?tui dir}"
+    local src_bundle="$tui_dir/packages/ector-tui/dist/tui-bundle.js"
+    if [ ! -f "$src_bundle" ]; then
+        return 0
+    fi
+    local pnpm_root="$tui_dir/node_modules/.pnpm"
+    if [ ! -d "$pnpm_root" ]; then
+        return 0
+    fi
+    local d target_dir target_bundle
+    for d in "$pnpm_root"/@ector+ink@*/node_modules/@ector/ink; do
+        [ -d "$d" ] || continue
+        target_dir="$d/dist"
+        mkdir -p "$target_dir" 2>/dev/null || continue
+        target_bundle="$target_dir/tui-bundle.js"
+        rm -f "$target_bundle" 2>/dev/null || true
+        if ! ln "$src_bundle" "$target_bundle" 2>/dev/null; then
+            cp -f "$src_bundle" "$target_bundle" 2>/dev/null || true
+        fi
+    done
+}
+
+restore_ector_tui_prebuild_from_git() {
+    local root="${1:?install root}"
+    local tui_dir="$root/frontend/tui"
+
+    [ -d "$tui_dir" ] || return 0
+    if _tui_can_build_from_source "$tui_dir"; then
+        return 0
+    fi
+    if _tui_prebuilt_release_ready "$tui_dir"; then
+        return 0
+    fi
+    if [ ! -d "$root/.git" ]; then
+        return 0
+    fi
+
+    (
+        cd "$root" || exit 0
+        git checkout HEAD -- \
+            frontend/tui/dist/entry.js \
+            frontend/tui/packages/ector-tui/dist/tui-bundle.js \
+            2>/dev/null
+    ) || true
+}
+
+finalize_ector_tui_after_update() {
+    local root="${1:?install root}"
+    local tui_dir="$root/frontend/tui"
+
+    [ -f "$tui_dir/package.json" ] || return 0
+    restore_ector_tui_prebuild_from_git "$root"
+
+    if _tui_can_build_from_source "$tui_dir"; then
+        sync_ector_tui_ink_to_pnpm_store "$tui_dir"
+        return 0
+    fi
+    if ! _tui_prebuilt_release_ready "$tui_dir"; then
+        return 1
+    fi
+    if ! _ir_tui_node_modules_ready "$tui_dir"; then
+        _ir_ensure_pnpm || return 1
+        _ir_pnpm_install_tui "$tui_dir" || return 1
+    fi
+    sync_ector_tui_ink_to_pnpm_store "$tui_dir"
+    return 0
+}
+
 install_ector_bun() {
     local root="${1:?install root}"
     local helper="$root/scripts/lib/bun-bootstrap.sh"
