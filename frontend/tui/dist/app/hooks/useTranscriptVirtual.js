@@ -143,23 +143,12 @@ export function useTranscriptVirtual(opts) {
       return;
     }
     s_0.setClampBounds(undefined, undefined);
-    const vp = s_0.getViewportHeight();
+    const vp = Math.max(0, s_0.getViewportHeight());
     if (contentHeight != null && contentHeight > 0 && vp > 0) {
       s_0.scrollTo(Math.max(0, contentHeight - vp));
+      return;
     }
     s_0.scrollToBottom();
-    queueMicrotask(() => {
-      const sb = scrollRef.current;
-      if (!sb) {
-        return;
-      }
-      sb.setClampBounds(undefined, undefined);
-      if (contentHeight != null && contentHeight > 0 && sb.getViewportHeight() > 0) {
-        sb.scrollTo(Math.max(0, contentHeight - sb.getViewportHeight()));
-      }
-      sb.scrollToBottom();
-    });
-    requestAnimationFrame(() => scrollRef.current?.scrollToBottom());
   }, [scrollRef]);
   useLayoutEffect(() => {
     const len = historyItems.length;
@@ -191,7 +180,7 @@ export function useTranscriptVirtual(opts) {
     } else {
       transcriptLenRef.current = len;
     }
-  }, [historyItems.length, scrollRef, scrollTranscriptToBottom, sid, virtualHistory.offsets, virtualRows.length]);
+  }, [historyItems.length, scrollRef, scrollTranscriptToBottom, sid]);
   useEffect(() => {
     if (!chaseBottomRef.current) {
       return;

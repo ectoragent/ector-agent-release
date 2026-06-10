@@ -12,5 +12,5 @@ Provides subcommands for:
 """
 
 __version_name__ = "1.0"
-__version_code__ = 32
+__version_code__ = 33
 __version__ = __version_name__

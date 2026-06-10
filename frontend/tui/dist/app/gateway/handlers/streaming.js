@@ -1,4 +1,5 @@
 import { STATUS } from '../../../content/uiStatus.js';
+import { getUiState } from '../../uiStore.js';
 import { patchUiState } from '../../uiStore.js';
 export function handleThinkingDelta(ev, api) {
   const p = ev.payload;
@@ -25,6 +26,10 @@ function normalizeLegacyStatusText(text) {
 export function handleStatusUpdate(ev, api) {
   const p = ev.payload;
   if (!p?.text) {
+    return;
+  }
+  const status = getUiState().status;
+  if (status === STATUS.resuming || status === STATUS.forgingSession) {
     return;
   }
   const text = normalizeLegacyStatusText(p.text);
@@ -63,9 +68,9 @@ export function handleMessageComplete(ev, api) {
       role: 'assistant',
       text: finalText
     }];
-    msgs.forEach(api.appendMessage);
-    if (api.bellOnComplete && api.stdout?.isTTY) {
-      api.stdout.write('\x07');
+    api.appendMessages(msgs);
+    if (api.bellOnComplete && process.stderr.isTTY) {
+      process.stderr.write('\x07');
     }
   }
   api.setStatus(STATUS.ready);

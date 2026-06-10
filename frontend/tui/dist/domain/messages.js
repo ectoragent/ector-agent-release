@@ -1,4 +1,4 @@
-import { LONG_MSG } from '../config/limits.js';
+import { LONG_MSG, MAX_HISTORY } from '../config/limits.js';
 import { buildToolTrailLine, fmtK } from '../lib/text.js';
 export const introMsg = info => ({
   info,
@@ -17,6 +17,13 @@ export const backgroundMessageParts = text => {
 /** User-facing actions that hide the intro banner (first message, slash, panel, shell, …). */
 export const isIntroDismissInteraction = msg => msg.kind !== 'intro' && (msg.role === 'user' || msg.kind === 'slash' || msg.kind === 'panel');
 export const withoutIntro = items => items.filter(m => m.kind !== 'intro');
+/** Cap transcript length — same policy as live append in useMainApp. */
+export const capTranscriptHistory = items => {
+  if (items.length <= MAX_HISTORY) {
+    return items;
+  }
+  return items[0]?.kind === 'intro' ? [items[0], ...items.slice(-(MAX_HISTORY - 1))] : items.slice(-MAX_HISTORY);
+};
 /** Fresh session shows intro; resumed/compressed transcripts with rows do not. */
 export const sessionHistoryItems = (info, messages) => {
   if (messages.length > 0) {

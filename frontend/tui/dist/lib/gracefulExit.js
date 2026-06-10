@@ -4,6 +4,7 @@ const SIGNAL_EXIT_CODE = {
   SIGTERM: 143
 };
 let wired = false;
+let registeredCleanups = [];
 const runCleanupsSync = cleanups => {
   for (const fn of cleanups) {
     try {
@@ -13,8 +14,14 @@ const runCleanupsSync = cleanups => {
     }
   }
 };
+/** Run all registered cleanups then exit — used by stdin force-quit and signal handlers. */
+export function forceProcessExit(code) {
+  runCleanupsSync(registeredCleanups);
+  process.exit(code);
+}
 export function setupGracefulExit({
   cleanups = [],
+  deferSigint,
   failsafeMs = 4000,
   onError,
   onSignal
@@ -23,11 +30,11 @@ export function setupGracefulExit({
     return;
   }
   wired = true;
+  registeredCleanups = cleanups;
   let shuttingDown = false;
   let sigintStreak = 0;
   const exit = (code, signal) => {
     if (shuttingDown) {
-      // Shutdown already started but the process is stuck — force exit.
       process.exit(code);
       return;
     }
@@ -35,7 +42,6 @@ export function setupGracefulExit({
     if (signal) {
       onSignal?.(signal);
     }
-    // Restore TTY synchronously — async cleanups left the shell in mouse/raw mode.
     runCleanupsSync(cleanups);
     process.exit(code);
   };
@@ -43,9 +49,11 @@ export function setupGracefulExit({
     process.on(sig, () => {
       if (sig === 'SIGINT') {
         sigintStreak++;
+        if (deferSigint?.() && sigintStreak === 1) {
+          return;
+        }
         if (sigintStreak >= 2) {
-          runCleanupsSync(cleanups);
-          process.exit(SIGNAL_EXIT_CODE[sig]);
+          forceProcessExit(SIGNAL_EXIT_CODE[sig]);
           return;
         }
       }
@@ -54,18 +62,11 @@ export function setupGracefulExit({
   }
   process.on('uncaughtException', err => {
     onError?.('uncaughtException', err);
-    if (!shuttingDown) {
-      shuttingDown = true;
-      runCleanupsSync(cleanups);
-      process.exit(1);
-    } else {
-      process.exit(1);
-    }
+    forceProcessExit(1);
   });
   process.on('unhandledRejection', reason => {
     onError?.('unhandledRejection', reason);
-    runCleanupsSync(cleanups);
-    process.exit(1);
+    forceProcessExit(1);
   });
   if (failsafeMs > 0) {
     const watchdog = setInterval(() => {

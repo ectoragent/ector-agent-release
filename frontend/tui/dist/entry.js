@@ -2,9 +2,10 @@
 import { jsx as _jsx } from "react/jsx-runtime";
 import { shutdownTui } from '@ector/ink';
 import { MOUSE_MOVEMENT_TRACKING, MOUSE_TRACKING } from './config/env.js';
+import { getUiState } from './app/uiStore.js';
 import { GatewayClient } from './gatewayClient.js';
 import { withBootSpinner } from './lib/bootSpinner.js';
-import { setupGracefulExit } from './lib/gracefulExit.js';
+import { forceProcessExit, setupGracefulExit } from './lib/gracefulExit.js';
 import { formatBytes, performHeapDump } from './lib/memory.js';
 import { startMemoryMonitor } from './lib/memoryMonitor.js';
 if (!process.stdin.isTTY) {
@@ -12,10 +13,15 @@ if (!process.stdin.isTTY) {
   process.exit(0);
 }
 const gw = new GatewayClient();
+const {
+  registerForceProcessExit
+} = await import('@ector/ink');
+registerForceProcessExit(forceProcessExit);
 gw.start();
 const dumpNotice = (snap, dump) => `ector-tui: ${snap.level} memory (${formatBytes(snap.heapUsed)}) — auto heap dump → ${dump?.heapPath ?? '(failed)'}\n`;
 setupGracefulExit({
   cleanups: [() => gw.kill(), () => shutdownTui()],
+  deferSigint: () => getUiState().busy,
   onError: (scope, err) => {
     const message = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
     process.stderr.write(`ector-tui ${scope}: ${message.slice(0, 2000)}\n`);
@@ -26,8 +32,7 @@ const stopMemoryMonitor = startMemoryMonitor({
   onCritical: (snap, dump) => {
     process.stderr.write(dumpNotice(snap, dump));
     process.stderr.write('ector-tui: exiting to avoid OOM; restart to recover\n');
-    shutdownTui();
-    process.exit(137);
+    forceProcessExit(137);
   },
   onHigh: (snap, dump) => process.stderr.write(dumpNotice(snap, dump))
 });

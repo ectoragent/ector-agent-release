@@ -35,6 +35,7 @@ export function buildHandlerApi(ctx) {
   } = ctx.system;
   const {
     appendMessage,
+    appendMessages,
     panel,
     setHistoryItems
   } = ctx.transcript;
@@ -95,6 +96,7 @@ export function buildHandlerApi(ctx) {
   };
   return {
     appendMessage,
+    appendMessages,
     bellOnComplete,
     dropBgTask,
     isTerminalStatus,

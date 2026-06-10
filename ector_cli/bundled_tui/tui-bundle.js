@@ -807,7 +807,7 @@ function useDeclaredCursor(args) {
 // src/hooks/useExternalProcess.ts
 import { useCallback } from "react";
 var HANDOFF = `${TERMINAL_RESTORE_SEQ}\x1B[2J\x1B[H`;
-var RESTORE_TUI = `${TERMINAL_ALT_SCREEN_SEQ}\x1B[?1000h\x1B[?1002h\x1B[?1006h\x1B[?25l`;
+var restoreTuiSequences = (mouseOn) => mouseOn ? `${TERMINAL_ALT_SCREEN_SEQ}\x1B[?1000h\x1B[?1002h\x1B[?1006h\x1B[?25l` : `${TERMINAL_ALT_SCREEN_SEQ}\x1B[?25l`;
 async function withInkSuspended(run) {
   const r = getRenderer();
   r?.pause?.();
@@ -816,10 +816,9 @@ async function withInkSuspended(run) {
   try {
     await run();
   } finally {
-    process.stdout.write(RESTORE_TUI);
+    process.stdout.write(restoreTuiSequences(getMouseTracking()));
     process.stdin.setRawMode?.(true);
     r?.resume?.();
-    void getMouseTracking();
   }
 }
 function useExternalProcess() {
@@ -1090,9 +1089,14 @@ var rendererIsDead = () => {
   const renderer2 = getRenderer();
   return Boolean(renderer2?.isDestroyed);
 };
-var forceExit = (code = 130) => {
-  shutdownTui();
+var forceExitImpl = (code) => {
   process.exit(code);
+};
+var registerForceProcessExit = (fn) => {
+  forceExitImpl = fn;
+};
+var forceExit = (code = 130) => {
+  forceExitImpl(code);
 };
 var forceQuitOnSecondCtrlC = (sequence) => {
   if (sequence !== "") {
@@ -1415,6 +1419,7 @@ export {
   isXtermJs,
   maxScrollTop,
   measureElement,
+  registerForceProcessExit,
   render_default as render,
   renderSync,
   scrollFastPathStats,

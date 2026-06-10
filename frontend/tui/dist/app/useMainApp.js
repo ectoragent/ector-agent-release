@@ -1,12 +1,12 @@
 import { useApp, useHasSelection, useSelection, useTerminalTitle } from '@ector/ink';
 import { useStore } from '@nanostores/react';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { STARTUP_RESUME_ID } from '../config/env.js';
-import { MAX_HISTORY, WHEEL_SCROLL_STEP } from '../config/limits.js';
-import { INTERRUPT_USER_LABEL, STATUS } from '../content/uiStatus.js';
+import { WHEEL_SCROLL_STEP } from '../config/limits.js';
+import { INTERRUPT_USER_LABEL, isComposerReady, STATUS } from '../content/uiStatus.js';
 import { SECTION_NAMES, sectionMode } from '../domain/details.js';
 import { attachedImageNotice, imageTokenMeta } from '../domain/messages.js';
-import { isIntroDismissInteraction, withoutIntro } from '../domain/messages.js';
+import { capTranscriptHistory, isIntroDismissInteraction, withoutIntro } from '../domain/messages.js';
 import { compactCwd, statusBarCwd } from '../domain/paths.js';
 import { useGitBranch } from '../hooks/useGitBranch.js';
 import { appendTranscriptMessage } from '../lib/messages.js';
@@ -31,12 +31,6 @@ import { useLongRunToolCharms } from './useLongRunToolCharms.js';
 import { useSessionLifecycle } from './useSessionLifecycle.js';
 import { useSubmission } from './useSubmission.js';
 const GOOD_VIBES_RE = /\b(good bot|thanks|thank you|thx|ty|ily|love you)\b/i;
-const capHistory = items => {
-  if (items.length <= MAX_HISTORY) {
-    return items;
-  }
-  return items[0]?.kind === 'intro' ? [items[0], ...items.slice(-(MAX_HISTORY - 1))] : items.slice(-MAX_HISTORY);
-};
 const statusColorOf = (status, t) => {
   if (status === STATUS.ready) {
     return t.statusReady;
@@ -135,10 +129,27 @@ export function useMainApp(gw) {
     scrollRef,
     selection
   }), [selection]);
-  const appendMessage = useCallback(msg_0 => setHistoryItems(prev => {
-    const next = appendTranscriptMessage(prev, msg_0);
-    return capHistory(isIntroDismissInteraction(msg_0) ? withoutIntro(next) : next);
-  }), []);
+  const foldTranscriptMessages = useCallback((prev, msgs) => {
+    let next = prev;
+    for (const msg_0 of msgs) {
+      next = appendTranscriptMessage(next, msg_0);
+      if (isIntroDismissInteraction(msg_0)) {
+        next = withoutIntro(next);
+      }
+    }
+    return capTranscriptHistory(next);
+  }, []);
+  const appendMessage = useCallback(msg_1 => setHistoryItems(prev_0 => foldTranscriptMessages(prev_0, [msg_1])), [foldTranscriptMessages]);
+  const appendMessages = useCallback(msgs_0 => {
+    if (!msgs_0.length) {
+      return;
+    }
+    // Turn-end batches can be large (trail + assistant table) — defer so
+    // streaming teardown (busy→false) paints before heavy history mount.
+    startTransition(() => {
+      setHistoryItems(prev_1 => foldTranscriptMessages(prev_1, msgs_0));
+    });
+  }, [foldTranscriptMessages]);
   const sys = useCallback(text => appendMessage({
     role: 'system',
     text
@@ -206,7 +217,7 @@ export function useMainApp(gw) {
   });
   useEffect(() => {
     if (ui.busy) {
-      setTurnStartedAt(prev_0 => prev_0 ?? Date.now());
+      setTurnStartedAt(prev_2 => prev_2 ?? Date.now());
     } else {
       setTurnStartedAt(null);
     }
@@ -295,7 +306,7 @@ export function useMainApp(gw) {
   // and error paths never emit message.complete, so anything enqueued while
   // `!sleep` / a failed turn was running would stay stuck forever.
   useEffect(() => {
-    if (!ui.sid || ui.busy || composerRefs.queueEditRef.current !== null || composerRefs.queueRef.current.length === 0) {
+    if (!isComposerReady(ui) || ui.busy || composerRefs.queueEditRef.current !== null || composerRefs.queueRef.current.length === 0) {
       return;
     }
     const next_0 = composerActions.dequeue();
@@ -366,6 +377,7 @@ export function useMainApp(gw) {
     },
     transcript: {
       appendMessage,
+      appendMessages,
       panel,
       setHistoryItems
     },
@@ -374,7 +386,7 @@ export function useMainApp(gw) {
       setRecording: setVoiceRecording,
       setVoiceEnabled
     }
-  }), [appendMessage, bellOnComplete, composerActions.setInput, gateway, panel, session.closeSession, session.newSession, session.resetSession, session.resumeById, setVoiceEnabled, setVoiceProcessing, setVoiceRecording, stdout, submitRef, sys]);
+  }), [appendMessage, appendMessages, bellOnComplete, composerActions.setInput, gateway, panel, session.closeSession, session.newSession, session.resetSession, session.resumeById, setVoiceEnabled, setVoiceProcessing, setVoiceRecording, stdout, submitRef, sys]);
   useGatewayLifecycle(gw, onEvent, sys);
   useLongRunToolCharms();
   const slash = useMemo(() => createSlashHandler({

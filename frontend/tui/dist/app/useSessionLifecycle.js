@@ -1,10 +1,10 @@
 import { c as _c } from "react/compiler-runtime";
 import { evictInkCaches } from '@ector/ink';
-import { useCallback } from 'react';
+import { useCallback, useRef } from 'react';
 import { STARTUP_WORKTREE } from '../config/env.js';
 import { buildSetupRequiredSections, SETUP_REQUIRED_TITLE } from '../content/setup.js';
 import { STATUS } from '../content/uiStatus.js';
-import { introMsg, sessionHistoryItems, toTranscriptMessages } from '../domain/messages.js';
+import { capTranscriptHistory, introMsg, sessionHistoryItems, toTranscriptMessages } from '../domain/messages.js';
 import { ZERO } from '../domain/usage.js';
 import { asRpcResult } from '../lib/rpc.js';
 import { patchOverlayState } from './overlayStore.js';
@@ -41,6 +41,7 @@ export function useSessionLifecycle(opts) {
     setVoiceRecording,
     sys
   } = opts;
+  const resumeGenerationRef = useRef(0);
   let t0;
   if ($[0] !== rpc) {
     t0 = targetSid => targetSid ? rpc("session.close", {
@@ -174,13 +175,17 @@ export function useSessionLifecycle(opts) {
   let t4;
   if ($[23] !== closeSession || $[24] !== colsRef || $[25] !== composerActions || $[26] !== gw || $[27] !== newSession || $[28] !== panel || $[29] !== rpc || $[30] !== setHistoryItems || $[31] !== setLastUserMsg || $[32] !== setSessionStartedAt || $[33] !== setStickyPrompt || $[34] !== setVoiceProcessing || $[35] !== setVoiceRecording || $[36] !== sys) {
     t4 = id => {
+      const generation = resumeGenerationRef.current = resumeGenerationRef.current + 1;
       const prior = getUiState();
       const returnSessionKey = id.startsWith("bg_") ? prior.sessionKey && !prior.sessionKey.startsWith("bg_") ? prior.sessionKey : prior.returnSessionKey : null;
+      turnController.fullReset();
       patchOverlayState({
         picker: false
       });
       patchUiState(state => ({
         ...state,
+        busy: false,
+        sid: null,
         status: STATUS.resuming,
         ...(id.startsWith("bg_") ? {
           returnSessionKey: returnSessionKey ?? state.returnSessionKey
@@ -190,6 +195,9 @@ export function useSessionLifecycle(opts) {
         })
       }));
       rpc("setup.status", {}).then(setup_0 => {
+        if (generation !== resumeGenerationRef.current) {
+          return;
+        }
         if (setup_0?.provider_configured === false) {
           panel(SETUP_REQUIRED_TITLE, buildSetupRequiredSections());
           patchUiState({
@@ -197,10 +205,13 @@ export function useSessionLifecycle(opts) {
           });
           return;
         }
-        closeSession(getUiState().sid === id ? null : getUiState().sid).then(() => gw.request("session.resume", {
+        closeSession(prior.sid).then(() => gw.request("session.resume", {
           cols: colsRef.current,
           session_id: id
         }).then(raw => {
+          if (generation !== resumeGenerationRef.current) {
+            return;
+          }
           const r_0 = asRpcResult(raw);
           if (!r_0) {
             sys("error: invalid response: session.resume");
@@ -225,7 +236,7 @@ export function useSessionLifecycle(opts) {
               text: pending
             }];
           }
-          setHistoryItems(items);
+          setHistoryItems(capTranscriptHistory(items));
           patchUiState({
             info: r_0.info ?? null,
             pendingBackgroundReply: null,
@@ -236,6 +247,9 @@ export function useSessionLifecycle(opts) {
             usage: usageFrom(r_0.info ?? null)
           });
         }).catch(e => {
+          if (generation !== resumeGenerationRef.current) {
+            return;
+          }
           sys(`error: ${e.message}`);
           newSession();
         }));

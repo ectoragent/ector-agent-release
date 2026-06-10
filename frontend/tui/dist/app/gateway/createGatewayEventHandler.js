@@ -1,3 +1,4 @@
+import { STATUS } from '../../content/uiStatus.js';
 import { getUiState } from '../uiStore.js';
 import { handleError, handleGatewayReady } from './handlers/gatewayReady.js';
 import { handleIdentityRestored, handleIdentityRevoked, handleIdentityUserChanged } from './handlers/identity.js';
@@ -11,7 +12,13 @@ import { buildHandlerApi } from './shared.js';
 export function createGatewayEventHandler(ctx) {
   const api = buildHandlerApi(ctx);
   return ev => {
-    const sid = getUiState().sid;
+    const {
+      sid,
+      status
+    } = getUiState();
+    if ((status === STATUS.resuming || status === STATUS.forgingSession) && !ev.type.startsWith('gateway.') && !ev.type.startsWith('identity.')) {
+      return;
+    }
     if (ev.session_id && sid && ev.session_id !== sid && !ev.type.startsWith('gateway.') && !ev.type.startsWith('identity.') && ev.type !== 'background.complete') {
       return;
     }
