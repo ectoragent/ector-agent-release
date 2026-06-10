@@ -1,1 +1,1 @@
-export { ComposerFooter, composerCostLabel, showComposerContextPct } from './ComposerFooter.js';
+export { composerCostLabel, ComposerFooter, showComposerContextPct } from './ComposerFooter.js';

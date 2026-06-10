@@ -1,11 +1,13 @@
 import { useInput } from '@ector/ink';
 import { useStore } from '@nanostores/react';
 import { useEffect, useRef } from 'react';
+import { CTRL_C_DOUBLE_TAP_MS } from '../config/input.js';
 import { TYPING_IDLE_MS } from '../config/timing.js';
 import { strings } from '../content/strings.js';
 import { STATUS } from '../content/uiStatus.js';
 import { isAction, isCopyShortcut, isMac, isVoiceToggleKey } from '../lib/platform.js';
 import { computeWheelStep, initWheelAccelForHost } from '../lib/wheelAccel.js';
+import { resolveCtrlCAction } from './inputHandlersLogic.js';
 import { getInputSelection } from './inputSelectionStore.js';
 import { $isBlocked, $overlayState, patchOverlayState } from './overlayStore.js';
 import { turnController } from './turnController.js';
@@ -374,30 +376,30 @@ export function useInputHandlers(ctx) {
     }
     if (key.ctrl && ch.toLowerCase() === 'c') {
       const now = Date.now();
-      // While a turn is running: clear draft text, interrupt on first press
-      // (Esc parity), force-quit on a second press within 1.5s (ssh-like).
-      if (live.busy) {
-        if (cState.input || cState.inputBuf.length) {
-          return cActions.clearIn();
-        }
-        if (now - lastCtrlCRef.current < 1500) {
-          return actions.die();
-        }
-        lastCtrlCRef.current = now;
-        if (live.sid) {
-          return turnController.interruptTurn({
-            appendMessage: actions.appendMessage,
-            gw: gateway.gw,
-            sid: live.sid,
-            sys: actions.sys
-          });
-        }
-        return;
-      }
-      if (cState.input || cState.inputBuf.length) {
+      const action_0 = resolveCtrlCAction({
+        busy: live.busy,
+        hasDraft: Boolean(cState.input || cState.inputBuf.length),
+        hasSid: Boolean(live.sid),
+        lastCtrlCAt: lastCtrlCRef.current,
+        now,
+        windowMs: CTRL_C_DOUBLE_TAP_MS
+      });
+      if (action_0 === 'clear_draft') {
         return cActions.clearIn();
       }
-      return actions.die();
+      if (action_0 === 'die') {
+        return actions.die();
+      }
+      if (action_0 === 'interrupt' && live.sid) {
+        lastCtrlCRef.current = now;
+        return turnController.interruptTurn({
+          appendMessage: actions.appendMessage,
+          gw: gateway.gw,
+          sid: live.sid,
+          sys: actions.sys
+        });
+      }
+      return;
     }
     if (isAction(key, ch, 'd')) {
       return actions.die();

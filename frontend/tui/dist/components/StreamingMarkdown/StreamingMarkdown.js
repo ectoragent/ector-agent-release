@@ -30,8 +30,8 @@ import { jsx as _jsx, jsxs as _jsxs } from "react/jsx-runtime";
 // affected.
 import { Box } from '@ector/ink';
 import { memo, useRef } from 'react';
-import { isTableDivider } from '../Markdown/lib/blockRegex.js';
 import { Md } from '../Markdown/index.js';
+import { isTableDivider } from '../Markdown/lib/blockRegex.js';
 // Count ``` or ~~~ fence toggles in `s` up to `end`. Odd = currently inside
 // a fenced block; we can't split the prefix there or we'd orphan the fence.
 const fenceOpenAt = (s, end) => {

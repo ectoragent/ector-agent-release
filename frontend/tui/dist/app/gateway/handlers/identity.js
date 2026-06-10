@@ -1,7 +1,7 @@
 import { buildLoginRequiredSections, LOGIN_REQUIRED_TITLE } from '../../../content/auth.js';
 import { STATUS } from '../../../content/uiStatus.js';
-import { getUiState, patchUiState } from '../../uiStore.js';
 import { turnController } from '../../turnController.js';
+import { getUiState, patchUiState } from '../../uiStore.js';
 export function handleIdentityRevoked(_ev, api) {
   api.panel(LOGIN_REQUIRED_TITLE, buildLoginRequiredSections());
   patchUiState({

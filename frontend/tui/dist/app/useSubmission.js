@@ -5,23 +5,9 @@ import { attachedImageNotice } from '../domain/messages.js';
 import { looksLikeSlashCommand } from '../domain/slash.js';
 import { asRpcResult } from '../lib/rpc.js';
 import { hasInterpolation, INTERPOLATION_RE } from '../protocol/interpolation.js';
-import { PASTE_SNIPPET_RE } from '../protocol/paste.js';
+import { expandSnippets, isDoubleEnterTap, isSessionBusyError, resolveDoubleEnter } from './submissionLogic.js';
 import { turnController } from './turnController.js';
 import { getUiState, patchUiState } from './uiStore.js';
-const DOUBLE_ENTER_MS = 450;
-const SESSION_BUSY_RE = /session busy|waiting for model response/i;
-const isSessionBusyError = e => e instanceof Error && SESSION_BUSY_RE.test(e.message);
-const expandSnips = snips => {
-  const byLabel = new Map();
-  for (const {
-    label,
-    text
-  } of snips) {
-    const hit = byLabel.get(label);
-    hit ? hit.push(text) : byLabel.set(label, [text]);
-  }
-  return value => value.replace(PASTE_SNIPPET_RE, tok => byLabel.get(tok)?.shift() ?? tok);
-};
 const spliceMatches = (text, matches, results) => matches.reduceRight((acc, m, i) => acc.slice(0, m.index) + results[i] + acc.slice(m.index + m[0].length), text);
 export function useSubmission(opts) {
   const {
@@ -62,7 +48,7 @@ export function useSubmission(opts) {
     };
   }, [composerState.input, composerState.inputBuf]);
   const send = useCallback((text, showUserMessage = true) => {
-    const expand = expandSnips(composerState.pasteSnips);
+    const expand = expandSnippets(composerState.pasteSnips);
     const startSubmit = (displayText, submitText, showUserMessage_0 = true) => {
       const live = getUiState();
       if (!isComposerReady(live)) {
@@ -243,9 +229,15 @@ export function useSubmission(opts) {
     if (!value.trim() && !composerState.inputBuf.length) {
       const live_2 = getUiState();
       const now = Date.now();
-      const doubleTap = now - lastEmptyAt.current < DOUBLE_ENTER_MS;
+      const doubleTap = isDoubleEnterTap(now, lastEmptyAt.current);
       lastEmptyAt.current = now;
-      if (doubleTap && live_2.busy && live_2.sid) {
+      const action = resolveDoubleEnter({
+        busy: live_2.busy,
+        doubleTap,
+        hasQueue: composerRefs.queueRef.current.length > 0,
+        hasSid: Boolean(live_2.sid)
+      });
+      if (action === 'interrupt' && live_2.sid) {
         return turnController.interruptTurn({
           appendMessage,
           gw,
@@ -253,7 +245,7 @@ export function useSubmission(opts) {
           sys
         });
       }
-      if (doubleTap && live_2.sid && composerRefs.queueRef.current.length) {
+      if (action === 'dequeue') {
         const next_0 = composerActions.dequeue();
         composerActions.syncQueue();
         if (next_0) {

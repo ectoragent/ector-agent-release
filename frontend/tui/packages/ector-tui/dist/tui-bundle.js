@@ -482,9 +482,6 @@ function NoSelect({ children, fromLeftEdge: _fromLeftEdge, ...props }) {
   return /* @__PURE__ */ jsx9(Box_default, { ...props, children });
 }
 
-// src/components/ScrollBox/ScrollBox.tsx
-import { forwardRef as forwardRef3, useEffect, useImperativeHandle, useRef } from "react";
-
 // src/lib/scrollMath.ts
 var BOTTOM_SLACK = 2;
 var MANUAL_SCROLL_GRACE_MS = 2500;
@@ -492,6 +489,7 @@ var maxScrollTop = (scrollHeight, viewportHeight) => Math.max(0, scrollHeight - 
 var isNearScrollBottom = (scrollTop, scrollHeight, viewportHeight, slack = BOTTOM_SLACK) => scrollTop >= maxScrollTop(scrollHeight, viewportHeight) - slack;
 
 // src/components/ScrollBox/ScrollBox.tsx
+import { forwardRef as forwardRef3, useEffect, useImperativeHandle, useRef } from "react";
 import { jsx as jsx10 } from "@opentui/react/jsx-runtime";
 var scrollViewportHeight = (sb) => {
   if (!sb) {
@@ -1080,6 +1078,45 @@ function useTerminalViewport() {
   return [setElement, entryRef.current];
 }
 
+// src/lib/ctrlCForceQuit.ts
+var FORCE_QUIT_WINDOW_MS = 1500;
+var lastCtrlCAt = 0;
+var forceQuitOnSecondCtrlC = (sequence) => {
+  if (sequence !== "") {
+    return false;
+  }
+  const now = Date.now();
+  if (now - lastCtrlCAt < FORCE_QUIT_WINDOW_MS) {
+    shutdownTui();
+    process.exit(130);
+  }
+  lastCtrlCAt = now;
+  return false;
+};
+
+// src/lib/mouseInputLeak.ts
+var ESC = "\x1B";
+var SGR_MOUSE_FULL_RE = new RegExp(`^${ESC}\\[<\\d+(?:;\\d+){0,2}[Mm]$`);
+var SGR_MOUSE_LEAK_RE = /^(?:<)?\d+(?:;\d+){0,2}[Mm]$/;
+var SGR_MOUSE_BURST_RE = /^(?:\d+;\d+;\d+[Mm]){2,}$/;
+var isMouseInputLeak = (raw, input = "") => {
+  const candidate = raw || input;
+  if (!candidate) {
+    return false;
+  }
+  return SGR_MOUSE_FULL_RE.test(candidate) || SGR_MOUSE_LEAK_RE.test(candidate) || SGR_MOUSE_BURST_RE.test(candidate);
+};
+
+// src/lib/inputPipeline.ts
+var createSwallowMouseSequence = (mouseParser) => {
+  return (sequence) => {
+    if (isMouseInputLeak(sequence)) {
+      return true;
+    }
+    return mouseParser.parseMouseEvent(Buffer.from(sequence)) !== null;
+  };
+};
+
 // src/render.tsx
 import { createCliRenderer, MouseParser } from "@opentui/core";
 import { createRoot } from "@opentui/react";
@@ -1131,65 +1168,6 @@ var toInputEvent = (e) => ({
   keypress: { raw: e.raw }
 });
 
-// src/lib/mouseInputLeak.ts
-var SGR_MOUSE_FULL_RE = /^\x1b\[<\d+(?:;\d+){0,2}[Mm]$/;
-var SGR_MOUSE_LEAK_RE = /^(?:<)?\d+(?:;\d+){0,2}[Mm]$/;
-var SGR_MOUSE_BURST_RE = /^(?:\d+;\d+;\d+[Mm]){2,}$/;
-var SCROLL_DIRECTIONS = ["up", "down", "left", "right"];
-var emptyKey = () => ({
-  alt: false,
-  backspace: false,
-  ctrl: false,
-  delete: false,
-  downArrow: false,
-  end: false,
-  escape: false,
-  home: false,
-  leftArrow: false,
-  meta: false,
-  pageDown: false,
-  pageUp: false,
-  rightArrow: false,
-  return: false,
-  shift: false,
-  super: false,
-  tab: false,
-  upArrow: false,
-  wheelDown: false,
-  wheelUp: false
-});
-var isMouseInputLeak = (raw, input = "") => {
-  const candidate = raw || input;
-  if (!candidate) {
-    return false;
-  }
-  return SGR_MOUSE_FULL_RE.test(candidate) || SGR_MOUSE_LEAK_RE.test(candidate) || SGR_MOUSE_BURST_RE.test(candidate);
-};
-var parseMouseLeakScrolls = (raw) => {
-  const out = [];
-  for (const match of raw.matchAll(/(\d+);(\d+);(\d+)([Mm])/g)) {
-    const rawButtonCode = Number(match[1]);
-    const pressRelease = match[4];
-    if (pressRelease !== "M" || (rawButtonCode & 64) === 0) {
-      continue;
-    }
-    const direction = SCROLL_DIRECTIONS[rawButtonCode & 3];
-    if (direction === "up" || direction === "down") {
-      out.push(direction);
-    }
-  }
-  return out;
-};
-var wheelInputEvent = (direction) => ({
-  input: "",
-  key: {
-    ...emptyKey(),
-    wheelDown: direction === "down",
-    wheelUp: direction === "up"
-  },
-  keypress: { raw: "" }
-});
-
 // src/components/InputBridge/InputBridge.tsx
 function InputBridge() {
   useKeyboard(
@@ -1205,9 +1183,6 @@ function InputBridge() {
       const event = toInputEvent(key);
       const raw = event.keypress.raw ?? event.input;
       if (isMouseInputLeak(raw, event.input)) {
-        for (const direction of parseMouseLeakScrolls(raw)) {
-          emitInput(wheelInputEvent(direction));
-        }
         return;
       }
       emitInput(event);
@@ -1271,31 +1246,11 @@ import { jsx as jsx13, jsxs } from "@opentui/react/jsx-runtime";
 async function render(node, options = {}) {
   setExitOnCtrlC(options.exitOnCtrlC ?? true);
   setMouseTracking(options.mouseTracking ?? true);
-  const mouseParser = new MouseParser();
-  const swallowMouseSequence = (sequence) => {
-    const parsed = mouseParser.parseMouseEvent(Buffer.from(sequence));
-    if (parsed?.type === "scroll" && parsed.scroll) {
-      const direction = parsed.scroll.direction;
-      if (direction === "up" || direction === "down") {
-        emitInput(wheelInputEvent(direction));
-      }
-      return true;
-    }
-    if (parsed) {
-      return true;
-    }
-    if (isMouseInputLeak(sequence)) {
-      for (const direction of parseMouseLeakScrolls(sequence)) {
-        emitInput(wheelInputEvent(direction));
-      }
-      return true;
-    }
-    return false;
-  };
+  const swallowMouseSequence = createSwallowMouseSequence(new MouseParser());
   const renderer2 = await createCliRenderer({
     backgroundColor: "#0A0A0A",
     exitOnCtrlC: options.exitOnCtrlC ?? true,
-    prependInputHandlers: [swallowMouseSequence],
+    prependInputHandlers: [forceQuitOnSecondCtrlC, swallowMouseSequence],
     screenMode: "alternate-screen",
     stdin: options.stdin,
     stdout: options.stdout,
@@ -1403,6 +1358,7 @@ export {
   AlternateScreen,
   Ansi,
   Box_default as Box,
+  FORCE_QUIT_WINDOW_MS,
   Link,
   MANUAL_SCROLL_GRACE_MS,
   Newline,
@@ -1413,7 +1369,10 @@ export {
   Text_default as Text,
   TextInput,
   copyTextToSystemClipboard,
+  createSwallowMouseSequence,
   evictInkCaches,
+  forceQuitOnSecondCtrlC,
+  isMouseInputLeak,
   isNearScrollBottom,
   isXtermJs,
   maxScrollTop,

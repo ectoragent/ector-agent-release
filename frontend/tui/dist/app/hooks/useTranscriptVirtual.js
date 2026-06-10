@@ -1,12 +1,13 @@
 import { MANUAL_SCROLL_GRACE_MS, maxScrollTop } from '@ector/ink';
 import { useStore } from '@nanostores/react';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef } from 'react';
-import { $uiState } from '../uiStore.js';
 import { FULL_RENDER_TAIL_ITEMS } from '../../config/limits.js';
 import { sectionMode } from '../../domain/details.js';
 import { useVirtualHistory } from '../../hooks/useVirtualHistory.js';
 import { getViewportSnapshot } from '../../lib/viewportStore.js';
 import { estimatedMsgHeight, isHeavyTranscriptMessage, messageHeightKey } from '../../lib/virtualHeights.js';
+import { shouldClearHeightCacheOnBusyEnd, shouldFollowNewHistoryAtBottom } from '../transcriptVirtualLogic.js';
+import { $uiState } from '../uiStore.js';
 const MAX_HEIGHT_CACHE_BUCKETS = 12;
 export function useTranscriptVirtual(opts) {
   const {
@@ -95,7 +96,7 @@ export function useTranscriptVirtual(opts) {
   useEffect(() => {
     const wasBusy = prevBusyRef.current;
     prevBusyRef.current = busy;
-    if (wasBusy && !busy && sid) {
+    if (shouldClearHeightCacheOnBusyEnd(wasBusy, busy, sid)) {
       const prefix = `${sid}:`;
       for (const key of heightCachesRef.current.keys()) {
         if (key.startsWith(prefix)) {
@@ -146,7 +147,14 @@ export function useTranscriptVirtual(opts) {
       const s_0 = scrollRef.current;
       const snap = getViewportSnapshot(s_0);
       transcriptLenRef.current = len;
-      if (s_0?.isSticky() && Date.now() - (s_0.getLastManualScrollAt() || 0) >= MANUAL_SCROLL_GRACE_MS && (snap.atBottom || snap.viewportHeight <= 0)) {
+      if (s_0 && shouldFollowNewHistoryAtBottom({
+        atBottom: snap.atBottom,
+        isSticky: s_0.isSticky(),
+        lastManualScrollAt: s_0.getLastManualScrollAt() || 0,
+        manualGraceMs: MANUAL_SCROLL_GRACE_MS,
+        now: Date.now(),
+        viewportHeight: snap.viewportHeight
+      })) {
         scrollTranscriptToBottom(virtualHistory.offsets[len] ?? 0);
       }
     } else {

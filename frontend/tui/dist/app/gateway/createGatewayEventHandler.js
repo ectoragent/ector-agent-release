@@ -1,6 +1,6 @@
 import { getUiState } from '../uiStore.js';
-import { handleIdentityRestored, handleIdentityRevoked, handleIdentityUserChanged } from './handlers/identity.js';
 import { handleError, handleGatewayReady } from './handlers/gatewayReady.js';
+import { handleIdentityRestored, handleIdentityRevoked, handleIdentityUserChanged } from './handlers/identity.js';
 import { handleApprovalRequest, handleBackgroundComplete, handleSecretRequest, handleSudoRequest, handleWiserRequest } from './handlers/overlays.js';
 import { handleSessionInfo, handleSessionTitle } from './handlers/session.js';
 import { handleGatewayProtocolError, handleGatewayStartTimeout, handleGatewayStderr, handleMessageComplete, handleMessageDelta, handleMessageStart, handleReasoningAvailable, handleReasoningDelta, handleStatusUpdate, handleThinkingDelta } from './handlers/streaming.js';

@@ -1,9 +1,9 @@
 import { REASONING_PULSE_MS, STREAM_BATCH_MS, STREAM_HEAVY_BATCH_MS, STREAM_HEAVY_CHARS, STREAM_IDLE_BATCH_MS, STREAM_SCROLL_BATCH_MS, STREAM_TYPING_BATCH_MS } from '../../config/timing.js';
-import { estimateMarkdownBodyLines } from '../../lib/virtualHeights.js';
 import { INTERRUPT_USER_LABEL, STATUS } from '../../content/uiStatus.js';
 import { appendToolShelfMessage, isToolShelfMessage } from '../../lib/liveProgress.js';
 import { hasReasoningTag, splitReasoning } from '../../lib/reasoning.js';
 import { boundedLiveRenderText, buildToolTrailLine, estimateTokensRough, isTransientTrailLine, sameToolTrailGroup } from '../../lib/text.js';
+import { estimateMarkdownBodyLines } from '../../lib/virtualHeights.js';
 import { resetFlowOverlays } from '../overlayStore.js';
 import { pushSnapshot } from '../spawnHistoryStore.js';
 import { archiveDoneTodos, getTurnState, patchTurnState, resetTurnState } from '../turnStore.js';

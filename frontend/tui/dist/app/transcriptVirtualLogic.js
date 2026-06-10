@@ -1,0 +1,2 @@
+export const shouldClearHeightCacheOnBusyEnd = (wasBusy, busy, sid) => wasBusy && !busy && Boolean(sid);
+export const shouldFollowNewHistoryAtBottom = ctx => ctx.isSticky && ctx.now - ctx.lastManualScrollAt >= ctx.manualGraceMs && (ctx.atBottom || ctx.viewportHeight <= 0);

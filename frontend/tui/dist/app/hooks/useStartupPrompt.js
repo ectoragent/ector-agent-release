@@ -1,5 +1,5 @@
-import { useEffect, useRef } from 'react';
 import { useStore } from '@nanostores/react';
+import { useEffect, useRef } from 'react';
 import { STARTUP_INITIAL_IMAGE, STARTUP_INITIAL_PROMPT, STARTUP_RESUME_ID } from '../../config/env.js';
 import { isComposerReady } from '../../content/uiStatus.js';
 import { rpcErrorMessage } from '../../lib/rpc.js';
