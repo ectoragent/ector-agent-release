@@ -1186,6 +1186,29 @@ var forceQuitOnSecondCtrlC = (sequence) => {
   return false;
 };
 
+// src/lib/agentDebugLog.ts
+var agentDebugLog = (location, message, data, hypothesisId) => {
+  const payload = {
+    sessionId: "9e46c8",
+    location,
+    message,
+    data,
+    hypothesisId,
+    timestamp: Date.now()
+  };
+  fetch("http://127.0.0.1:7942/ingest/87fa9e4b-a416-4933-9cfd-a9f0ed917b76", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "9e46c8" },
+    body: JSON.stringify(payload)
+  }).catch(() => {
+  });
+  try {
+    process.stderr.write(`ECTOR_MOUSE_DEBUG ${JSON.stringify(payload)}
+`);
+  } catch {
+  }
+};
+
 // src/lib/mouseInputLeak.ts
 var ESC = "\x1B";
 var SGR_MOUSE_FULL_RE = new RegExp(`^${ESC}\\[<\\d+(?:;\\d+){0,2}[Mm]$`);
@@ -1201,6 +1224,24 @@ var isMouseInputLeak = (raw, input = "") => {
     return false;
   }
   return SGR_MOUSE_FULL_RE.test(candidate) || SGR_MOUSE_BRACKET_LEAK_RE.test(candidate) || SGR_MOUSE_LEAK_RE.test(candidate) || SGR_MOUSE_BURST_RE.test(candidate) || SGR_MOUSE_FRAGMENT_TEST.test(candidate);
+};
+var isIncompleteMouseEscape = (sequence) => {
+  if (!sequence) {
+    return false;
+  }
+  if (isMouseInputLeak(sequence) || sequenceContainsMouseLeak(sequence)) {
+    return false;
+  }
+  if (sequence.endsWith("\x1B") || sequence.endsWith("\x1B[") || sequence.endsWith("\x1B[<")) {
+    return true;
+  }
+  if (/\[<\d*(?:;\d*)*$/i.test(sequence) && !/[Mm]$/.test(sequence)) {
+    return true;
+  }
+  if (/\x1b\[<\d*(?:;\d*)*$/i.test(sequence) && !/[Mm]$/.test(sequence)) {
+    return true;
+  }
+  return false;
 };
 var sequenceContainsMouseLeak = (sequence) => {
   if (!sequence) {
@@ -1234,25 +1275,57 @@ var parseMouseLeakScrolls = (raw) => {
 };
 
 // src/lib/inputPipeline.ts
+var MAX_PENDING_MOUSE = 48;
 var forwardMouseScrolls = (sequence) => {
   for (const dir of parseMouseLeakScrolls(sequence)) {
     emitWheelInput(dir);
   }
 };
-var createSwallowMouseSequence = (mouseParser) => {
-  return (sequence) => {
-    const event = mouseParser.parseMouseEvent(Buffer.from(sequence));
-    if (event !== null) {
-      if (event.type === "scroll") {
-        forwardMouseScrolls(sequence);
-      }
-      return true;
-    }
-    if (sequenceContainsMouseLeak(sequence) || isMouseInputLeak(sequence)) {
+var swallowMousePayload = (sequence, mouseParser) => {
+  const event = mouseParser.parseMouseEvent(Buffer.from(sequence));
+  if (event !== null) {
+    if (event.type === "scroll") {
       forwardMouseScrolls(sequence);
+    }
+    return true;
+  }
+  if (sequenceContainsMouseLeak(sequence) || isMouseInputLeak(sequence)) {
+    forwardMouseScrolls(sequence);
+    agentDebugLog(
+      "inputPipeline.ts:swallowLeak",
+      "swallowed mouse leak",
+      { len: sequence.length, preview: sequence.slice(0, 24) },
+      "D"
+    );
+    return true;
+  }
+  return false;
+};
+var createSwallowMouseSequence = (mouseParser) => {
+  let pending = "";
+  return (sequence) => {
+    let combined = pending ? pending + sequence : sequence;
+    pending = "";
+    if (combined.length > MAX_PENDING_MOUSE) {
+      agentDebugLog(
+        "inputPipeline.ts:pendingOverflow",
+        "mouse pending buffer overflow, dropping",
+        { len: combined.length },
+        "D"
+      );
+      combined = sequence;
+    }
+    if (isIncompleteMouseEscape(combined)) {
+      pending = combined;
+      agentDebugLog(
+        "inputPipeline.ts:pending",
+        "buffered incomplete mouse escape",
+        { len: combined.length, preview: combined.slice(0, 24) },
+        "D"
+      );
       return true;
     }
-    return false;
+    return swallowMousePayload(combined, mouseParser);
   };
 };
 
@@ -1276,7 +1349,14 @@ function InputBridge() {
       }
       const event = toInputEvent(key);
       const raw = event.keypress.raw ?? event.input;
-      if (isMouseInputLeak(raw, event.input)) {
+      const merged = `${raw}${event.input}`;
+      if (isMouseInputLeak(raw, event.input) || sequenceContainsMouseLeak(merged)) {
+        agentDebugLog(
+          "InputBridge.tsx:useKeyboard",
+          "blocked mouse leak on keyboard path",
+          { rawLen: raw.length, inputLen: event.input.length, preview: merged.slice(0, 24) },
+          "C"
+        );
         return;
       }
       emitInput(event);
@@ -1470,6 +1550,7 @@ export {
   evictInkCaches,
   forceQuitOnSecondCtrlC,
   getRenderer,
+  isIncompleteMouseEscape,
   isMouseInputLeak,
   isNearScrollBottom,
   isTuiShutdown,

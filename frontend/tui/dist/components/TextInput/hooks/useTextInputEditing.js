@@ -1,4 +1,4 @@
-import { isMouseInputLeak, stripMouseLeakFragments } from '@ector/ink';
+import { isMouseInputLeak, sequenceContainsMouseLeak, stripMouseLeakFragments } from '@ector/ink';
 import { readClipboardText, writeClipboardText } from '../../../lib/clipboard.js';
 import { isActionMod, isMac, isMacActionFallback } from '../../../lib/platform.js';
 import { stringWidth, supportsTerminalFastEcho, useInput } from '../lib/inkRuntime.js';
@@ -218,11 +218,44 @@ export function useTextInputEditing(opts) {
   };
   useInput((rawInp, k, event) => {
     const eventRaw = event.keypress.raw ?? '';
-    if (isMouseInputLeak(eventRaw, rawInp)) {
+    const merged = `${eventRaw}${rawInp}`;
+    if (isMouseInputLeak(eventRaw, rawInp) || sequenceContainsMouseLeak(merged)) {
+      if (sequenceContainsMouseLeak(merged)) {
+        // #region agent log
+        fetch('http://127.0.0.1:7942/ingest/87fa9e4b-a416-4933-9cfd-a9f0ed917b76', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Debug-Session-Id': '9e46c8'
+          },
+          body: JSON.stringify({
+            sessionId: '9e46c8',
+            location: 'useTextInputEditing.ts:useInput',
+            message: 'blocked mouse leak in composer',
+            data: {
+              preview: merged.slice(0, 24)
+            },
+            hypothesisId: 'E',
+            timestamp: Date.now()
+          })
+        }).catch(() => {});
+        try {
+          process.stderr.write(`ECTOR_MOUSE_DEBUG ${JSON.stringify({
+            location: 'useTextInputEditing',
+            preview: merged.slice(0, 24)
+          })}\n`);
+        } catch {
+          /* ignore */
+        }
+        // #endregion
+      }
       return;
     }
     const inp = stripMouseLeakFragments(rawInp);
     if (rawInp && !inp) {
+      return;
+    }
+    if (inp !== rawInp && sequenceContainsMouseLeak(inp)) {
       return;
     }
     if (eventRaw === '\x1bv' || eventRaw === '\x1bV' || eventRaw === '\x16' || isMac && isActionMod(k) && inp.toLowerCase() === 'v') {

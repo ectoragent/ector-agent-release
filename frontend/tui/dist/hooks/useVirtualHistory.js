@@ -383,28 +383,6 @@ export function useVirtualHistory(scrollRef, items, columns, {
       }
       lastScrollTopRef.current = Math.max(0, total - vp);
       forceTailFollowRef.current = false;
-      // #region agent log
-      fetch('http://127.0.0.1:7942/ingest/87fa9e4b-a416-4933-9cfd-a9f0ed917b76', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Debug-Session-Id': '9e46c8'
-        },
-        body: JSON.stringify({
-          sessionId: '9e46c8',
-          runId: 'post-fix',
-          hypothesisId: 'E',
-          location: 'useVirtualHistory.ts:forceTailFollow',
-          message: 'force tail scroll',
-          data: {
-            total,
-            vp,
-            itemCount: n
-          },
-          timestamp: Date.now()
-        })
-      }).catch(() => {});
-      // #endregion
     } else {
       // Virtual clamp (clampMin especially) traps scroll-up when height
       // estimates overshoot rendered rows on large messages. Prefer a

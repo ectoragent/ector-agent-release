@@ -216,28 +216,6 @@ export function useTranscriptVirtual(opts) {
         resumeScrollPendingRef.current = true;
         lastManualScrollAtRef.current = 0;
         scrollTranscriptToBottom(virtualTotal > 0 ? virtualTotal : undefined);
-        // #region agent log
-        fetch('http://127.0.0.1:7942/ingest/87fa9e4b-a416-4933-9cfd-a9f0ed917b76', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'X-Debug-Session-Id': '9e46c8'
-          },
-          body: JSON.stringify({
-            sessionId: '9e46c8',
-            runId: 'post-fix',
-            hypothesisId: 'B',
-            location: 'useTranscriptVirtual.ts:sidChanged',
-            message: 'resume sid scroll',
-            data: {
-              sid,
-              len,
-              virtualTotal
-            },
-            timestamp: Date.now()
-          })
-        }).catch(() => {});
-        // #endregion
       }
       return;
     }
@@ -296,33 +274,6 @@ export function useTranscriptVirtual(opts) {
       const total = virtualRows.length > 0 ? virtualHistory.offsets[virtualRows.length] ?? 0 : 0;
       scrollTranscriptToBottom(total > 0 ? total : undefined);
       const snap_1 = getViewportSnapshot(scrollRef.current);
-      // #region agent log
-      if (resumeScrollPendingRef.current && frames <= 3) {
-        fetch('http://127.0.0.1:7942/ingest/87fa9e4b-a416-4933-9cfd-a9f0ed917b76', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'X-Debug-Session-Id': '9e46c8'
-          },
-          body: JSON.stringify({
-            sessionId: '9e46c8',
-            runId: 'post-fix',
-            hypothesisId: 'B',
-            location: 'useTranscriptVirtual.ts:chase',
-            message: 'chase frame',
-            data: {
-              frame: frames,
-              virtualTotal: total,
-              scrollHeight: snap_1.scrollHeight,
-              bottom: snap_1.bottom,
-              atBottom: snap_1.atBottom,
-              atVirtualBottom: isAtVirtualBottom(snap_1, total)
-            },
-            timestamp: Date.now()
-          })
-        }).catch(() => {});
-      }
-      // #endregion
       if (isAtVirtualBottom(snap_1, total)) {
         chaseBottomRef.current = false;
         resumeScrollPendingRef.current = false;

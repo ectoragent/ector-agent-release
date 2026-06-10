@@ -251,25 +251,6 @@ export function useSessionLifecycle(opts) {
             if (generation !== resumeGenerationRef.current) {
               return;
             }
-            fetch("http://127.0.0.1:7942/ingest/87fa9e4b-a416-4933-9cfd-a9f0ed917b76", {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "X-Debug-Session-Id": "9e46c8"
-              },
-              body: JSON.stringify({
-                sessionId: "9e46c8",
-                runId: "post-fix",
-                hypothesisId: "A",
-                location: "useSessionLifecycle.ts:resumeById",
-                message: "resume sid applied",
-                data: {
-                  itemCount: capped.length,
-                  sid: r_0.session_id
-                },
-                timestamp: Date.now()
-              })
-            }).catch(_temp);
             patchUiState({
               sid: r_0.session_id
             });
@@ -341,4 +322,3 @@ export function useSessionLifecycle(opts) {
   }
   return t6;
 }
-function _temp() {}
