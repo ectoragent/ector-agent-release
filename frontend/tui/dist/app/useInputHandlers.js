@@ -209,12 +209,19 @@ export function useInputHandlers(ctx) {
   };
   useInput((ch, key) => {
     const live = getUiState();
+    if (key.wheelUp || key.wheelDown) {
+      const dir_1 = key.wheelUp ? -1 : 1;
+      const rows = computeWheelStep(wheelAccelRef.current, dir_1, Date.now());
+      if (rows) {
+        return scrollTranscript(dir_1 * rows * wheelStep);
+      }
+    }
     if (isBlocked) {
-      // When approval/wiser/confirm overlays are active, their own useInput
-      // handlers must receive keystrokes (arrow keys, numbers, Enter).  Only
-      // intercept Ctrl+C here so the user can deny/dismiss — all other keys
-      // fall through to the component-level handlers.
-      if (overlay.approval || overlay.wiser || overlay.confirm) {
+      // When approval/wiser/confirm/sudo/secret overlays are active, their own
+      // useInput handlers must receive keystrokes (arrow keys, numbers, Enter).
+      // Only intercept Ctrl+C here so the user can deny/dismiss — all other
+      // keys fall through to the component-level handlers.
+      if (overlay.approval || overlay.wiser || overlay.confirm || overlay.sudo || overlay.secret) {
         if (isCtrl(key, ch, 'c')) {
           cancelOverlayFromCtrlC();
         }
@@ -329,12 +336,6 @@ export function useInputHandlers(ctx) {
       const len_0 = cState.completions.length;
       cActions.setCompIdx(i => key.upArrow ? (i - 1 + len_0) % len_0 : (i + 1) % len_0);
       return;
-    }
-    if (key.wheelUp || key.wheelDown) {
-      const dir_1 = key.wheelUp ? -1 : 1;
-      // 0 = direction-flip bounce deferred; skip the no-op scroll.
-      const rows = computeWheelStep(wheelAccelRef.current, dir_1, Date.now());
-      return rows ? scrollTranscript(dir_1 * rows * wheelStep) : undefined;
     }
     if (key.shift && key.upArrow) {
       return scrollTranscript(-wheelStep * 3);

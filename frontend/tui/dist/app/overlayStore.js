@@ -40,11 +40,31 @@ export const resetOverlayState = () => $overlayState.set(buildOverlayState());
  * every turn completion / interrupt; the old "reset everything" behaviour
  * silently closed /agents the moment delegation finished.
  */
-export const resetFlowOverlays = () => $overlayState.set({
-  ...buildOverlayState(),
-  agents: $overlayState.get().agents,
-  agentsInitialHistoryIndex: $overlayState.get().agentsInitialHistoryIndex,
-  modelPicker: $overlayState.get().modelPicker,
-  picker: $overlayState.get().picker,
-  skillsHub: $overlayState.get().skillsHub
-});
+export const resetFlowOverlays = () => {
+  const prev = $overlayState.get();
+  $overlayState.set({
+    ...buildOverlayState(),
+    agents: prev.agents,
+    agentsInitialHistoryIndex: prev.agentsInitialHistoryIndex,
+    modelPicker: prev.modelPicker,
+    picker: prev.picker,
+    skillsHub: prev.skillsHub,
+    // idle() runs on message.complete but the gateway thread may still be
+    // blocked in sudo/secret/approval/wiser — never dismiss those prompts.
+    ...(prev.sudo ? {
+      sudo: prev.sudo
+    } : {}),
+    ...(prev.secret ? {
+      secret: prev.secret
+    } : {}),
+    ...(prev.approval ? {
+      approval: prev.approval
+    } : {}),
+    ...(prev.wiser ? {
+      wiser: prev.wiser
+    } : {}),
+    ...(prev.confirm ? {
+      confirm: prev.confirm
+    } : {})
+  });
+};

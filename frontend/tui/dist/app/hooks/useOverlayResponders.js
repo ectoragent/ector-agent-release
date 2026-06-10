@@ -54,12 +54,19 @@ export function useOverlayResponders(opts) {
   let t2;
   if ($[5] !== overlaySudo || $[6] !== respondWith) {
     t2 = pw => {
-      if (!overlaySudo) {
+      const pending = getOverlayState().sudo ?? overlaySudo;
+      if (!pending) {
         return;
       }
+      patchOverlayState({
+        sudo: null
+      });
+      patchUiState({
+        status: STATUS.running
+      });
       return respondWith("sudo.respond", {
         password: pw,
-        request_id: overlaySudo.requestId
+        request_id: pending.requestId
       }, _temp);
     };
     $[5] = overlaySudo;
@@ -72,11 +79,18 @@ export function useOverlayResponders(opts) {
   let t3;
   if ($[8] !== overlaySecret || $[9] !== respondWith) {
     t3 = value => {
-      if (!overlaySecret) {
+      const pending_0 = getOverlayState().secret ?? overlaySecret;
+      if (!pending_0) {
         return;
       }
+      patchOverlayState({
+        secret: null
+      });
+      patchUiState({
+        status: STATUS.running
+      });
       return respondWith("secret.respond", {
-        request_id: overlaySecret.requestId,
+        request_id: pending_0.requestId,
         value
       }, _temp2);
     };
@@ -90,14 +104,14 @@ export function useOverlayResponders(opts) {
   let t4;
   if ($[11] !== appendMessage || $[12] !== overlayWiser || $[13] !== rpc || $[14] !== sys) {
     t4 = answer => {
-      const pending = getOverlayState().wiser ?? overlayWiser;
-      if (!pending) {
+      const pending_1 = getOverlayState().wiser ?? overlayWiser;
+      if (!pending_1) {
         return;
       }
       const {
         question,
         requestId
-      } = pending;
+      } = pending_1;
       patchOverlayState({
         wiser: null
       });
@@ -174,19 +188,5 @@ export function useOverlayResponders(opts) {
   }
   return t6;
 }
-function _temp2() {
-  patchOverlayState({
-    secret: null
-  });
-  patchUiState({
-    status: STATUS.running
-  });
-}
-function _temp() {
-  patchOverlayState({
-    sudo: null
-  });
-  patchUiState({
-    status: STATUS.running
-  });
-}
+function _temp2() {}
+function _temp() {}

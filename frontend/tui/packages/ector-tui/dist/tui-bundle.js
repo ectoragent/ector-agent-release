@@ -1144,10 +1144,12 @@ var BASE_KEY = {
   wheelUp: false
 };
 var emitWheelInput = (direction) => {
-  emitInput({
-    input: "",
-    key: { ...BASE_KEY, wheelDown: direction === "down", wheelUp: direction === "up" },
-    keypress: { raw: "" }
+  queueMicrotask(() => {
+    emitInput({
+      input: "",
+      key: { ...BASE_KEY, wheelDown: direction === "down", wheelUp: direction === "up" },
+      keypress: { raw: "" }
+    });
   });
 };
 
@@ -1202,20 +1204,27 @@ var isMouseInputLeak = (raw, input = "") => {
   }
   return SGR_MOUSE_FULL_RE.test(candidate) || SGR_MOUSE_BRACKET_LEAK_RE.test(candidate) || SGR_MOUSE_LEAK_RE.test(candidate) || SGR_MOUSE_BURST_RE.test(candidate) || SGR_MOUSE_FRAGMENT_TEST.test(candidate);
 };
+var INCOMPLETE_MOUSE_MAX = 12;
 var isIncompleteMouseEscape = (sequence) => {
   if (!sequence) {
+    return false;
+  }
+  if (sequence.length > INCOMPLETE_MOUSE_MAX) {
     return false;
   }
   if (isMouseInputLeak(sequence) || sequenceContainsMouseLeak(sequence)) {
     return false;
   }
-  if (sequence.endsWith("\x1B") || sequence.endsWith("\x1B[") || sequence.endsWith("\x1B[<")) {
+  if (/^\x1b\[[0-9;]*[A-Za-z]$/.test(sequence)) {
+    return false;
+  }
+  if (sequence === "\x1B" || sequence === "\x1B[" || sequence === "\x1B[<" || sequence === "[<") {
     return true;
   }
-  if (/\[<\d*(?:;\d*)*$/i.test(sequence) && !/[Mm]$/.test(sequence)) {
+  if (/^\[<\d*(?:;\d*)*$/i.test(sequence) && !/[Mm]$/.test(sequence)) {
     return true;
   }
-  if (/\x1b\[<\d*(?:;\d*)*$/i.test(sequence) && !/[Mm]$/.test(sequence)) {
+  if (/^\x1b\[<\d*(?:;\d*)*$/i.test(sequence) && !/[Mm]$/.test(sequence)) {
     return true;
   }
   return false;
