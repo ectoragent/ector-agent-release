@@ -508,67 +508,10 @@ def _block(event: str, sid: str, payload: dict, timeout: int | None = None) -> s
     ev = threading.Event()
     _pending[rid] = (sid, ev, event)
     payload["request_id"] = rid
-    # #region agent log
-    if event == "sudo.request":
-        try:
-            import json
-            import time
-
-            with open(
-                "/Users/dev/Documents/develop-personal/ector-agent/.cursor/debug-9e46c8.log",
-                "a",
-                encoding="utf-8",
-            ) as _df:
-                _df.write(
-                    json.dumps(
-                        {
-                            "sessionId": "9e46c8",
-                            "location": "server.py:_block",
-                            "message": "sudo.request emit",
-                            "data": {"request_id": rid, "sid": sid, "timeout": timeout},
-                            "hypothesisId": "D",
-                            "runId": "pre-fix",
-                            "timestamp": int(time.time() * 1000),
-                        }
-                    )
-                    + "\n"
-                )
-        except Exception:
-            pass
-    # #endregion
     _emit(event, sid, payload)
     ev.wait(timeout=timeout)
     _pending.pop(rid, None)
-    answer = _answers.pop(rid, "")
-    # #region agent log
-    if event == "sudo.request":
-        try:
-            import json
-            import time
-
-            with open(
-                "/Users/dev/Documents/develop-personal/ector-agent/.cursor/debug-9e46c8.log",
-                "a",
-                encoding="utf-8",
-            ) as _df:
-                _df.write(
-                    json.dumps(
-                        {
-                            "sessionId": "9e46c8",
-                            "location": "server.py:_block",
-                            "message": "sudo.request resolved",
-                            "data": {"gotPassword": bool(answer), "request_id": rid},
-                            "hypothesisId": "D",
-                            "runId": "pre-fix",
-                            "timestamp": int(time.time() * 1000),
-                        }
-                    )
-                    + "\n"
-                )
-        except Exception:
-            pass
-    # #endregion
-    return answer
+    return _answers.pop(rid, "")
 
 
 def _clear_pending(sid: str | None = None) -> None:

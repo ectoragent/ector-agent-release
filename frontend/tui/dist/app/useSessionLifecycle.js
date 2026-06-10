@@ -182,6 +182,7 @@ export function useSessionLifecycle(opts) {
       patchOverlayState({
         picker: false
       });
+      setHistoryItems([]);
       patchUiState(state => ({
         ...state,
         busy: false,
@@ -236,15 +237,42 @@ export function useSessionLifecycle(opts) {
               text: pending
             }];
           }
-          setHistoryItems(capTranscriptHistory(items));
+          const capped = capTranscriptHistory(items);
+          setHistoryItems(capped);
           patchUiState({
             info: r_0.info ?? null,
             pendingBackgroundReply: null,
             sessionKey: r_0.resumed ?? id,
             sessionTitle: r_0.title?.trim() || null,
-            sid: r_0.session_id,
             status: STATUS.ready,
             usage: usageFrom(r_0.info ?? null)
+          });
+          requestAnimationFrame(() => {
+            if (generation !== resumeGenerationRef.current) {
+              return;
+            }
+            fetch("http://127.0.0.1:7942/ingest/87fa9e4b-a416-4933-9cfd-a9f0ed917b76", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "X-Debug-Session-Id": "9e46c8"
+              },
+              body: JSON.stringify({
+                sessionId: "9e46c8",
+                runId: "post-fix",
+                hypothesisId: "A",
+                location: "useSessionLifecycle.ts:resumeById",
+                message: "resume sid applied",
+                data: {
+                  itemCount: capped.length,
+                  sid: r_0.session_id
+                },
+                timestamp: Date.now()
+              })
+            }).catch(_temp);
+            patchUiState({
+              sid: r_0.session_id
+            });
           });
         }).catch(e => {
           if (generation !== resumeGenerationRef.current) {
@@ -313,3 +341,4 @@ export function useSessionLifecycle(opts) {
   }
   return t6;
 }
+function _temp() {}

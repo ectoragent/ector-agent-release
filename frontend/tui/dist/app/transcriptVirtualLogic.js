@@ -53,5 +53,13 @@ export const isReadingHistory = ctx => {
   }
   return !ctx.atBottom;
 };
+/** Bottom of viewport reached relative to virtual offsets, not only mounted DOM height. */
+export const isAtVirtualBottom = (snap, virtualTotal) => {
+  if (snap.viewportHeight <= 0) {
+    return false;
+  }
+  const contentHeight = Math.max(snap.scrollHeight, virtualTotal);
+  return snap.bottom >= contentHeight - 2;
+};
 /** Auto-scroll when docked at bottom, or until the user manually scrolls away. */
 export const shouldAutoScrollTail = ctx => !isReadingHistory(ctx);

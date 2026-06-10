@@ -1,5 +1,4 @@
 import { STATUS } from '../../../content/uiStatus.js';
-import { debugSessionLog } from '../../../lib/debugSessionLog.js';
 import { patchOverlayState } from '../../overlayStore.js';
 import { getUiState, patchUiState } from '../../uiStore.js';
 export function handleWiserRequest(ev, api) {
@@ -26,11 +25,6 @@ export function handleApprovalRequest(ev, api) {
 }
 export function handleSudoRequest(ev, api) {
   const p = ev.payload;
-  // #region agent log
-  debugSessionLog('overlays.ts:handleSudoRequest', 'sudo.request overlay', {
-    requestId: p.request_id
-  }, 'B');
-  // #endregion
   patchOverlayState({
     sudo: {
       requestId: p.request_id

@@ -5,7 +5,6 @@ import { MOUSE_MOVEMENT_TRACKING, MOUSE_TRACKING } from './config/env.js';
 import { getUiState } from './app/uiStore.js';
 import { GatewayClient } from './gatewayClient.js';
 import { withBootSpinner } from './lib/bootSpinner.js';
-import { debugSessionLog } from './lib/debugSessionLog.js';
 import { forceProcessExit, setupGracefulExit } from './lib/gracefulExit.js';
 import { formatBytes, performHeapDump } from './lib/memory.js';
 import { startMemoryMonitor } from './lib/memoryMonitor.js';
@@ -25,23 +24,9 @@ setupGracefulExit({
   deferSigint: () => getUiState().busy,
   onError: (scope, err) => {
     const message = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
-    // #region agent log
-    debugSessionLog('entry.tsx:onError', 'tui fatal error', {
-      message: message.slice(0, 500),
-      scope,
-      stack: err instanceof Error ? err.stack?.slice(0, 800) : undefined
-    }, 'C');
-    // #endregion
     process.stderr.write(`ector-tui ${scope}: ${message.slice(0, 2000)}\n`);
   },
-  onSignal: signal => {
-    // #region agent log
-    debugSessionLog('entry.tsx:onSignal', 'tui signal exit', {
-      signal
-    }, 'E');
-    // #endregion
-    process.stderr.write(`ector-tui: received ${signal}\n`);
-  }
+  onSignal: signal => process.stderr.write(`ector-tui: received ${signal}\n`)
 });
 const stopMemoryMonitor = startMemoryMonitor({
   onCritical: (snap, dump) => {

@@ -733,20 +733,6 @@ function shutdownTui() {
     } catch {
     }
   }
-  fetch("http://127.0.0.1:7942/ingest/87fa9e4b-a416-4933-9cfd-a9f0ed917b76", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "9e46c8" },
-    body: JSON.stringify({
-      sessionId: "9e46c8",
-      location: "terminalShutdown.ts:shutdownTui",
-      message: "shutdown complete",
-      data: { isTTY: process.stdout.isTTY, hadRenderer: Boolean(renderer2) },
-      hypothesisId: "E",
-      runId: "pre-fix",
-      timestamp: Date.now()
-    })
-  }).catch(() => {
-  });
 }
 
 // src/hooks/useApp.ts
@@ -1093,90 +1079,6 @@ function useTerminalViewport() {
   return [setElement, entryRef.current];
 }
 
-// src/lib/ctrlCForceQuit.ts
-var FORCE_QUIT_WINDOW_MS = 1500;
-var lastCtrlCAt = 0;
-var rendererIsDead = () => {
-  if (isTuiShutdown()) {
-    return true;
-  }
-  const renderer2 = getRenderer();
-  return Boolean(renderer2?.isDestroyed);
-};
-var forceExitImpl = (code) => {
-  process.exit(code);
-};
-var registerForceProcessExit = (fn) => {
-  forceExitImpl = fn;
-};
-var forceExit = (code = 130) => {
-  forceExitImpl(code);
-};
-var forceQuitOnSecondCtrlC = (sequence) => {
-  if (sequence !== "") {
-    return false;
-  }
-  if (rendererIsDead()) {
-    forceExit(130);
-    return true;
-  }
-  const now = Date.now();
-  if (now - lastCtrlCAt < FORCE_QUIT_WINDOW_MS) {
-    forceExit(130);
-  }
-  lastCtrlCAt = now;
-  return false;
-};
-
-// src/lib/mouseInputLeak.ts
-var ESC = "\x1B";
-var SGR_MOUSE_FULL_RE = new RegExp(`^${ESC}\\[<\\d+(?:;\\d+){0,2}[Mm]$`);
-var SGR_MOUSE_LEAK_RE = /^(?:<)?\d+(?:;\d+){0,2}[Mm]$/;
-var SGR_MOUSE_BURST_RE = /^(?:\d+;\d+;\d+[Mm]){2,}$/;
-var SGR_MOUSE_FRAGMENT_RE = /\d+;\d+;\d+[Mm]/g;
-var SGR_MOUSE_FRAGMENT_TEST = /\d+;\d+;\d+[Mm]/;
-var isMouseInputLeak = (raw, input = "") => {
-  const candidate = raw || input;
-  if (!candidate) {
-    return false;
-  }
-  return SGR_MOUSE_FULL_RE.test(candidate) || SGR_MOUSE_LEAK_RE.test(candidate) || SGR_MOUSE_BURST_RE.test(candidate) || SGR_MOUSE_FRAGMENT_TEST.test(candidate);
-};
-var sequenceContainsMouseLeak = (sequence) => {
-  if (!sequence) {
-    return false;
-  }
-  if (isMouseInputLeak(sequence)) {
-    return true;
-  }
-  return SGR_MOUSE_FRAGMENT_TEST.test(sequence);
-};
-var stripMouseLeakFragments = (text) => {
-  if (!text) {
-    return text;
-  }
-  return text.replace(SGR_MOUSE_FRAGMENT_RE, "");
-};
-
-// src/lib/inputPipeline.ts
-var createSwallowMouseSequence = (mouseParser) => {
-  return (sequence) => {
-    const event = mouseParser.parseMouseEvent(Buffer.from(sequence));
-    if (event !== null) {
-      return event.type !== "scroll";
-    }
-    return sequenceContainsMouseLeak(sequence) || isMouseInputLeak(sequence);
-  };
-};
-
-// src/render.tsx
-import { createCliRenderer, MouseParser } from "@opentui/core";
-import { createRoot } from "@opentui/react";
-
-// src/components/InputBridge/InputBridge.tsx
-import { decodePasteBytes } from "@opentui/core";
-import { useKeyboard, usePaste } from "@opentui/react";
-
 // src/input.ts
 var named = (e, name) => e.name === name;
 var toInkKey = (e) => ({
@@ -1219,8 +1121,148 @@ var toInputEvent = (e) => ({
   key: toInkKey(e),
   keypress: { raw: e.raw }
 });
+var BASE_KEY = {
+  alt: false,
+  backspace: false,
+  ctrl: false,
+  delete: false,
+  downArrow: false,
+  end: false,
+  escape: false,
+  home: false,
+  leftArrow: false,
+  meta: false,
+  pageDown: false,
+  pageUp: false,
+  rightArrow: false,
+  return: false,
+  shift: false,
+  super: false,
+  tab: false,
+  upArrow: false,
+  wheelDown: false,
+  wheelUp: false
+};
+var emitWheelInput = (direction) => {
+  emitInput({
+    input: "",
+    key: { ...BASE_KEY, wheelDown: direction === "down", wheelUp: direction === "up" },
+    keypress: { raw: "" }
+  });
+};
+
+// src/lib/ctrlCForceQuit.ts
+var FORCE_QUIT_WINDOW_MS = 1500;
+var lastCtrlCAt = 0;
+var rendererIsDead = () => {
+  if (isTuiShutdown()) {
+    return true;
+  }
+  const renderer2 = getRenderer();
+  return Boolean(renderer2?.isDestroyed);
+};
+var forceExitImpl = (code) => {
+  process.exit(code);
+};
+var registerForceProcessExit = (fn) => {
+  forceExitImpl = fn;
+};
+var forceExit = (code = 130) => {
+  forceExitImpl(code);
+};
+var forceQuitOnSecondCtrlC = (sequence) => {
+  if (sequence !== "") {
+    return false;
+  }
+  if (rendererIsDead()) {
+    forceExit(130);
+    return true;
+  }
+  const now = Date.now();
+  if (now - lastCtrlCAt < FORCE_QUIT_WINDOW_MS) {
+    forceExit(130);
+  }
+  lastCtrlCAt = now;
+  return false;
+};
+
+// src/lib/mouseInputLeak.ts
+var ESC = "\x1B";
+var SGR_MOUSE_FULL_RE = new RegExp(`^${ESC}\\[<\\d+(?:;\\d+){0,2}[Mm]$`);
+var SGR_MOUSE_BRACKET_LEAK_RE = /^\[<\d+(?:;\d+){0,2}[Mm]$/;
+var SGR_MOUSE_LEAK_RE = /^(?:<)?\d+(?:;\d+){0,2}[Mm]$/;
+var SGR_MOUSE_BURST_RE = /^(?:\d+;\d+;\d+[Mm]){2,}$/;
+var SGR_MOUSE_FRAGMENT_RE = /\d+;\d+;\d+[Mm]/g;
+var SGR_MOUSE_FRAGMENT_TEST = /\d+;\d+;\d+[Mm]/;
+var SCROLL_DIRECTIONS = ["up", "down", "left", "right"];
+var isMouseInputLeak = (raw, input = "") => {
+  const candidate = raw || input;
+  if (!candidate) {
+    return false;
+  }
+  return SGR_MOUSE_FULL_RE.test(candidate) || SGR_MOUSE_BRACKET_LEAK_RE.test(candidate) || SGR_MOUSE_LEAK_RE.test(candidate) || SGR_MOUSE_BURST_RE.test(candidate) || SGR_MOUSE_FRAGMENT_TEST.test(candidate);
+};
+var sequenceContainsMouseLeak = (sequence) => {
+  if (!sequence) {
+    return false;
+  }
+  if (isMouseInputLeak(sequence)) {
+    return true;
+  }
+  return SGR_MOUSE_FRAGMENT_TEST.test(sequence);
+};
+var stripMouseLeakFragments = (text) => {
+  if (!text) {
+    return text;
+  }
+  return text.replace(SGR_MOUSE_FRAGMENT_RE, "");
+};
+var parseMouseLeakScrolls = (raw) => {
+  const out = [];
+  for (const match of raw.matchAll(/(\d+);(\d+);(\d+)([Mm])/g)) {
+    const rawButtonCode = Number(match[1]);
+    const pressRelease = match[4];
+    if (pressRelease !== "M" || (rawButtonCode & 64) === 0) {
+      continue;
+    }
+    const direction = SCROLL_DIRECTIONS[rawButtonCode & 3];
+    if (direction === "up" || direction === "down") {
+      out.push(direction);
+    }
+  }
+  return out;
+};
+
+// src/lib/inputPipeline.ts
+var forwardMouseScrolls = (sequence) => {
+  for (const dir of parseMouseLeakScrolls(sequence)) {
+    emitWheelInput(dir);
+  }
+};
+var createSwallowMouseSequence = (mouseParser) => {
+  return (sequence) => {
+    const event = mouseParser.parseMouseEvent(Buffer.from(sequence));
+    if (event !== null) {
+      if (event.type === "scroll") {
+        forwardMouseScrolls(sequence);
+      }
+      return true;
+    }
+    if (sequenceContainsMouseLeak(sequence) || isMouseInputLeak(sequence)) {
+      forwardMouseScrolls(sequence);
+      return true;
+    }
+    return false;
+  };
+};
+
+// src/render.tsx
+import { createCliRenderer, MouseParser } from "@opentui/core";
+import { createRoot } from "@opentui/react";
 
 // src/components/InputBridge/InputBridge.tsx
+import { decodePasteBytes } from "@opentui/core";
+import { useKeyboard, usePaste } from "@opentui/react";
 function InputBridge() {
   useKeyboard(
     (key) => {
@@ -1424,6 +1466,7 @@ export {
   TextInput,
   copyTextToSystemClipboard,
   createSwallowMouseSequence,
+  emitWheelInput,
   evictInkCaches,
   forceQuitOnSecondCtrlC,
   getRenderer,

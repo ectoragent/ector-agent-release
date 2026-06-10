@@ -4,10 +4,9 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef } from 'react'
 import { TYPING_IDLE_MS } from '../../config/timing.js';
 import { sectionMode } from '../../domain/details.js';
 import { useVirtualHistory } from '../../hooks/useVirtualHistory.js';
-import { debugSessionLog } from '../../lib/debugSessionLog.js';
-import { getViewportSnapshot, useViewportSnapshot } from '../../lib/viewportStore.js';
+import { getViewportSnapshot } from '../../lib/viewportStore.js';
 import { messageHeightKey } from '../../lib/virtualHeights.js';
-import { buildInitialHeightEstimates, shouldAutoScrollTail, shouldClearHeightCacheOnBusyEnd } from '../transcriptVirtualLogic.js';
+import { buildInitialHeightEstimates, isAtVirtualBottom, shouldAutoScrollTail, shouldClearHeightCacheOnBusyEnd } from '../transcriptVirtualLogic.js';
 import { turnController } from '../turnController.js';
 import { useTurnSelector } from '../turnStore.js';
 import { $isBlocked } from '../overlayStore.js';
@@ -16,6 +15,7 @@ const MAX_HEIGHT_CACHE_BUCKETS = 12;
 const CHASE_BOTTOM_MAX_FRAMES = 12;
 const CHASE_BOTTOM_LARGE_HISTORY = 40;
 const CHASE_BOTTOM_LARGE_FRAMES = 8;
+const CHASE_BOTTOM_RESUME_FRAMES = 32;
 export function useTranscriptVirtual(opts) {
   const {
     cols,
@@ -32,13 +32,11 @@ export function useTranscriptVirtual(opts) {
     busy
   } = useStore($uiState);
   const isBlocked = useStore($isBlocked);
-  const viewport = useViewportSnapshot(scrollRef);
   const streamingLiveTail = useTurnSelector(state => Boolean(state.streaming.trim()));
   const liveScrollFingerprint = useTurnSelector(state_0 => `${state_0.streaming.length}:${state_0.reasoning.length}:${state_0.streamSegments.length}`);
   const prevBusyRef = useRef(busy);
   const prevLiveTailRef = useRef(liveTailActive);
   const prevFlowBlockRef = useRef(isBlocked);
-  const prevViewportHeightRef = useRef(0);
   const msgIdsRef = useRef(new WeakMap());
   const msgIdSeqRef = useRef(0);
   const heightCachesRef = useRef(new Map());
@@ -111,9 +109,11 @@ export function useTranscriptVirtual(opts) {
     liveTailActive: streamingLiveTail,
     onHeightsChange: syncHeightCache
   });
+  const virtualTotal = virtualRows.length > 0 ? virtualHistory.offsets[virtualRows.length] ?? 0 : 0;
   const transcriptLenRef = useRef(0);
   const prevSidRef = useRef(undefined);
   const chaseBottomRef = useRef(false);
+  const resumeScrollPendingRef = useRef(false);
   const tailFollowRef = useRef(true);
   const turnEndFollowLatchRef = useRef(false);
   const lastManualScrollAtRef = useRef(0);
@@ -213,7 +213,31 @@ export function useTranscriptVirtual(opts) {
         tailFollowRef.current = true;
         turnEndFollowLatchRef.current = false;
         chaseBottomRef.current = true;
-        scrollTranscriptToBottom();
+        resumeScrollPendingRef.current = true;
+        lastManualScrollAtRef.current = 0;
+        scrollTranscriptToBottom(virtualTotal > 0 ? virtualTotal : undefined);
+        // #region agent log
+        fetch('http://127.0.0.1:7942/ingest/87fa9e4b-a416-4933-9cfd-a9f0ed917b76', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Debug-Session-Id': '9e46c8'
+          },
+          body: JSON.stringify({
+            sessionId: '9e46c8',
+            runId: 'post-fix',
+            hypothesisId: 'B',
+            location: 'useTranscriptVirtual.ts:sidChanged',
+            message: 'resume sid scroll',
+            data: {
+              sid,
+              len,
+              virtualTotal
+            },
+            timestamp: Date.now()
+          })
+        }).catch(() => {});
+        // #endregion
       }
       return;
     }
@@ -230,34 +254,78 @@ export function useTranscriptVirtual(opts) {
     } else {
       transcriptLenRef.current = len;
     }
-  }, [historyItems.length, scrollRef, scrollTranscriptToBottom, sid, virtualHistory.offsets, virtualRows.length]);
+  }, [historyItems.length, scrollRef, scrollTranscriptToBottom, sid, virtualTotal, virtualRows.length]);
   useLayoutEffect(() => {
     if (prevLiveTailRef.current && !liveTailActive && tailFollowRef.current) {
       turnEndFollowLatchRef.current = true;
     }
     prevLiveTailRef.current = liveTailActive;
   }, [liveTailActive]);
+  useLayoutEffect(() => {
+    if (!resumeScrollPendingRef.current || !sid || historyItems.length === 0) {
+      return;
+    }
+    const snap_0 = getViewportSnapshot(scrollRef.current);
+    if (isAtVirtualBottom(snap_0, virtualTotal)) {
+      resumeScrollPendingRef.current = false;
+      chaseBottomRef.current = false;
+      return;
+    }
+    chaseBottomRef.current = true;
+    scrollTranscriptToBottom(virtualTotal > 0 ? virtualTotal : undefined);
+  }, [historyItems.length, scrollRef, scrollTranscriptToBottom, sid, virtualTotal]);
   useEffect(() => {
     if (!chaseBottomRef.current) {
       return;
     }
     let cancelled = false;
     let frames = 0;
-    const maxFrames = historyItems.length >= CHASE_BOTTOM_LARGE_HISTORY ? CHASE_BOTTOM_LARGE_FRAMES : CHASE_BOTTOM_MAX_FRAMES;
+    const maxFrames = resumeScrollPendingRef.current ? CHASE_BOTTOM_RESUME_FRAMES : historyItems.length >= CHASE_BOTTOM_LARGE_HISTORY ? CHASE_BOTTOM_LARGE_FRAMES : CHASE_BOTTOM_MAX_FRAMES;
     const chase = () => {
       if (cancelled || frames++ > maxFrames) {
         chaseBottomRef.current = false;
+        resumeScrollPendingRef.current = false;
         return;
       }
       const s_3 = scrollRef.current;
       if (s_3 && Date.now() - s_3.getLastManualScrollAt() < 2500) {
         chaseBottomRef.current = false;
+        resumeScrollPendingRef.current = false;
         return;
       }
-      scrollTranscriptToBottom();
-      const snap_0 = getViewportSnapshot(scrollRef.current);
-      if (snap_0.atBottom && snap_0.viewportHeight > 0) {
+      const total = virtualRows.length > 0 ? virtualHistory.offsets[virtualRows.length] ?? 0 : 0;
+      scrollTranscriptToBottom(total > 0 ? total : undefined);
+      const snap_1 = getViewportSnapshot(scrollRef.current);
+      // #region agent log
+      if (resumeScrollPendingRef.current && frames <= 3) {
+        fetch('http://127.0.0.1:7942/ingest/87fa9e4b-a416-4933-9cfd-a9f0ed917b76', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Debug-Session-Id': '9e46c8'
+          },
+          body: JSON.stringify({
+            sessionId: '9e46c8',
+            runId: 'post-fix',
+            hypothesisId: 'B',
+            location: 'useTranscriptVirtual.ts:chase',
+            message: 'chase frame',
+            data: {
+              frame: frames,
+              virtualTotal: total,
+              scrollHeight: snap_1.scrollHeight,
+              bottom: snap_1.bottom,
+              atBottom: snap_1.atBottom,
+              atVirtualBottom: isAtVirtualBottom(snap_1, total)
+            },
+            timestamp: Date.now()
+          })
+        }).catch(() => {});
+      }
+      // #endregion
+      if (isAtVirtualBottom(snap_1, total)) {
         chaseBottomRef.current = false;
+        resumeScrollPendingRef.current = false;
         return;
       }
       requestAnimationFrame(chase);
@@ -266,7 +334,7 @@ export function useTranscriptVirtual(opts) {
     return () => {
       cancelled = true;
     };
-  }, [historyItems.length, scrollRef, scrollTranscriptToBottom, sid]);
+  }, [historyItems.length, scrollRef, scrollTranscriptToBottom, sid, virtualHistory.offsets, virtualRows.length, virtualTotal]);
   useLayoutEffect(() => {
     if (!liveTailActive) {
       return;
@@ -275,14 +343,14 @@ export function useTranscriptVirtual(opts) {
     if (!s_4) {
       return;
     }
-    const snap_1 = getViewportSnapshot(s_4);
+    const snap_2 = getViewportSnapshot(s_4);
     const manualAt_1 = s_4.getLastManualScrollAt() || 0;
     if (!shouldAutoScrollTail({
-      atBottom: snap_1.atBottom,
+      atBottom: snap_2.atBottom,
       lastManualScrollAt: manualAt_1,
       manualGraceMs: MANUAL_SCROLL_GRACE_MS,
       now: Date.now(),
-      viewportHeight: snap_1.viewportHeight
+      viewportHeight: snap_2.viewportHeight
     }) && !turnEndFollowLatchRef.current) {
       return;
     }
@@ -294,8 +362,8 @@ export function useTranscriptVirtual(opts) {
         return;
       }
       scrollTranscriptToBottom();
-      const snap_2 = getViewportSnapshot(scrollRef.current);
-      if (!snap_2.atBottom) {
+      const snap_3 = getViewportSnapshot(scrollRef.current);
+      if (!snap_3.atBottom) {
         requestAnimationFrame(settle);
       }
     };
@@ -305,26 +373,14 @@ export function useTranscriptVirtual(opts) {
     };
   }, [liveTailActive, liveScrollFingerprint, scrollRef, scrollTranscriptToBottom]);
   useLayoutEffect(() => {
-    const vp_0 = viewport.viewportHeight;
     const blockChanged = isBlocked !== prevFlowBlockRef.current;
-    const vpChanged = vp_0 > 0 && prevViewportHeightRef.current > 0 && vp_0 !== prevViewportHeightRef.current;
     prevFlowBlockRef.current = isBlocked;
-    prevViewportHeightRef.current = vp_0;
-    if (!liveTailActive || !blockChanged && !vpChanged) {
+    if (!liveTailActive || !blockChanged) {
       return;
     }
     if (!tailFollowRef.current && !turnEndFollowLatchRef.current) {
       return;
     }
-    // #region agent log
-    debugSessionLog('useTranscriptVirtual.ts:flowBlock', 'flow overlay viewport sync', {
-      blockChanged,
-      isBlocked,
-      liveTailActive,
-      vp: vp_0,
-      vpChanged
-    }, 'B');
-    // #endregion
     scrollTranscriptToBottom();
     let frame_0 = 0;
     let cancelled_1 = false;
@@ -339,7 +395,7 @@ export function useTranscriptVirtual(opts) {
     return () => {
       cancelled_1 = true;
     };
-  }, [isBlocked, liveTailActive, scrollRef, scrollTranscriptToBottom, viewport.viewportHeight]);
+  }, [isBlocked, liveTailActive, scrollRef, scrollTranscriptToBottom]);
   return {
     virtualHistory,
     virtualRows

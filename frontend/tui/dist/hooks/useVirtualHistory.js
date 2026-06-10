@@ -1,5 +1,4 @@
 import { useCallback, useDeferredValue, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
-import { debugSessionLog } from '../lib/debugSessionLog.js';
 const ESTIMATE = 4;
 // Overscan was 40 (= viewport) which is way more than needed when heights
 // are well-estimated.  Cutting in half saves ~20 mounted items per scroll
@@ -90,7 +89,6 @@ export function useVirtualHistory(scrollRef, items, columns, {
   const prevItemsHeadRef = useRef(undefined);
   const prevItemCountRef = useRef(0);
   const forceTailFollowRef = useRef(false);
-  const debugSpacerSigRef = useRef('');
   // Width change: scale cached heights by oldCols/newCols instead of clearing
   // (clearing forces a pessimistic back-walk mounting ~190 rows at once, each
   // a fresh marked.lexer + syntax highlight ≈ 3ms). Freeze the mount range
@@ -378,9 +376,35 @@ export function useVirtualHistory(scrollRef, items, columns, {
     // spacer → white flash.
     if (forceTailFollowRef.current && s_1) {
       s_1.setClampBounds(undefined, undefined);
-      s_1.scrollToBottom();
+      if (total > 0 && vp > 0) {
+        s_1.scrollTo(Math.max(0, total - vp));
+      } else {
+        s_1.scrollToBottom();
+      }
       lastScrollTopRef.current = Math.max(0, total - vp);
       forceTailFollowRef.current = false;
+      // #region agent log
+      fetch('http://127.0.0.1:7942/ingest/87fa9e4b-a416-4933-9cfd-a9f0ed917b76', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Debug-Session-Id': '9e46c8'
+        },
+        body: JSON.stringify({
+          sessionId: '9e46c8',
+          runId: 'post-fix',
+          hypothesisId: 'E',
+          location: 'useVirtualHistory.ts:forceTailFollow',
+          message: 'force tail scroll',
+          data: {
+            total,
+            vp,
+            itemCount: n
+          },
+          timestamp: Date.now()
+        })
+      }).catch(() => {});
+      // #endregion
     } else {
       // Virtual clamp (clampMin especially) traps scroll-up when height
       // estimates overshoot rendered rows on large messages. Prefer a
@@ -442,25 +466,6 @@ export function useVirtualHistory(scrollRef, items, columns, {
       topSpacer = Math.min(topSpacer, target_0);
     }
   }
-  // #region agent log
-  {
-    const sig = `${bottomSpacer}|${effStart}|${effEnd}|${vp}`;
-    const suspicious = bottomSpacer > Math.max(vp * 3, 120);
-    if (suspicious && sig !== debugSpacerSigRef.current) {
-      debugSpacerSigRef.current = sig;
-      debugSessionLog('useVirtualHistory.ts:spacers', 'bottomSpacer anomaly', {
-        bottomSpacer,
-        effEnd,
-        effStart,
-        itemCount: items.length,
-        liveTailActive,
-        topSpacer,
-        total,
-        viewportHeight: vp
-      }, 'A');
-    }
-  }
-  // #endregion
   return {
     bottomSpacer,
     end: effEnd,
