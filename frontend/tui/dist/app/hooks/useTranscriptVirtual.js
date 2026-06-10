@@ -11,9 +11,9 @@ import { turnController } from '../turnController.js';
 import { useTurnSelector } from '../turnStore.js';
 import { $uiState } from '../uiStore.js';
 const MAX_HEIGHT_CACHE_BUCKETS = 12;
-const CHASE_BOTTOM_MAX_FRAMES = 8;
+const CHASE_BOTTOM_MAX_FRAMES = 12;
 const CHASE_BOTTOM_LARGE_HISTORY = 40;
-const CHASE_BOTTOM_LARGE_FRAMES = 2;
+const CHASE_BOTTOM_LARGE_FRAMES = 8;
 export function useTranscriptVirtual(opts) {
   const {
     cols,
@@ -197,13 +197,14 @@ export function useTranscriptVirtual(opts) {
   useLayoutEffect(() => {
     const len = historyItems.length;
     const sidChanged = sid !== prevSidRef.current;
-    const virtualTotal = virtualHistory.offsets[virtualRows.length] ?? 0;
     if (sidChanged) {
       prevSidRef.current = sid;
       transcriptLenRef.current = len;
       if (sid && len > 0) {
+        tailFollowRef.current = true;
+        turnEndFollowLatchRef.current = false;
         chaseBottomRef.current = true;
-        scrollTranscriptToBottom(virtualTotal);
+        scrollTranscriptToBottom();
       }
       return;
     }
@@ -212,7 +213,7 @@ export function useTranscriptVirtual(opts) {
       transcriptLenRef.current = len;
       const follow_0 = tailFollowRef.current || turnEndFollowLatchRef.current;
       if (s_2 && follow_0) {
-        scrollTranscriptToBottom(virtualHistory.offsets[len] ?? 0);
+        scrollTranscriptToBottom();
         if (getViewportSnapshot(s_2).atBottom) {
           turnEndFollowLatchRef.current = false;
         }
@@ -244,7 +245,7 @@ export function useTranscriptVirtual(opts) {
         chaseBottomRef.current = false;
         return;
       }
-      scrollTranscriptToBottom(virtualHistory.offsets[virtualRows.length] ?? 0);
+      scrollTranscriptToBottom();
       const snap_0 = getViewportSnapshot(scrollRef.current);
       if (snap_0.atBottom && snap_0.viewportHeight > 0) {
         chaseBottomRef.current = false;
@@ -258,11 +259,22 @@ export function useTranscriptVirtual(opts) {
     };
   }, [historyItems.length, scrollRef, scrollTranscriptToBottom, sid]);
   useLayoutEffect(() => {
-    if (!liveTailActive || !(tailFollowRef.current || turnEndFollowLatchRef.current)) {
+    if (!liveTailActive) {
       return;
     }
     const s_4 = scrollRef.current;
     if (!s_4) {
+      return;
+    }
+    const snap_1 = getViewportSnapshot(s_4);
+    const manualAt_1 = s_4.getLastManualScrollAt() || 0;
+    if (!shouldAutoScrollTail({
+      atBottom: snap_1.atBottom,
+      lastManualScrollAt: manualAt_1,
+      manualGraceMs: MANUAL_SCROLL_GRACE_MS,
+      now: Date.now(),
+      viewportHeight: snap_1.viewportHeight
+    }) && !turnEndFollowLatchRef.current) {
       return;
     }
     scrollTranscriptToBottom();
@@ -273,8 +285,8 @@ export function useTranscriptVirtual(opts) {
         return;
       }
       scrollTranscriptToBottom();
-      const snap_1 = getViewportSnapshot(scrollRef.current);
-      if (!snap_1.atBottom) {
+      const snap_2 = getViewportSnapshot(scrollRef.current);
+      if (!snap_2.atBottom) {
         requestAnimationFrame(settle);
       }
     };

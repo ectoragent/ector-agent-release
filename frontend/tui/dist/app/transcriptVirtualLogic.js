@@ -45,15 +45,13 @@ export function buildInitialHeightEstimates(rows, ctx) {
 export const shouldFollowNewHistoryAtBottom = ctx => shouldAutoScrollTail(ctx);
 /** User scrolled up to read history — do not pull them back to the live tail. */
 export const isReadingHistory = ctx => {
-  if (ctx.lastManualScrollAt > 0 && ctx.now - ctx.lastManualScrollAt < ctx.manualGraceMs) {
+  if (ctx.lastManualScrollAt <= 0) {
+    return false;
+  }
+  if (ctx.now - ctx.lastManualScrollAt < ctx.manualGraceMs) {
     return true;
   }
   return !ctx.atBottom;
 };
-/** Auto-scroll when docked at bottom; geometry wins over sticky lag. */
-export const shouldAutoScrollTail = ctx => {
-  if (isReadingHistory(ctx)) {
-    return false;
-  }
-  return ctx.atBottom || ctx.viewportHeight <= 0;
-};
+/** Auto-scroll when docked at bottom, or until the user manually scrolls away. */
+export const shouldAutoScrollTail = ctx => !isReadingHistory(ctx);
