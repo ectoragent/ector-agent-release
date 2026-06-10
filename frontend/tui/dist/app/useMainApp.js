@@ -289,6 +289,7 @@ export function useMainApp(gw) {
     submit
   } = useSubmission({
     appendMessage,
+    appendMessages,
     composerActions,
     composerRefs,
     composerState,
@@ -309,14 +310,21 @@ export function useMainApp(gw) {
     if (!isComposerReady(ui) || ui.busy || composerRefs.queueEditRef.current !== null || composerRefs.queueRef.current.length === 0) {
       return;
     }
-    const next_0 = composerActions.dequeue();
-    if (next_0) {
-      patchUiState({
-        busy: true,
-        status: STATUS.running
-      });
-      sendQueued(next_0);
-    }
+    // Defer one tick so turn-end history paint (startTransition) can commit
+    // before the next prompt re-claims busy.
+    queueMicrotask(() => {
+      if (!isComposerReady(getUiState()) || getUiState().busy || composerRefs.queueEditRef.current !== null || composerRefs.queueRef.current.length === 0) {
+        return;
+      }
+      const next_0 = composerActions.dequeue();
+      if (next_0) {
+        patchUiState({
+          busy: true,
+          status: STATUS.running
+        });
+        sendQueued(next_0);
+      }
+    });
   }, [ui.sid, ui.busy, composerActions, composerRefs, sendQueued]);
   const {
     pagerPageSize
@@ -324,6 +332,7 @@ export function useMainApp(gw) {
     actions: {
       answerWiser,
       appendMessage,
+      appendMessages,
       die,
       dispatchSubmission,
       guardBusySessionSwitch: session.guardBusySessionSwitch,

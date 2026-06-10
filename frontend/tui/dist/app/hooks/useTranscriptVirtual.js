@@ -1,14 +1,14 @@
-import { MANUAL_SCROLL_GRACE_MS, maxScrollTop } from '@ector/ink';
+import { MANUAL_SCROLL_GRACE_MS } from '@ector/ink';
 import { useStore } from '@nanostores/react';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef } from 'react';
-import { FULL_RENDER_TAIL_ITEMS } from '../../config/limits.js';
 import { TYPING_IDLE_MS } from '../../config/timing.js';
 import { sectionMode } from '../../domain/details.js';
 import { useVirtualHistory } from '../../hooks/useVirtualHistory.js';
 import { getViewportSnapshot } from '../../lib/viewportStore.js';
-import { estimatedMsgHeight, isHeavyTranscriptMessage, messageHeightKey } from '../../lib/virtualHeights.js';
-import { shouldClearHeightCacheOnBusyEnd, shouldFollowNewHistoryAtBottom } from '../transcriptVirtualLogic.js';
+import { messageHeightKey } from '../../lib/virtualHeights.js';
+import { buildInitialHeightEstimates, shouldAutoScrollTail, shouldClearHeightCacheOnBusyEnd } from '../transcriptVirtualLogic.js';
 import { turnController } from '../turnController.js';
+import { useTurnSelector } from '../turnStore.js';
 import { $uiState } from '../uiStore.js';
 const MAX_HEIGHT_CACHE_BUCKETS = 12;
 const CHASE_BOTTOM_MAX_FRAMES = 8;
@@ -29,7 +29,9 @@ export function useTranscriptVirtual(opts) {
   const {
     busy
   } = useStore($uiState);
+  const liveTailFingerprint = useTurnSelector(state => `${state.streaming.length}:${state.streamPendingTools.length}:${state.streamSegments.length}:${state.reasoning.length}:${state.tools.length}:${state.turnTrail.length}:${state.subagents.length}`);
   const prevBusyRef = useRef(busy);
+  const prevLiveTailRef = useRef(liveTailActive);
   const msgIdsRef = useRef(new WeakMap());
   const msgIdSeqRef = useRef(0);
   const heightCachesRef = useRef(new Map());
@@ -54,6 +56,10 @@ export function useTranscriptVirtual(opts) {
   }, [detailsMode, detailsModeCommandOverride, sections]);
   const detailsVisible = detailsLayoutKey !== 'hidden:hidden';
   const heightCacheKey = `${sid ?? 'draft'}:${cols}:${compact ? '1' : '0'}:${detailsLayoutKey}`;
+  const layoutEstKey = `${cols}:${compact ? '1' : '0'}:${detailsLayoutKey}`;
+  const prevLayoutEstKeyRef = useRef('');
+  const prevTotalRowsRef = useRef(0);
+  const estimateCacheRef = useRef(new Map());
   const heightCache = useMemo(() => {
     let cache = heightCachesRef.current.get(heightCacheKey);
     if (!cache) {
@@ -66,30 +72,31 @@ export function useTranscriptVirtual(opts) {
     return cache;
   }, [heightCacheKey]);
   const initialHeights = useMemo(() => {
-    const out = new Map();
-    for (const row of virtualRows) {
-      const boundedRender = isHeavyTranscriptMessage(row.msg.text, cols);
-      const limitHistory = row.index < virtualRows.length - FULL_RENDER_TAIL_ITEMS;
-      const estimate = estimatedMsgHeight(row.msg, cols, {
-        boundedRender,
-        compact,
-        details: detailsVisible,
-        limitHistory
-      });
-      const cached = heightCache.get(row.key);
-      const cachedOk = cached !== undefined && (!boundedRender || cached <= estimate * 2 + 8);
-      out.set(row.key, cachedOk ? cached : estimate);
+    const layoutChanged = prevLayoutEstKeyRef.current !== layoutEstKey;
+    if (layoutChanged) {
+      estimateCacheRef.current.clear();
+      prevLayoutEstKeyRef.current = layoutEstKey;
     }
+    const out = buildInitialHeightEstimates(virtualRows, {
+      cols,
+      compact,
+      detailsVisible,
+      heightCache,
+      layoutChanged,
+      prevEstimates: estimateCacheRef.current,
+      prevTotalRows: prevTotalRowsRef.current
+    });
+    estimateCacheRef.current = out;
+    prevTotalRowsRef.current = virtualRows.length;
     return out;
-  }, [cols, compact, detailsVisible, heightCache, virtualRows]);
+  }, [cols, compact, detailsVisible, heightCache, layoutEstKey, virtualRows]);
   const syncHeightCache = useCallback(heights => {
-    for (const row_0 of virtualRows) {
-      const h = heights.get(row_0.key);
+    for (const [key, h] of heights) {
       if (h) {
-        heightCache.set(row_0.key, h);
+        heightCache.set(key, h);
       }
     }
-  }, [heightCache, virtualRows]);
+  }, [heightCache]);
   const virtualHistory = useVirtualHistory(scrollRef, virtualRows, cols, {
     initialHeights,
     liveTailActive,
@@ -98,19 +105,49 @@ export function useTranscriptVirtual(opts) {
   const transcriptLenRef = useRef(0);
   const prevSidRef = useRef(undefined);
   const chaseBottomRef = useRef(false);
+  const tailFollowRef = useRef(true);
+  const turnEndFollowLatchRef = useRef(false);
   const lastManualScrollAtRef = useRef(0);
   const scrollBoostTimerRef = useRef(null);
-  useEffect(() => {
-    const s = scrollRef.current;
-    if (!s) {
+  const refreshTailFollow = useCallback(s => {
+    const manualAt = s.getLastManualScrollAt() || 0;
+    const now = Date.now();
+    if (manualAt > 0 && now - manualAt < MANUAL_SCROLL_GRACE_MS) {
+      tailFollowRef.current = false;
+      turnEndFollowLatchRef.current = false;
       return;
     }
-    const unsub = s.subscribe(() => {
-      const manualAt = s.getLastManualScrollAt();
-      if (!manualAt || manualAt === lastManualScrollAtRef.current || !busy) {
+    const snap = getViewportSnapshot(s);
+    const follow = shouldAutoScrollTail({
+      atBottom: snap.atBottom,
+      lastManualScrollAt: manualAt,
+      manualGraceMs: MANUAL_SCROLL_GRACE_MS,
+      now,
+      viewportHeight: snap.viewportHeight
+    });
+    if (follow) {
+      tailFollowRef.current = true;
+      turnEndFollowLatchRef.current = false;
+      return;
+    }
+    if (turnEndFollowLatchRef.current) {
+      return;
+    }
+    tailFollowRef.current = false;
+  }, []);
+  useEffect(() => {
+    const s_0 = scrollRef.current;
+    if (!s_0) {
+      return;
+    }
+    refreshTailFollow(s_0);
+    const unsub = s_0.subscribe(() => {
+      refreshTailFollow(s_0);
+      const manualAt_0 = s_0.getLastManualScrollAt();
+      if (!manualAt_0 || manualAt_0 === lastManualScrollAtRef.current || !busy) {
         return;
       }
-      lastManualScrollAtRef.current = manualAt;
+      lastManualScrollAtRef.current = manualAt_0;
       turnController.boostStreamingForScroll();
       clearTimeout(scrollBoostTimerRef.current ?? undefined);
       scrollBoostTimerRef.current = setTimeout(() => {
@@ -123,33 +160,40 @@ export function useTranscriptVirtual(opts) {
       scrollBoostTimerRef.current = null;
       unsub();
     };
-  }, [busy, scrollRef]);
+  }, [busy, refreshTailFollow, scrollRef]);
   useEffect(() => {
     const wasBusy = prevBusyRef.current;
     prevBusyRef.current = busy;
+    if (wasBusy && !busy && tailFollowRef.current) {
+      turnEndFollowLatchRef.current = true;
+    }
+    if (busy) {
+      turnEndFollowLatchRef.current = false;
+    }
     if (shouldClearHeightCacheOnBusyEnd(wasBusy, busy, sid)) {
       const prefix = `${sid}:`;
-      for (const key of heightCachesRef.current.keys()) {
-        if (key.startsWith(prefix)) {
-          heightCachesRef.current.delete(key);
+      for (const key_0 of heightCachesRef.current.keys()) {
+        if (key_0.startsWith(prefix)) {
+          heightCachesRef.current.delete(key_0);
         }
       }
       scrollRef.current?.setClampBounds(undefined, undefined);
     }
   }, [busy, scrollRef, sid]);
   const scrollTranscriptToBottom = useCallback(contentHeight => {
-    const s_0 = scrollRef.current;
-    if (!s_0) {
+    const s_1 = scrollRef.current;
+    if (!s_1) {
       return;
     }
-    s_0.setClampBounds(undefined, undefined);
-    const vp = Math.max(0, s_0.getViewportHeight());
+    s_1.setClampBounds(undefined, undefined);
+    const vp = Math.max(0, s_1.getViewportHeight());
     if (contentHeight != null && contentHeight > 0 && vp > 0) {
-      s_0.scrollTo(Math.max(0, contentHeight - vp));
-      return;
+      s_1.scrollTo(Math.max(0, contentHeight - vp));
+    } else {
+      s_1.scrollToBottom();
     }
-    s_0.scrollToBottom();
-  }, [scrollRef]);
+    refreshTailFollow(s_1);
+  }, [refreshTailFollow, scrollRef]);
   useLayoutEffect(() => {
     const len = historyItems.length;
     const sidChanged = sid !== prevSidRef.current;
@@ -164,23 +208,25 @@ export function useTranscriptVirtual(opts) {
       return;
     }
     if (len > transcriptLenRef.current) {
-      const s_1 = scrollRef.current;
-      const snap = getViewportSnapshot(s_1);
+      const s_2 = scrollRef.current;
       transcriptLenRef.current = len;
-      if (s_1 && shouldFollowNewHistoryAtBottom({
-        atBottom: snap.atBottom,
-        isSticky: s_1.isSticky(),
-        lastManualScrollAt: s_1.getLastManualScrollAt() || 0,
-        manualGraceMs: MANUAL_SCROLL_GRACE_MS,
-        now: Date.now(),
-        viewportHeight: snap.viewportHeight
-      })) {
+      const follow_0 = tailFollowRef.current || turnEndFollowLatchRef.current;
+      if (s_2 && follow_0) {
         scrollTranscriptToBottom(virtualHistory.offsets[len] ?? 0);
+        if (getViewportSnapshot(s_2).atBottom) {
+          turnEndFollowLatchRef.current = false;
+        }
       }
     } else {
       transcriptLenRef.current = len;
     }
-  }, [historyItems.length, scrollRef, scrollTranscriptToBottom, sid]);
+  }, [historyItems.length, scrollRef, scrollTranscriptToBottom, sid, virtualHistory.offsets, virtualRows.length]);
+  useLayoutEffect(() => {
+    if (prevLiveTailRef.current && !liveTailActive && tailFollowRef.current) {
+      turnEndFollowLatchRef.current = true;
+    }
+    prevLiveTailRef.current = liveTailActive;
+  }, [liveTailActive]);
   useEffect(() => {
     if (!chaseBottomRef.current) {
       return;
@@ -193,8 +239,8 @@ export function useTranscriptVirtual(opts) {
         chaseBottomRef.current = false;
         return;
       }
-      const s_2 = scrollRef.current;
-      if (s_2 && Date.now() - s_2.getLastManualScrollAt() < 2500) {
+      const s_3 = scrollRef.current;
+      if (s_3 && Date.now() - s_3.getLastManualScrollAt() < 2500) {
         chaseBottomRef.current = false;
         return;
       }
@@ -212,29 +258,31 @@ export function useTranscriptVirtual(opts) {
     };
   }, [historyItems.length, scrollRef, scrollTranscriptToBottom, sid]);
   useLayoutEffect(() => {
-    if (!liveTailActive) {
+    if (!liveTailActive || !(tailFollowRef.current || turnEndFollowLatchRef.current)) {
       return;
     }
-    const s_3 = scrollRef.current;
-    if (!s_3) {
+    const s_4 = scrollRef.current;
+    if (!s_4) {
       return;
     }
-    // scrollBy clears stickyScroll; do not snap back while the user reads
-    // history (each stream paint used to call scrollToBottom and felt stuck).
-    if (!s_3.isSticky() || Date.now() - s_3.getLastManualScrollAt() < MANUAL_SCROLL_GRACE_MS) {
-      return;
-    }
-    const scrollH = Math.max(s_3.getScrollHeight(), s_3.getFreshScrollHeight?.() ?? 0);
-    const vp_0 = Math.max(0, s_3.getViewportHeight());
-    const maxTop = maxScrollTop(scrollH, vp_0);
-    const cur = s_3.getScrollTop() + s_3.getPendingDelta();
-    // Already docked — skip redundant scrollTo (was causing micro-jitter at bottom).
-    if (cur >= maxTop - 1) {
-      return;
-    }
-    s_3.setClampBounds(undefined, undefined);
-    s_3.scrollTo(maxTop);
-  }, [liveTailActive, scrollRef, virtualHistory.bottomSpacer, virtualHistory.end, virtualHistory.offsets, virtualHistory.topSpacer, virtualRows.length]);
+    scrollTranscriptToBottom();
+    let frame = 0;
+    let cancelled_0 = false;
+    const settle = () => {
+      if (cancelled_0 || frame++ > 3 || !tailFollowRef.current) {
+        return;
+      }
+      scrollTranscriptToBottom();
+      const snap_1 = getViewportSnapshot(scrollRef.current);
+      if (!snap_1.atBottom) {
+        requestAnimationFrame(settle);
+      }
+    };
+    requestAnimationFrame(settle);
+    return () => {
+      cancelled_0 = true;
+    };
+  }, [liveTailActive, liveTailFingerprint, scrollRef, scrollTranscriptToBottom, virtualHistory.end, virtualRows.length]);
   return {
     virtualHistory,
     virtualRows

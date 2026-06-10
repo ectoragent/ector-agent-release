@@ -12,6 +12,7 @@ const spliceMatches = (text, matches, results) => matches.reduceRight((acc, m, i
 export function useSubmission(opts) {
   const {
     appendMessage,
+    appendMessages,
     composerActions,
     composerRefs,
     composerState,
@@ -240,6 +241,7 @@ export function useSubmission(opts) {
       if (action === 'interrupt' && live_2.sid) {
         return turnController.interruptTurn({
           appendMessage,
+          appendMessages,
           gw,
           sid: live_2.sid,
           sys

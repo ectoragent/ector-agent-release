@@ -366,6 +366,7 @@ export function useInputHandlers(ctx) {
     if (key.escape && live.busy && live.sid) {
       return turnController.interruptTurn({
         appendMessage: actions.appendMessage,
+        appendMessages: actions.appendMessages,
         gw: gateway.gw,
         sid: live.sid,
         sys: actions.sys
@@ -424,6 +425,7 @@ export function useInputHandlers(ctx) {
         lastCtrlCRef.current = now;
         return turnController.interruptTurn({
           appendMessage: actions.appendMessage,
+          appendMessages: actions.appendMessages,
           gw: gateway.gw,
           sid: live.sid,
           sys: actions.sys

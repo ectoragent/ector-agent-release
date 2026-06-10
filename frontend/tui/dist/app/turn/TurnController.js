@@ -93,6 +93,7 @@ export class TurnController {
   }
   interruptTurn({
     appendMessage,
+    appendMessages,
     gw,
     sid,
     sys
@@ -115,15 +116,13 @@ export class TurnController {
       activity: [],
       outcome: ''
     });
-    for (const msg of segments) {
-      appendMessage(msg);
-    }
+    const preserved = [...segments];
     // Always surface an interruption indicator — if there's an in-flight
     // `partial` or pending tools, fold them into a single assistant message;
     // otherwise emit a sys note so the transcript always records that the
     // turn was cancelled, even when only prior `segments` were preserved.
     if (partial || tools.length) {
-      appendMessage({
+      preserved.push({
         role: 'assistant',
         text: partial ? `${partial}\n\n*[${INTERRUPT_USER_LABEL}]*` : `*[${INTERRUPT_USER_LABEL}]*`,
         ...(tools.length && {
@@ -132,6 +131,15 @@ export class TurnController {
       });
     } else {
       sys(INTERRUPT_USER_LABEL);
+    }
+    if (preserved.length) {
+      if (appendMessages) {
+        appendMessages(preserved);
+      } else {
+        for (const msg of preserved) {
+          appendMessage(msg);
+        }
+      }
     }
     patchUiState({
       status: STATUS.interrupted
