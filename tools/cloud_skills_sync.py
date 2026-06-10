@@ -1069,8 +1069,11 @@ def ensure_cloud_skills_for_agent_startup(*, max_wait_seconds: float = 2.5) -> N
     settings = _cloud_sync_settings()
     if not settings.enabled:
         return
-    if _authorization_header() is None:
-        return
+    try:
+        if _authorization_header() is None:
+            return
+    except KeyboardInterrupt:
+        raise
 
     has_local_state = CLOUD_STATE_FILE.exists() or CLOUD_ETAG_FILE.exists()
     if has_local_state:
@@ -1087,6 +1090,8 @@ def ensure_cloud_skills_for_agent_startup(*, max_wait_seconds: float = 2.5) -> N
     def _blocking_sync() -> None:
         try:
             sync_cloud_skills_library(quiet=True, respect_rate_limit=True)
+        except KeyboardInterrupt:
+            raise
         except Exception:
             logger.debug("cloud_skills_sync blocking startup failed", exc_info=True)
 
@@ -1095,7 +1100,10 @@ def ensure_cloud_skills_for_agent_startup(*, max_wait_seconds: float = 2.5) -> N
             while _sync_thread_running() and time.monotonic() < deadline:
                 time.sleep(0.05)
             return
-        _blocking_sync()
+        try:
+            _blocking_sync()
+        except KeyboardInterrupt:
+            raise
 
 
 def start_periodic_cloud_skills_sync(

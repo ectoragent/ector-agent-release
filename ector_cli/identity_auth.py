@@ -2349,6 +2349,9 @@ def enforce_agent_runtime_access(*, interactive: Optional[bool] = None) -> None:
         warning = str(access.get("subscription_warning") or "").strip()
         if warning:
             print(f"Aviso de assinatura: {warning}", file=_sys.stderr)
+    except KeyboardInterrupt:
+        print("Cancelado.", file=_sys.stderr)
+        _sys.exit(130)
     except IdentityAuthError as exc:
         if exc.access_level == "blocked":
             print_subscription_blocked_message(str(exc), file=_sys.stderr)

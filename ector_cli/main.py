@@ -436,9 +436,13 @@ def _enforce_identity_auth(args) -> None:
         sys.exit(2)
 
     interactive = sys.stdin.isatty() and sys.stderr.isatty()
-    enforce_agent_runtime_access(interactive=interactive)
+    try:
+        enforce_agent_runtime_access(interactive=interactive)
+        _schedule_cloud_skills_if_agent_command(args)
+    except KeyboardInterrupt:
+        from ector_cli.cli_output import exit_on_keyboard_interrupt
 
-    _schedule_cloud_skills_if_agent_command(args)
+        exit_on_keyboard_interrupt()
 
 
 def _schedule_cloud_skills_if_agent_command(args) -> None:
@@ -453,6 +457,8 @@ def _schedule_cloud_skills_if_agent_command(args) -> None:
 
         ensure_cloud_skills_for_agent_startup()
         maybe_schedule_cloud_skills_sync(quiet=True, force=False)
+    except KeyboardInterrupt:
+        raise
     except Exception:
         logger.debug("cloud skills auto-sync at CLI startup failed", exc_info=True)
 
@@ -2069,6 +2075,16 @@ def _cli_process_title_for_args(args) -> str:
 
 def main():
     """Main entry point for ector CLI."""
+    try:
+        _main_inner()
+    except KeyboardInterrupt:
+        from ector_cli.cli_output import exit_on_keyboard_interrupt
+
+        exit_on_keyboard_interrupt()
+
+
+def _main_inner():
+    """CLI body — wrapped by :func:`main` for clean Ctrl+C exit."""
     from ector_cli.cli_parser import build_parser
 
     parser, subparsers = build_parser()

@@ -5,9 +5,20 @@ functions previously duplicated across setup.py, tools_config.py,
 mcp_config.py, and memory_setup.py.
 """
 
+from __future__ import annotations
+
 import getpass
+import sys
+from typing import NoReturn
 
 from ector_cli.colors import Colors, color
+
+
+def exit_on_keyboard_interrupt(*, message: str = "Cancelado.") -> NoReturn:
+    """Exit 130 without leaking a KeyboardInterrupt traceback (SIGINT convention)."""
+    if message:
+        print(message, file=sys.stderr)
+    raise SystemExit(130)
 
 
 # ─── Print Helpers ────────────────────────────────────────────────────────────
