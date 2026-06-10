@@ -24,8 +24,11 @@ export function setupGracefulExit({
   }
   wired = true;
   let shuttingDown = false;
+  let sigintStreak = 0;
   const exit = (code, signal) => {
     if (shuttingDown) {
+      // Shutdown already started but the process is stuck — force exit.
+      process.exit(code);
       return;
     }
     shuttingDown = true;
@@ -37,7 +40,17 @@ export function setupGracefulExit({
     process.exit(code);
   };
   for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
-    process.on(sig, () => exit(SIGNAL_EXIT_CODE[sig], sig));
+    process.on(sig, () => {
+      if (sig === 'SIGINT') {
+        sigintStreak++;
+        if (sigintStreak >= 2) {
+          runCleanupsSync(cleanups);
+          process.exit(SIGNAL_EXIT_CODE[sig]);
+          return;
+        }
+      }
+      exit(SIGNAL_EXIT_CODE[sig], sig);
+    });
   }
   process.on('uncaughtException', err => {
     onError?.('uncaughtException', err);
@@ -45,8 +58,21 @@ export function setupGracefulExit({
       shuttingDown = true;
       runCleanupsSync(cleanups);
       process.exit(1);
+    } else {
+      process.exit(1);
     }
   });
-  process.on('unhandledRejection', reason => onError?.('unhandledRejection', reason));
-  void failsafeMs;
+  process.on('unhandledRejection', reason => {
+    onError?.('unhandledRejection', reason);
+    runCleanupsSync(cleanups);
+    process.exit(1);
+  });
+  if (failsafeMs > 0) {
+    const watchdog = setInterval(() => {
+      if (shuttingDown) {
+        process.exit(1);
+      }
+    }, failsafeMs);
+    watchdog.unref?.();
+  }
 }

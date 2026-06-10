@@ -32,7 +32,7 @@ export function isLoadingStatus(status) {
 }
 /** Composer accepts input once a session is bound; queue handles busy turns. */
 export function isComposerReady(state) {
-  if (state.status === STATUS.loginRequired) {
+  if (state.status === STATUS.loginRequired || isLoadingStatus(state.status)) {
     return false;
   }
   return Boolean(state.sid);

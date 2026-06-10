@@ -702,7 +702,9 @@ function Spacer() {
 
 // src/terminalShutdown.ts
 var TERMINAL_RESTORE_SEQ = "\x1B[?1000l\x1B[?1002l\x1B[?1003l\x1B[?1006l\x1B[?2004l\x1B[?25h\x1B[?1049l\x1B[0m";
+var TERMINAL_ALT_SCREEN_SEQ = "\x1B[?1049h\x1B[H";
 var shuttingDown = false;
+var isTuiShutdown = () => shuttingDown;
 function shutdownTui() {
   if (shuttingDown) {
     return;
@@ -805,7 +807,7 @@ function useDeclaredCursor(args) {
 // src/hooks/useExternalProcess.ts
 import { useCallback } from "react";
 var HANDOFF = `${TERMINAL_RESTORE_SEQ}\x1B[2J\x1B[H`;
-var RESTORE_MOUSE = "\x1B[?1000h\x1B[?1002h\x1B[?1003h\x1B[?25l";
+var RESTORE_TUI = `${TERMINAL_ALT_SCREEN_SEQ}\x1B[?1000h\x1B[?1002h\x1B[?1006h\x1B[?25l`;
 async function withInkSuspended(run) {
   const r = getRenderer();
   r?.pause?.();
@@ -814,7 +816,7 @@ async function withInkSuspended(run) {
   try {
     await run();
   } finally {
-    process.stdout.write(RESTORE_MOUSE);
+    process.stdout.write(RESTORE_TUI);
     process.stdin.setRawMode?.(true);
     r?.resume?.();
     void getMouseTracking();
@@ -1081,14 +1083,28 @@ function useTerminalViewport() {
 // src/lib/ctrlCForceQuit.ts
 var FORCE_QUIT_WINDOW_MS = 1500;
 var lastCtrlCAt = 0;
+var rendererIsDead = () => {
+  if (isTuiShutdown()) {
+    return true;
+  }
+  const renderer2 = getRenderer();
+  return Boolean(renderer2?.isDestroyed);
+};
+var forceExit = (code = 130) => {
+  shutdownTui();
+  process.exit(code);
+};
 var forceQuitOnSecondCtrlC = (sequence) => {
   if (sequence !== "") {
     return false;
   }
+  if (rendererIsDead()) {
+    forceExit(130);
+    return true;
+  }
   const now = Date.now();
   if (now - lastCtrlCAt < FORCE_QUIT_WINDOW_MS) {
-    shutdownTui();
-    process.exit(130);
+    forceExit(130);
   }
   lastCtrlCAt = now;
   return false;
@@ -1385,6 +1401,7 @@ export {
   RawAnsi,
   ScrollBox_default as ScrollBox,
   Spacer,
+  TERMINAL_ALT_SCREEN_SEQ,
   Text_default as Text,
   TextInput,
   copyTextToSystemClipboard,
@@ -1394,6 +1411,7 @@ export {
   getRenderer,
   isMouseInputLeak,
   isNearScrollBottom,
+  isTuiShutdown,
   isXtermJs,
   maxScrollTop,
   measureElement,

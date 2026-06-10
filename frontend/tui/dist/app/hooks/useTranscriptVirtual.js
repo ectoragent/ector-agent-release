@@ -11,6 +11,9 @@ import { shouldClearHeightCacheOnBusyEnd, shouldFollowNewHistoryAtBottom } from 
 import { turnController } from '../turnController.js';
 import { $uiState } from '../uiStore.js';
 const MAX_HEIGHT_CACHE_BUCKETS = 12;
+const CHASE_BOTTOM_MAX_FRAMES = 8;
+const CHASE_BOTTOM_LARGE_HISTORY = 40;
+const CHASE_BOTTOM_LARGE_FRAMES = 2;
 export function useTranscriptVirtual(opts) {
   const {
     cols,
@@ -195,8 +198,9 @@ export function useTranscriptVirtual(opts) {
     }
     let cancelled = false;
     let frames = 0;
+    const maxFrames = historyItems.length >= CHASE_BOTTOM_LARGE_HISTORY ? CHASE_BOTTOM_LARGE_FRAMES : CHASE_BOTTOM_MAX_FRAMES;
     const chase = () => {
-      if (cancelled || frames++ > 20) {
+      if (cancelled || frames++ > maxFrames) {
         chaseBottomRef.current = false;
         return;
       }
@@ -217,7 +221,7 @@ export function useTranscriptVirtual(opts) {
     return () => {
       cancelled = true;
     };
-  }, [historyItems.length, scrollRef, scrollTranscriptToBottom, sid, virtualRows.length]);
+  }, [historyItems.length, scrollRef, scrollTranscriptToBottom, sid]);
   useLayoutEffect(() => {
     if (!liveTailActive) {
       return;
