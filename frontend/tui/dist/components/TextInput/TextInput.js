@@ -1,4 +1,5 @@
 import { jsx as _jsx } from "react/jsx-runtime";
+import { stripMouseLeakFragments } from '@ector/ink';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { setInputSelection } from '../../app/inputSelectionStore.js';
 import { writeClipboardText } from '../../lib/clipboard.js';
@@ -48,7 +49,7 @@ export function TextInput({
   cbChange.current = onChange;
   cbSubmit.current = onSubmit;
   cbPaste.current = onPaste;
-  const raw = self.current ? vRef.current : value;
+  const raw = stripMouseLeakFragments(self.current ? vRef.current : value);
   const display = mask ? raw.replace(/[^\n]/g, mask[0] ?? '*') : raw;
   const selected = useMemo(() => sel && sel.start !== sel.end ? {
     end: Math.max(sel.start, sel.end),

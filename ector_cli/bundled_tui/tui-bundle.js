@@ -1376,6 +1376,100 @@ function InputBridge() {
   return null;
 }
 
+// src/lib/mouseFilteredStdin.ts
+import { PassThrough } from "node:stream";
+var MOUSE_PREFIX_RE = /^(?:\x1b\[<\d+(?:;\d+)*[Mm]|\[<\d+(?:;\d+)*[Mm]|\d+;\d+;\d+[Mm])/;
+var stripMouseFromStdinChunk = (buffer) => {
+  let pending = buffer;
+  let forward = "";
+  while (pending.length > 0) {
+    const mouse = pending.match(MOUSE_PREFIX_RE);
+    if (mouse) {
+      const frame = mouse[0];
+      for (const dir of parseMouseLeakScrolls(frame)) {
+        emitWheelInput(dir);
+      }
+      agentDebugLog(
+        "mouseFilteredStdin.ts:strip",
+        "stdin filter stripped mouse frame",
+        { len: frame.length, preview: frame.slice(0, 24) },
+        "F"
+      );
+      pending = pending.slice(frame.length);
+      continue;
+    }
+    if (isIncompleteMouseEscape(pending)) {
+      break;
+    }
+    const stripped = stripMouseLeakFragments(pending);
+    if (stripped !== pending) {
+      for (const dir of parseMouseLeakScrolls(pending)) {
+        emitWheelInput(dir);
+      }
+      agentDebugLog(
+        "mouseFilteredStdin.ts:stripLeak",
+        "stdin filter stripped embedded mouse leak",
+        { len: pending.length, preview: pending.slice(0, 24) },
+        "F"
+      );
+      forward += stripped;
+      pending = "";
+      continue;
+    }
+    if (pending.startsWith("\x1B")) {
+      const csi = pending.match(/^\x1b\[[\d;]*[A-Za-z]/);
+      if (csi) {
+        forward += csi[0];
+        pending = pending.slice(csi[0].length);
+        continue;
+      }
+      const ss3 = pending.match(/^\x1bO[A-Za-z]/);
+      if (ss3) {
+        forward += ss3[0];
+        pending = pending.slice(ss3[0].length);
+        continue;
+      }
+      if (pending.length >= 2 && pending[1] !== "[" && pending[1] !== "O") {
+        forward += pending.slice(0, 2);
+        pending = pending.slice(2);
+        continue;
+      }
+      break;
+    }
+    forward += pending[0];
+    pending = pending.slice(1);
+  }
+  return { forward, remainder: pending };
+};
+var createMouseFilteredStdin = (source = process.stdin) => {
+  const filtered = new PassThrough();
+  let pending = "";
+  const onData = (chunk) => {
+    const merged = pending + chunk.toString("latin1");
+    const { forward, remainder } = stripMouseFromStdinChunk(merged);
+    pending = remainder;
+    if (forward) {
+      filtered.write(forward, "latin1");
+    }
+  };
+  source.on("data", onData);
+  source.on("end", () => {
+    if (pending) {
+      filtered.write(pending, "latin1");
+      pending = "";
+    }
+    filtered.end();
+  });
+  source.on("error", (err) => filtered.destroy(err));
+  filtered.isTTY = source.isTTY;
+  filtered.isRaw = source.isRaw;
+  filtered.setRawMode = source.setRawMode?.bind(source);
+  filtered.ref = source.ref?.bind(source);
+  filtered.unref = source.unref?.bind(source);
+  filtered.read = source.read?.bind(source);
+  return filtered;
+};
+
 // src/hooks/useTerminalDimensions.ts
 import { useAppContext } from "@opentui/react";
 import { useCallback as useCallback3, useSyncExternalStore } from "react";
@@ -1421,13 +1515,14 @@ async function render(node, options = {}) {
   setExitOnCtrlC(options.exitOnCtrlC ?? true);
   setMouseTracking(options.mouseTracking ?? true);
   const swallowMouseSequence = createSwallowMouseSequence(new MouseParser());
+  const stdin = options.stdin ?? createMouseFilteredStdin(process.stdin);
   const renderer2 = await createCliRenderer({
     backgroundColor: "#0A0A0A",
     enableMouseMovement: options.enableMouseMovement ?? true,
     exitOnCtrlC: options.exitOnCtrlC ?? true,
     prependInputHandlers: [forceQuitOnSecondCtrlC, swallowMouseSequence],
     screenMode: "alternate-screen",
-    stdin: options.stdin,
+    stdin,
     stdout: options.stdout,
     useMouse: options.mouseTracking ?? true
   });

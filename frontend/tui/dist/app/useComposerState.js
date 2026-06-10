@@ -2,7 +2,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { useStdin, withInkSuspended } from '@ector/ink';
+import { stripMouseLeakFragments, useStdin, withInkSuspended } from '@ector/ink';
 import { useStore } from '@nanostores/react';
 import { useCallback, useMemo, useState } from 'react';
 import { LARGE_PASTE } from '../config/limits.js';
@@ -72,7 +72,13 @@ export function useComposerState({
   onImageAttached,
   submitRef
 }) {
-  const [input, setInput] = useState('');
+  const [input, setInputState] = useState('');
+  const setInput = useCallback(value => {
+    setInputState(prev => {
+      const next = typeof value === 'function' ? value(prev) : value;
+      return stripMouseLeakFragments(next);
+    });
+  }, []);
   const [inputBuf, setInputBuf] = useState([]);
   const [pasteSnips, setPasteSnips] = useState([]);
   const isBlocked = useStore($isBlocked);
@@ -115,7 +121,7 @@ export function useComposerState({
     bracketed,
     cursor,
     text,
-    value
+    value: value_0
   }) => {
     const cleanedText = stripTrailingPasteNewlines(text);
     if (!cleanedText || !/[^\n]/.test(cleanedText)) {
@@ -137,10 +143,10 @@ export function useComposerState({
           if (!remainder) {
             return {
               cursor,
-              value
+              value: value_0
             };
           }
-          return insertAtCursor(value, cursor, remainder);
+          return insertAtCursor(value_0, cursor, remainder);
         }
       } catch {
         // Fall back to generic file-drop detection below.
@@ -151,7 +157,7 @@ export function useComposerState({
           text: cleanedText
         });
         if (dropped?.matched && dropped.text) {
-          return insertAtCursor(value, cursor, dropped.text);
+          return insertAtCursor(value_0, cursor, dropped.text);
         }
       } catch {
         // Fall through to normal text paste behavior.
@@ -161,12 +167,12 @@ export function useComposerState({
     if (cleanedText.length < LARGE_PASTE.chars && lineCount < LARGE_PASTE.lines) {
       return {
         cursor: cursor + cleanedText.length,
-        value: value.slice(0, cursor) + cleanedText + value.slice(cursor)
+        value: value_0.slice(0, cursor) + cleanedText + value_0.slice(cursor)
       };
     }
     const label = pasteTokenLabel(cleanedText, lineCount);
-    const inserted = insertAtCursor(value, cursor, label);
-    setPasteSnips(prev => trimSnips([...prev, {
+    const inserted = insertAtCursor(value_0, cursor, label);
+    setPasteSnips(prev_0 => trimSnips([...prev_0, {
       label,
       text: cleanedText
     }]));
@@ -177,7 +183,7 @@ export function useComposerState({
       if (!path) {
         return;
       }
-      setPasteSnips(prev_0 => prev_0.map(s => s.label === label ? {
+      setPasteSnips(prev_1 => prev_1.map(s => s.label === label ? {
         ...s,
         path
       } : s));
@@ -189,7 +195,7 @@ export function useComposerState({
     cursor: cursor_0,
     hotkey,
     text: text_0,
-    value: value_0
+    value: value_1
   }) => {
     if (hotkey) {
       const preferOsc52 = isRemoteShellSession(process.env);
@@ -210,7 +216,7 @@ export function useComposerState({
             bracketed: false,
             cursor: cursor_0,
             text: preferredText,
-            value: value_0
+            value: value_1
           });
         }
         void onClipboardPaste(false);
@@ -221,7 +227,7 @@ export function useComposerState({
       bracketed: !!bracketed_0,
       cursor: cursor_0,
       text: text_0,
-      value: value_0
+      value: value_1
     });
   }, [handleResolvedPaste, onClipboardPaste, querier]);
   const openEditor = useCallback(async () => {
