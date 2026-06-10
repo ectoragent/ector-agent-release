@@ -927,28 +927,16 @@ def _verify_tui_after_update(install_dir: Path) -> bool:
     if not (tui_dir / "package.json").is_file():
         return True
 
-    from ector_cli.tui_launch import (
-        sync_ector_ink_dist_to_pnpm_store,
-        tui_can_build_from_source,
-        tui_is_prebuilt_release,
+    from ector_cli.tui_launch import ensure_tui_prebuild_artifacts
+
+    if ensure_tui_prebuild_artifacts(install_dir):
+        return True
+
+    _fail(
+        "Pacote TUI incompleto após a atualização — "
+        "dist/tui-bundle.js ausente. Execute `ector update` novamente."
     )
-
-    if tui_can_build_from_source(tui_dir):
-        return True
-    if tui_is_prebuilt_release(tui_dir):
-        sync_ector_ink_dist_to_pnpm_store(tui_dir)
-        return True
-
-    bundle = tui_dir / "packages" / "ector-tui" / "dist" / "tui-bundle.js"
-    if not bundle.is_file():
-        _fail(
-            "Pacote TUI incompleto após a atualização — "
-            "dist/tui-bundle.js ausente. Execute `ector update` novamente ou "
-            "reinstale: curl -fsSL https://ector.cc/install.sh | bash"
-        )
-        return False
-    sync_ector_ink_dist_to_pnpm_store(tui_dir)
-    return True
+    return False
 
 
 def _report_update_success(install_dir: Path) -> None:

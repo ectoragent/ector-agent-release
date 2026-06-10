@@ -142,7 +142,7 @@ ector-acp = "acp_adapter.entry:main"
 py-modules = ["run_agent", "model_tools", "toolsets", "batch_runner", "trajectory_compressor", "toolset_distributions", "cli", "ector_constants", "ector_state", "ector_time", "ector_logging", "ector_process", "rl_cli", "utils"]
 
 [tool.setuptools.package-data]
-ector_cli = ["web_dist/**/*"]
+ector_cli = ["web_dist/**/*", "bundled_tui/**/*"]
 
 [tool.setuptools.packages.find]
 include = ["agent", "agent.*", "tools", "tools.*", "ector_cli", "gateway", "gateway.*", "tui_gateway", "tui_gateway.*", "cron", "acp_adapter", "plugins", "plugins.*"]

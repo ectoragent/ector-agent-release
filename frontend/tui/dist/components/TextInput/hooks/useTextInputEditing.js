@@ -1,4 +1,4 @@
-import { isMouseInputLeak } from '@ector/ink';
+import { isMouseInputLeak, stripMouseLeakFragments } from '@ector/ink';
 import { readClipboardText, writeClipboardText } from '../../../lib/clipboard.js';
 import { isActionMod, isMac, isMacActionFallback } from '../../../lib/platform.js';
 import { stringWidth, supportsTerminalFastEcho, useInput } from '../lib/inkRuntime.js';
@@ -216,9 +216,13 @@ export function useTextInputEditing(opts) {
     const nextCursor = range_0 ? range_0.start + cleaned.length : curRef.current + cleaned.length;
     commit(nextValue, nextCursor);
   };
-  useInput((inp, k, event) => {
+  useInput((rawInp, k, event) => {
     const eventRaw = event.keypress.raw ?? '';
-    if (isMouseInputLeak(eventRaw, inp)) {
+    if (isMouseInputLeak(eventRaw, rawInp)) {
+      return;
+    }
+    const inp = stripMouseLeakFragments(rawInp);
+    if (rawInp && !inp) {
       return;
     }
     if (eventRaw === '\x1bv' || eventRaw === '\x1bV' || eventRaw === '\x16' || isMac && isActionMod(k) && inp.toLowerCase() === 'v') {

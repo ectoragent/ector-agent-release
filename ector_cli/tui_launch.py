@@ -12,7 +12,12 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-from ector_constants import safe_getcwd
+from ector_constants import get_ector_home, safe_getcwd
+
+_TUI_PREBUILD_REL_PATHS = (
+    "frontend/tui/dist/entry.js",
+    "frontend/tui/packages/ector-tui/dist/tui-bundle.js",
+)
 
 
 def print_tui_exit_summary(session_id: Optional[str]) -> None:
@@ -79,6 +84,182 @@ def print_tui_exit_summary(session_id: Optional[str]) -> None:
     print(f"Tokens:         {_tok(total_tokens)} ({token_parts})")
 
 
+
+
+def _bundled_tui_dir() -> Path:
+    return Path(__file__).resolve().parent / "bundled_tui"
+
+
+def _tui_prebuild_cache_dir() -> Path:
+    return get_ector_home() / "runtime" / "tui-prebuild"
+
+
+def snapshot_tui_prebuild_cache(tui_dir: Path) -> None:
+    """Keep a copy of release dist artefacts under ECTOR_HOME for post-update recovery."""
+    entry = tui_dir / "dist" / "entry.js"
+    bundle = tui_dir / "packages" / "ector-tui" / "dist" / "tui-bundle.js"
+    if not entry.is_file() or not bundle.is_file():
+        return
+    cache = _tui_prebuild_cache_dir()
+    try:
+        cache.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(entry, cache / "entry.js")
+        shutil.copy2(bundle, cache / "tui-bundle.js")
+    except OSError:
+        pass
+
+
+def restore_tui_prebuild_from_package(tui_dir: Path) -> bool:
+    """Restore release dist from ``ector_cli/bundled_tui`` (shipped in every release wheel)."""
+    src_entry = _bundled_tui_dir() / "entry.js"
+    src_bundle = _bundled_tui_dir() / "tui-bundle.js"
+    if not src_entry.is_file() or not src_bundle.is_file():
+        return False
+    entry = tui_dir / "dist" / "entry.js"
+    bundle = tui_dir / "packages" / "ector-tui" / "dist" / "tui-bundle.js"
+    try:
+        if not entry.is_file():
+            entry.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_entry, entry)
+        if not bundle.is_file():
+            bundle.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_bundle, bundle)
+    except OSError:
+        return False
+    return entry.is_file() and bundle.is_file()
+
+
+def restore_tui_prebuild_from_cache(tui_dir: Path) -> bool:
+    """Restore missing release dist files from the last known-good ECTOR_HOME snapshot."""
+    cache = _tui_prebuild_cache_dir()
+    entry = tui_dir / "dist" / "entry.js"
+    bundle = tui_dir / "packages" / "ector-tui" / "dist" / "tui-bundle.js"
+    cached_entry = cache / "entry.js"
+    cached_bundle = cache / "tui-bundle.js"
+    if not cached_entry.is_file() or not cached_bundle.is_file():
+        return False
+    restored = False
+    try:
+        if not entry.is_file():
+            entry.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(cached_entry, entry)
+            restored = True
+        if not bundle.is_file():
+            bundle.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(cached_bundle, bundle)
+            restored = True
+    except OSError:
+        return False
+    return restored or (entry.is_file() and bundle.is_file())
+
+
+def _git_tui_prebuild_refs(install_root: Path) -> list[str]:
+    refs: list[str] = ["HEAD", "@{u}"]
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(install_root), "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode == 0:
+            origin_head = (proc.stdout or "").strip()
+            if origin_head and origin_head not in refs:
+                refs.append(origin_head)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    for branch in ("main", "master"):
+        ref = f"origin/{branch}"
+        if ref not in refs:
+            refs.append(ref)
+    return refs
+
+
+def restore_tui_prebuild_from_git(install_root: Path) -> bool:
+    """Restore release TUI dist files from git (HEAD, upstream, origin/*)."""
+    tui_dir = install_root / "frontend" / "tui"
+    if not (install_root / ".git").is_dir() or tui_can_build_from_source(tui_dir):
+        return False
+    if tui_is_prebuilt_release(tui_dir):
+        return True
+
+    restored = False
+    for ref in _git_tui_prebuild_refs(install_root):
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(install_root), "checkout", ref, "--", *_TUI_PREBUILD_REL_PATHS],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if proc.returncode == 0 and tui_is_prebuilt_release(tui_dir):
+            return True
+        if proc.returncode == 0:
+            restored = True
+
+    entry = tui_dir / "dist" / "entry.js"
+    bundle = tui_dir / "packages" / "ector-tui" / "dist" / "tui-bundle.js"
+    for ref in _git_tui_prebuild_refs(install_root):
+        for rel, target in (
+            (_TUI_PREBUILD_REL_PATHS[0], entry),
+            (_TUI_PREBUILD_REL_PATHS[1], bundle),
+        ):
+            if target.is_file():
+                continue
+            try:
+                proc = subprocess.run(
+                    ["git", "-C", str(install_root), "show", f"{ref}:{rel}"],
+                    capture_output=True,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if proc.returncode != 0 or not proc.stdout:
+                continue
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(proc.stdout)
+                restored = True
+            except OSError:
+                continue
+        if tui_is_prebuilt_release(tui_dir):
+            return True
+    return restored and tui_is_prebuilt_release(tui_dir)
+
+
+def _finalize_tui_prebuild_restore(tui_dir: Path, install_root: Path) -> bool:
+    if not tui_is_prebuilt_release(tui_dir):
+        return False
+    sync_ector_ink_dist_to_pnpm_store(tui_dir)
+    snapshot_tui_prebuild_cache(tui_dir)
+    return True
+
+
+def ensure_tui_prebuild_artifacts(install_root: Path) -> bool:
+    """Best-effort restore of release-only TUI dist (git → cache → bundled wheel)."""
+    tui_dir = install_root / "frontend" / "tui"
+    if not (tui_dir / "package.json").is_file():
+        return True
+    if tui_can_build_from_source(tui_dir):
+        return True
+    if tui_is_prebuilt_release(tui_dir):
+        snapshot_tui_prebuild_cache(tui_dir)
+        return True
+    if restore_tui_prebuild_from_git(install_root) and _finalize_tui_prebuild_restore(
+        tui_dir, install_root
+    ):
+        return True
+    if restore_tui_prebuild_from_cache(tui_dir) and _finalize_tui_prebuild_restore(
+        tui_dir, install_root
+    ):
+        return True
+    if restore_tui_prebuild_from_package(tui_dir) and _finalize_tui_prebuild_restore(
+        tui_dir, install_root
+    ):
+        return True
+    return False
 
 
 def sync_ector_ink_dist_to_pnpm_store(tui_dir: Path) -> None:
@@ -568,16 +749,18 @@ def bun_bin() -> str:
 
 def build_ector_tui_bundle(tui_dir: Path, pm_bin: str, pm_name: str) -> None:
     """Build ``packages/ector-tui`` when sources are newer than ``tui-bundle.js``."""
+    install_root = _resolve_project_root(tui_dir)
+    ensure_tui_prebuild_artifacts(install_root)
     if tui_is_prebuilt_release(tui_dir):
         sync_ector_ink_dist_to_pnpm_store(tui_dir)
+        snapshot_tui_prebuild_cache(tui_dir)
         return
     if not tui_can_build_from_source(tui_dir):
         bundle = tui_dir / "packages" / "ector-tui" / "dist" / "tui-bundle.js"
         if not bundle.is_file():
             print(
                 "Pacote TUI incompleto — dist/tui-bundle.js ausente e não há "
-                "fontes para recompilar. Execute `ector update` novamente ou "
-                "reinstale: curl -fsSL https://ector.cc/install.sh | bash"
+                "fontes para recompilar. Execute `ector update` para reparar."
             )
             sys.exit(1)
         return
@@ -648,6 +831,7 @@ def _resolve_project_root(tui_dir: Path) -> Path:
 def make_tui_argv(tui_dir: Path) -> tuple[list[str], Path]:
     """TUI: OpenTUI via Bun usando o bundle dist/entry.js."""
     project_root = _resolve_project_root(tui_dir)
+    ensure_tui_prebuild_artifacts(project_root)
     ensure_tui_node(project_root)
     ensure_tui_bun(project_root)
     bun = bun_bin()
@@ -666,6 +850,7 @@ def make_tui_argv(tui_dir: Path) -> tuple[list[str], Path]:
         and not tui_need_pkg_install(tui_dir)
     ):
         sync_ector_ink_dist_to_pnpm_store(tui_dir)
+        snapshot_tui_prebuild_cache(tui_dir)
         return [bun, str(entry)], tui_dir
 
     pm_bin = shutil.which("pnpm") or shutil.which("npm")

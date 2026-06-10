@@ -1,5 +1,6 @@
 import { c as _c } from "react/compiler-runtime";
 import { useEffect, useRef } from 'react';
+import { MOUSE_TRACKING } from '../config/env.js';
 import { resolveDetailsMode, resolveSections } from '../domain/details.js';
 import { asRpcResult } from '../lib/rpc.js';
 import { turnController } from './turnController.js';
@@ -27,7 +28,7 @@ export const applyDisplay = (cfg, setBell) => {
     detailsMode: resolveDetailsMode(d),
     detailsModeCommandOverride: false,
     inlineDiffs: d.inline_diffs !== false,
-    mouseTracking: d.tui_mouse !== false,
+    mouseTracking: d.tui_mouse === true || d.tui_mouse !== false && MOUSE_TRACKING,
     sections: resolveSections(d.sections),
     showCost: !!d.show_cost,
     showReasoning: !!d.show_reasoning,

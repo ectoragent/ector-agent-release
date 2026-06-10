@@ -361,28 +361,91 @@ sync_ector_tui_ink_to_pnpm_store() {
     done
 }
 
+_tui_prebuild_cache_dir() {
+    if [ -n "${ECTOR_HOME:-}" ]; then
+        printf '%s/runtime/tui-prebuild' "$ECTOR_HOME"
+        return 0
+    fi
+    printf '%s/.ector/runtime/tui-prebuild' "${HOME:-/tmp}"
+}
+
+snapshot_ector_tui_prebuild_cache() {
+    local tui_dir="${1:?tui dir}"
+    local cache
+    cache="$(_tui_prebuild_cache_dir)"
+    if [ ! -f "$tui_dir/dist/entry.js" ] || [ ! -f "$tui_dir/packages/ector-tui/dist/tui-bundle.js" ]; then
+        return 0
+    fi
+    mkdir -p "$cache" 2>/dev/null || return 0
+    cp -f "$tui_dir/dist/entry.js" "$cache/entry.js" 2>/dev/null || true
+    cp -f "$tui_dir/packages/ector-tui/dist/tui-bundle.js" "$cache/tui-bundle.js" 2>/dev/null || true
+}
+
+restore_ector_tui_prebuild_from_cache() {
+    local tui_dir="${1:?tui dir}"
+    local cache
+    cache="$(_tui_prebuild_cache_dir)"
+    if [ ! -f "$cache/entry.js" ] || [ ! -f "$cache/tui-bundle.js" ]; then
+        return 1
+    fi
+    if [ ! -f "$tui_dir/dist/entry.js" ]; then
+        mkdir -p "$tui_dir/dist" 2>/dev/null || return 1
+        cp -f "$cache/entry.js" "$tui_dir/dist/entry.js" || return 1
+    fi
+    if [ ! -f "$tui_dir/packages/ector-tui/dist/tui-bundle.js" ]; then
+        mkdir -p "$tui_dir/packages/ector-tui/dist" 2>/dev/null || return 1
+        cp -f "$cache/tui-bundle.js" "$tui_dir/packages/ector-tui/dist/tui-bundle.js" || return 1
+    fi
+    return 0
+}
+
 restore_ector_tui_prebuild_from_git() {
     local root="${1:?install root}"
     local tui_dir="$root/frontend/tui"
+    local ref
 
     [ -d "$tui_dir" ] || return 0
     if _tui_can_build_from_source "$tui_dir"; then
         return 0
     fi
     if _tui_prebuilt_release_ready "$tui_dir"; then
+        snapshot_ector_tui_prebuild_cache "$tui_dir"
         return 0
     fi
     if [ ! -d "$root/.git" ]; then
-        return 0
+        return 1
     fi
 
     (
-        cd "$root" || exit 0
-        git checkout HEAD -- \
-            frontend/tui/dist/entry.js \
-            frontend/tui/packages/ector-tui/dist/tui-bundle.js \
-            2>/dev/null
-    ) || true
+        cd "$root" || exit 1
+        for ref in HEAD '@{u}' "origin/${BRANCH:-main}" origin/main origin/master; do
+            [ -n "$ref" ] || continue
+            git checkout "$ref" -- \
+                frontend/tui/dist/entry.js \
+                frontend/tui/packages/ector-tui/dist/tui-bundle.js \
+                2>/dev/null || continue
+            if _tui_prebuilt_release_ready "$tui_dir"; then
+                exit 0
+            fi
+        done
+        exit 1
+    ) && return 0
+
+    restore_ector_tui_prebuild_from_cache "$tui_dir"
+}
+
+_py_ensure_tui_prebuild() {
+    local root="${1:?install root}"
+    local py="$root/venv/bin/python"
+    [ -x "$py" ] || return 1
+    _PY_ENSURE_ROOT="$root" "$py" -c '
+from pathlib import Path
+import os
+import sys
+from ector_cli.tui_launch import ensure_tui_prebuild_artifacts
+root = Path(os.environ["_PY_ENSURE_ROOT"])
+sys.exit(0 if ensure_tui_prebuild_artifacts(root) else 1)
+' 2>/dev/null
 }
 
 finalize_ector_tui_after_update() {
@@ -390,21 +453,30 @@ finalize_ector_tui_after_update() {
     local tui_dir="$root/frontend/tui"
 
     [ -f "$tui_dir/package.json" ] || return 0
-    restore_ector_tui_prebuild_from_git "$root"
+    restore_ector_tui_prebuild_from_git "$root" || true
 
     if _tui_can_build_from_source "$tui_dir"; then
         sync_ector_tui_ink_to_pnpm_store "$tui_dir"
         return 0
     fi
-    if ! _tui_prebuilt_release_ready "$tui_dir"; then
-        return 1
-    fi
+
     if ! _ir_tui_node_modules_ready "$tui_dir"; then
         _ir_ensure_pnpm || return 1
         _ir_pnpm_install_tui "$tui_dir" || return 1
     fi
-    sync_ector_tui_ink_to_pnpm_store "$tui_dir"
-    return 0
+
+    if _py_ensure_tui_prebuild "$root"; then
+        sync_ector_tui_ink_to_pnpm_store "$tui_dir"
+        snapshot_ector_tui_prebuild_cache "$tui_dir"
+        return 0
+    fi
+
+    if _tui_prebuilt_release_ready "$tui_dir"; then
+        sync_ector_tui_ink_to_pnpm_store "$tui_dir"
+        snapshot_ector_tui_prebuild_cache "$tui_dir"
+        return 0
+    fi
+    return 1
 }
 
 install_ector_bun() {

@@ -4,6 +4,15 @@ const SIGNAL_EXIT_CODE = {
   SIGTERM: 143
 };
 let wired = false;
+const runCleanupsSync = cleanups => {
+  for (const fn of cleanups) {
+    try {
+      fn();
+    } catch {
+      // best-effort
+    }
+  }
+};
 export function setupGracefulExit({
   cleanups = [],
   failsafeMs = 4000,
@@ -23,12 +32,21 @@ export function setupGracefulExit({
     if (signal) {
       onSignal?.(signal);
     }
-    setTimeout(() => process.exit(code), failsafeMs).unref?.();
-    void Promise.allSettled(cleanups.map(fn => Promise.resolve().then(fn))).finally(() => process.exit(code));
+    // Restore TTY synchronously — async cleanups left the shell in mouse/raw mode.
+    runCleanupsSync(cleanups);
+    process.exit(code);
   };
   for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
     process.on(sig, () => exit(SIGNAL_EXIT_CODE[sig], sig));
   }
-  process.on('uncaughtException', err => onError?.('uncaughtException', err));
+  process.on('uncaughtException', err => {
+    onError?.('uncaughtException', err);
+    if (!shuttingDown) {
+      shuttingDown = true;
+      runCleanupsSync(cleanups);
+      process.exit(1);
+    }
+  });
   process.on('unhandledRejection', reason => onError?.('unhandledRejection', reason));
+  void failsafeMs;
 }

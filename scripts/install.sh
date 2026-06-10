@@ -851,19 +851,11 @@ clone_repo() {
             cd "$INSTALL_DIR"
 
             local autostash_ref=""
-            if [ -n "$(git status --porcelain)" ]; then
+            if [ -n "$(git status --porcelain)" ] && ! _is_update_mode; then
                 local stash_name
                 stash_name="ector-install-autostash-$(date -u +%Y%m%d-%H%M%S)"
-                if ! _is_update_mode; then
-                    log_info "Local changes detected, stashing before update..."
-                fi
-                if _is_update_mode; then
-                    # Não incluir untracked no update: dist/ pré-compilado pode
-                    # existir só localmente e sumir do disco após o stash+pull.
-                    git stash push -m "$stash_name" >/dev/null 2>&1
-                else
-                    git stash push --include-untracked -m "$stash_name"
-                fi
+                log_info "Local changes detected, stashing before update..."
+                git stash push --include-untracked -m "$stash_name"
                 autostash_ref="$(git rev-parse --verify refs/stash 2>/dev/null || true)"
             fi
 
@@ -871,8 +863,21 @@ clone_repo() {
                 git fetch origin && git checkout "$BRANCH" && git pull --ff-only origin "$BRANCH"
             }
 
+            _restore_tui_prebuild_after_pull() {
+                local _rt="$INSTALL_DIR/scripts/lib/install-runtime-check.sh"
+                if [ ! -f "$_rt" ]; then
+                    _rt="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/install-runtime-check.sh"
+                fi
+                if [ -f "$_rt" ]; then
+                    # shellcheck source=scripts/lib/install-runtime-check.sh
+                    source "$_rt"
+                    restore_ector_tui_prebuild_from_git "$INSTALL_DIR" || true
+                fi
+            }
+
             if _is_update_mode && declare -F _install_step >/dev/null 2>&1; then
                 _install_step "Código do Ector (git pull)" _git_update_pull || exit 1
+                _restore_tui_prebuild_after_pull
             else
                 _git_update_pull || exit 1
             fi
@@ -1350,6 +1355,9 @@ install_node_deps() {
             if [ "$HAS_BUN" != true ]; then
                 install_ector_bun "$INSTALL_DIR" && HAS_BUN=true || true
             fi
+            if _is_update_mode; then
+                install_ector_bun "$INSTALL_DIR" && HAS_BUN=true || true
+            fi
             if [ "$HAS_BUN" = true ]; then
                 if _is_update_mode; then
                     install_ector_tui_deps "$INSTALL_DIR" || return 1
@@ -1359,6 +1367,9 @@ install_node_deps() {
                     install_ector_tui_deps "$INSTALL_DIR" || true
                     build_ector_tui "$INSTALL_DIR" || true
                 fi
+            elif _is_update_mode; then
+                _install_step_warn "Runtime Bun (necessário para ector chat)"
+                return 1
             else
                 _install_step_warn "Runtime Bun (necessário para ector chat)"
             fi

@@ -2,6 +2,7 @@ import { c as _c } from "react/compiler-runtime";
 import { jsx as _jsx } from "react/jsx-runtime";
 import { useStore } from '@nanostores/react';
 import { GatewayProvider } from './app/gatewayContext.js';
+import { useMouseTrackingSync } from './app/hooks/useMouseTrackingSync.js';
 import { $uiState } from './app/uiStore.js';
 import { useMainApp } from './app/useMainApp.js';
 import { AppLayout } from './components/AppLayout/index.js';
@@ -21,6 +22,7 @@ export function App(t0) {
   const {
     mouseTracking
   } = useStore($uiState);
+  useMouseTrackingSync(mouseTracking);
   let t1;
   if ($[0] !== appActions || $[1] !== appComposer || $[2] !== appProgress || $[3] !== appStatus || $[4] !== appTranscript || $[5] !== gateway || $[6] !== mouseTracking) {
     t1 = _jsx(GatewayProvider, {
