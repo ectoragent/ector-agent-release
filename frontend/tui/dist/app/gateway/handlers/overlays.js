@@ -27,6 +27,7 @@ export function handleSudoRequest(ev, api) {
   const p = ev.payload;
   patchOverlayState({
     sudo: {
+      hint: p.hint,
       requestId: p.request_id
     }
   });

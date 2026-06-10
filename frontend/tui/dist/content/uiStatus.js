@@ -22,7 +22,7 @@ export const STATUS = {
   setupRequired: 'configuração necessária',
   setupRunning: 'configuração em andamento…',
   startingAgent: 'iniciando assistente…',
-  sudoNeeded: 'preciso da senha sudo',
+  sudoNeeded: 'senha sudo — ou corra sudo -v noutro terminal',
   waitingInput: 'sua vez de responder…'
 };
 /** Startup / session prep statuses that show a spinner in the bar. */

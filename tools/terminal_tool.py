@@ -235,29 +235,54 @@ def _validate_workdir(workdir: str) -> str | None:
     return None
 
 
+def _sudo_cache_hint() -> str:
+    """User-facing hint when sudo needs a password (OpenCode-style sudo -v workflow)."""
+    return (
+        "Dica: corra `sudo -v` noutro terminal para cachear credenciais (~15 min). "
+        "Em SSH, `Defaults timestamp_type=global` no sudoers partilha o cache entre TTYs."
+    )
+
+
+def _sudo_credentials_cached() -> bool:
+    """True when sudo works without a password prompt (root, NOPASSWD, or sudo -v cache)."""
+    if platform.system() == "Windows":
+        return False
+    try:
+        result = subprocess.run(
+            ["sudo", "-n", "true"],
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def _handle_sudo_failure(output: str, env_type: str) -> str:
     """
     Check for sudo failure and add helpful message for messaging contexts.
     
     Returns enhanced output if sudo failed in messaging context, else original.
     """
-    is_gateway = os.getenv("ECTOR_GATEWAY_SESSION")
-    
-    if not is_gateway:
-        return output
-    
-    # Check for sudo failure indicators
     sudo_failures = [
         "sudo: a password is required",
         "sudo: no tty present",
         "sudo: a terminal is required",
     ]
-    
+
     for failure in sudo_failures:
-        if failure in output:
+        if failure not in output:
+            continue
+        tips = [f"\n\n💡 {_sudo_cache_hint()}"]
+        if os.getenv("ECTOR_GATEWAY_SESSION"):
             from ector_constants import display_ector_home as _dhh
-            return output + f"\n\n💡 Tip: To enable sudo over messaging, add SUDO_PASSWORD to {_dhh()}/.env on the agent machine."
-    
+
+            tips.append(
+                f"Para messaging sem prompt interativo, adicione SUDO_PASSWORD em {_dhh()}/.env."
+            )
+        return output + "".join(tips)
+
     return output
 
 
@@ -694,6 +719,9 @@ def _transform_sudo_command(command: str | None) -> tuple[str | None, str | None
     password in the command string themselves; see their execute() methods for
     how they handle the non-None sudo_stdin case.
 
+    When ``sudo -n true`` succeeds (root, NOPASSWD, or cached ``sudo -v``):
+      Returns the command unchanged — no ``-S`` rewrite and no password prompt.
+
     If SUDO_PASSWORD is not set and in interactive mode (ECTOR_INTERACTIVE=1):
       Prompts user for password with 45s timeout, caches for session.
 
@@ -706,6 +734,9 @@ def _transform_sudo_command(command: str | None) -> tuple[str | None, str | None
         return None, None
     transformed, has_real_sudo = _rewrite_real_sudo_invocations(command)
     if not has_real_sudo:
+        return command, None
+
+    if _sudo_credentials_cached():
         return command, None
 
     has_configured_password = "SUDO_PASSWORD" in os.environ

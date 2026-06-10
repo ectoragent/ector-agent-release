@@ -173,6 +173,7 @@ export const ComposerPane = memo(function ComposerPane(t0) {
             icon: "\uD83D\uDD10",
             label: "senha sudo necess\xE1ria",
             onSubmit: actions.answerSudo,
+            sub: overlay.sudo.hint,
             t: ui.theme
           }, "comp-sudo") : null, overlay.secret ? _jsx(MaskedPrompt, {
             cols: composer.cols,

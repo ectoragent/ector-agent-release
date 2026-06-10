@@ -1277,10 +1277,17 @@ def _wire_callbacks(sid: str):
     thread that runs agent.run_conversation — e.g. prompt.submit's worker —
     not on the JSON-RPC handler or session-build threads.
     """
-    from tools.terminal_tool import set_sudo_password_callback
+    from tools.terminal_tool import _sudo_cache_hint, set_sudo_password_callback
     from tools.skills_tool import set_secret_capture_callback
 
-    set_sudo_password_callback(lambda: _block("sudo.request", sid, {}, timeout=120))
+    set_sudo_password_callback(
+        lambda: _block(
+            "sudo.request",
+            sid,
+            {"hint": _sudo_cache_hint()},
+            timeout=120,
+        )
+    )
 
     def secret_cb(env_var, prompt, metadata=None):
         pl = {"prompt": prompt, "env_var": env_var}
