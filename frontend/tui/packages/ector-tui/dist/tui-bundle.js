@@ -733,6 +733,20 @@ function shutdownTui() {
     } catch {
     }
   }
+  fetch("http://127.0.0.1:7942/ingest/87fa9e4b-a416-4933-9cfd-a9f0ed917b76", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "9e46c8" },
+    body: JSON.stringify({
+      sessionId: "9e46c8",
+      location: "terminalShutdown.ts:shutdownTui",
+      message: "shutdown complete",
+      data: { isTTY: process.stdout.isTTY, hadRenderer: Boolean(renderer2) },
+      hypothesisId: "E",
+      runId: "pre-fix",
+      timestamp: Date.now()
+    })
+  }).catch(() => {
+  });
 }
 
 // src/hooks/useApp.ts

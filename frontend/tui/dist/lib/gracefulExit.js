@@ -16,6 +16,27 @@ const runCleanupsSync = cleanups => {
 };
 /** Run all registered cleanups then exit — used by stdin force-quit and signal handlers. */
 export function forceProcessExit(code) {
+  // #region agent log
+  fetch('http://127.0.0.1:7942/ingest/87fa9e4b-a416-4933-9cfd-a9f0ed917b76', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Debug-Session-Id': '9e46c8'
+    },
+    body: JSON.stringify({
+      sessionId: '9e46c8',
+      location: 'gracefulExit.ts:forceProcessExit',
+      message: 'force exit',
+      data: {
+        code,
+        cleanups: registeredCleanups.length
+      },
+      hypothesisId: 'E',
+      runId: 'pre-fix',
+      timestamp: Date.now()
+    })
+  }).catch(() => {});
+  // #endregion
   runCleanupsSync(registeredCleanups);
   process.exit(code);
 }

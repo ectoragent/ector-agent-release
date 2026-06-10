@@ -1,6 +1,7 @@
 import { REASONING_PULSE_MS, STREAM_BATCH_MS, STREAM_HEAVY_BATCH_MS, STREAM_HEAVY_CHARS, STREAM_IDLE_BATCH_MS, STREAM_SCROLL_BATCH_MS, STREAM_TYPING_BATCH_MS } from '../../config/timing.js';
 import { INTERRUPT_USER_LABEL, STATUS } from '../../content/uiStatus.js';
 import { appendToolShelfMessage, isToolShelfMessage } from '../../lib/liveProgress.js';
+import { debugSessionLog } from '../../lib/debugSessionLog.js';
 import { hasReasoningTag, splitReasoning } from '../../lib/reasoning.js';
 import { boundedLiveRenderText, buildToolTrailLine, estimateTokensRough, isTransientTrailLine, sameToolTrailGroup } from '../../lib/text.js';
 import { estimateMarkdownBodyLines } from '../../lib/virtualHeights.js';
@@ -557,6 +558,17 @@ export class TurnController {
       toolTokens: this.toolTokenAcc,
       tools: this.activeTools
     });
+    // #region agent log
+    if (/sudo/i.test(`${name} ${context} ${technical}`)) {
+      debugSessionLog('TurnController.ts:recordToolStart', 'sudo tool.start', {
+        contextLen: context.length,
+        name,
+        technicalLen: technical.length,
+        toolId,
+        tools: this.activeTools.length
+      }, 'A');
+    }
+    // #endregion
   }
   reset() {
     this.clearReasoning();

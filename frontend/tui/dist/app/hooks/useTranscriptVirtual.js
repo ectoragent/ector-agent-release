@@ -4,6 +4,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef } from 'react'
 import { TYPING_IDLE_MS } from '../../config/timing.js';
 import { sectionMode } from '../../domain/details.js';
 import { useVirtualHistory } from '../../hooks/useVirtualHistory.js';
+import { debugSessionLog } from '../../lib/debugSessionLog.js';
 import { getViewportSnapshot, useViewportSnapshot } from '../../lib/viewportStore.js';
 import { messageHeightKey } from '../../lib/virtualHeights.js';
 import { buildInitialHeightEstimates, shouldAutoScrollTail, shouldClearHeightCacheOnBusyEnd } from '../transcriptVirtualLogic.js';
@@ -315,6 +316,15 @@ export function useTranscriptVirtual(opts) {
     if (!tailFollowRef.current && !turnEndFollowLatchRef.current) {
       return;
     }
+    // #region agent log
+    debugSessionLog('useTranscriptVirtual.ts:flowBlock', 'flow overlay viewport sync', {
+      blockChanged,
+      isBlocked,
+      liveTailActive,
+      vp: vp_0,
+      vpChanged
+    }, 'B');
+    // #endregion
     scrollTranscriptToBottom();
     let frame_0 = 0;
     let cancelled_1 = false;

@@ -1,4 +1,5 @@
 import { useCallback, useDeferredValue, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
+import { debugSessionLog } from '../lib/debugSessionLog.js';
 const ESTIMATE = 4;
 // Overscan was 40 (= viewport) which is way more than needed when heights
 // are well-estimated.  Cutting in half saves ~20 mounted items per scroll
@@ -89,6 +90,7 @@ export function useVirtualHistory(scrollRef, items, columns, {
   const prevItemsHeadRef = useRef(undefined);
   const prevItemCountRef = useRef(0);
   const forceTailFollowRef = useRef(false);
+  const debugSpacerSigRef = useRef('');
   // Width change: scale cached heights by oldCols/newCols instead of clearing
   // (clearing forces a pessimistic back-walk mounting ~190 rows at once, each
   // a fresh marked.lexer + syntax highlight ≈ 3ms). Freeze the mount range
@@ -440,6 +442,25 @@ export function useVirtualHistory(scrollRef, items, columns, {
       topSpacer = Math.min(topSpacer, target_0);
     }
   }
+  // #region agent log
+  {
+    const sig = `${bottomSpacer}|${effStart}|${effEnd}|${vp}`;
+    const suspicious = bottomSpacer > Math.max(vp * 3, 120);
+    if (suspicious && sig !== debugSpacerSigRef.current) {
+      debugSpacerSigRef.current = sig;
+      debugSessionLog('useVirtualHistory.ts:spacers', 'bottomSpacer anomaly', {
+        bottomSpacer,
+        effEnd,
+        effStart,
+        itemCount: items.length,
+        liveTailActive,
+        topSpacer,
+        total,
+        viewportHeight: vp
+      }, 'A');
+    }
+  }
+  // #endregion
   return {
     bottomSpacer,
     end: effEnd,
