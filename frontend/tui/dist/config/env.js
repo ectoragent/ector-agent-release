@@ -7,8 +7,10 @@ export const STARTUP_INITIAL_PROMPT = (process.env.ECTOR_TUI_INITIAL_PROMPT ?? '
 export const STARTUP_INITIAL_IMAGE = (process.env.ECTOR_TUI_INITIAL_IMAGE ?? '').trim();
 /** Create session in an isolated git worktree (`ector chat -w`). */
 export const STARTUP_WORKTREE = truthy(process.env.ECTOR_TUI_WORKTREE);
-/** Off by default on SSH/VPS — SGR mouse leaks freeze the composer and poison the shell on exit. */
-export const MOUSE_TRACKING = truthy(process.env.ECTOR_TUI_ENABLE_MOUSE) ? true : truthy(process.env.ECTOR_TUI_DISABLE_MOUSE) ? false : !isRemoteShell();
+/** Wheel scroll in the transcript requires mouse reporting — keep on unless explicitly disabled. */
+export const MOUSE_TRACKING = truthy(process.env.ECTOR_TUI_DISABLE_MOUSE) ? false : true;
+/** Motion events (not scroll) flood SSH terminals — scroll-only is enough and avoids composer leaks. */
+export const MOUSE_MOVEMENT_TRACKING = truthy(process.env.ECTOR_TUI_ENABLE_MOUSE_MOVEMENT) || !isRemoteShell() && MOUSE_TRACKING;
 export const NO_CONFIRM_DESTRUCTIVE = truthy(process.env.ECTOR_TUI_NO_CONFIRM);
 // Skip AlternateScreen — TUI renders into the primary buffer so the host
 // terminal's native scrollback captures whatever scrolls off the top.

@@ -1079,7 +1079,6 @@ function useTerminalViewport() {
 }
 
 // src/lib/ctrlCForceQuit.ts
-var MOUSE_DISABLE_SEQ = "\x1B[?1000l\x1B[?1002l\x1B[?1003l\x1B[?1006l";
 var FORCE_QUIT_WINDOW_MS = 1500;
 var lastCtrlCAt = 0;
 var forceQuitOnSecondCtrlC = (sequence) => {
@@ -1092,12 +1091,6 @@ var forceQuitOnSecondCtrlC = (sequence) => {
     process.exit(130);
   }
   lastCtrlCAt = now;
-  if (process.stdout.isTTY) {
-    try {
-      process.stdout.write(MOUSE_DISABLE_SEQ);
-    } catch {
-    }
-  }
   return false;
 };
 
@@ -1273,6 +1266,7 @@ async function render(node, options = {}) {
   const swallowMouseSequence = createSwallowMouseSequence(new MouseParser());
   const renderer2 = await createCliRenderer({
     backgroundColor: "#0A0A0A",
+    enableMouseMovement: options.enableMouseMovement ?? true,
     exitOnCtrlC: options.exitOnCtrlC ?? true,
     prependInputHandlers: [forceQuitOnSecondCtrlC, swallowMouseSequence],
     screenMode: "alternate-screen",
