@@ -1186,29 +1186,6 @@ var forceQuitOnSecondCtrlC = (sequence) => {
   return false;
 };
 
-// src/lib/agentDebugLog.ts
-var agentDebugLog = (location, message, data, hypothesisId) => {
-  const payload = {
-    sessionId: "9e46c8",
-    location,
-    message,
-    data,
-    hypothesisId,
-    timestamp: Date.now()
-  };
-  fetch("http://127.0.0.1:7942/ingest/87fa9e4b-a416-4933-9cfd-a9f0ed917b76", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "9e46c8" },
-    body: JSON.stringify(payload)
-  }).catch(() => {
-  });
-  try {
-    process.stderr.write(`ECTOR_MOUSE_DEBUG ${JSON.stringify(payload)}
-`);
-  } catch {
-  }
-};
-
 // src/lib/mouseInputLeak.ts
 var ESC = "\x1B";
 var SGR_MOUSE_FULL_RE = new RegExp(`^${ESC}\\[<\\d+(?:;\\d+){0,2}[Mm]$`);
@@ -1275,7 +1252,7 @@ var parseMouseLeakScrolls = (raw) => {
 };
 
 // src/lib/inputPipeline.ts
-var MAX_PENDING_MOUSE = 48;
+var MAX_PENDING_MOUSE = 256;
 var forwardMouseScrolls = (sequence) => {
   for (const dir of parseMouseLeakScrolls(sequence)) {
     emitWheelInput(dir);
@@ -1291,12 +1268,6 @@ var swallowMousePayload = (sequence, mouseParser) => {
   }
   if (sequenceContainsMouseLeak(sequence) || isMouseInputLeak(sequence)) {
     forwardMouseScrolls(sequence);
-    agentDebugLog(
-      "inputPipeline.ts:swallowLeak",
-      "swallowed mouse leak",
-      { len: sequence.length, preview: sequence.slice(0, 24) },
-      "D"
-    );
     return true;
   }
   return false;
@@ -1307,22 +1278,14 @@ var createSwallowMouseSequence = (mouseParser) => {
     let combined = pending ? pending + sequence : sequence;
     pending = "";
     if (combined.length > MAX_PENDING_MOUSE) {
-      agentDebugLog(
-        "inputPipeline.ts:pendingOverflow",
-        "mouse pending buffer overflow, dropping",
-        { len: combined.length },
-        "D"
-      );
-      combined = sequence;
+      forwardMouseScrolls(combined);
+      combined = stripMouseLeakFragments(combined);
+      if (!combined || swallowMousePayload(combined, mouseParser)) {
+        return true;
+      }
     }
     if (isIncompleteMouseEscape(combined)) {
       pending = combined;
-      agentDebugLog(
-        "inputPipeline.ts:pending",
-        "buffered incomplete mouse escape",
-        { len: combined.length, preview: combined.slice(0, 24) },
-        "D"
-      );
       return true;
     }
     return swallowMousePayload(combined, mouseParser);
@@ -1351,12 +1314,6 @@ function InputBridge() {
       const raw = event.keypress.raw ?? event.input;
       const merged = `${raw}${event.input}`;
       if (isMouseInputLeak(raw, event.input) || sequenceContainsMouseLeak(merged)) {
-        agentDebugLog(
-          "InputBridge.tsx:useKeyboard",
-          "blocked mouse leak on keyboard path",
-          { rawLen: raw.length, inputLen: event.input.length, preview: merged.slice(0, 24) },
-          "C"
-        );
         return;
       }
       emitInput(event);
@@ -1389,12 +1346,6 @@ var stripMouseFromStdinChunk = (buffer) => {
       for (const dir of parseMouseLeakScrolls(frame)) {
         emitWheelInput(dir);
       }
-      agentDebugLog(
-        "mouseFilteredStdin.ts:strip",
-        "stdin filter stripped mouse frame",
-        { len: frame.length, preview: frame.slice(0, 24) },
-        "F"
-      );
       pending = pending.slice(frame.length);
       continue;
     }
@@ -1406,12 +1357,6 @@ var stripMouseFromStdinChunk = (buffer) => {
       for (const dir of parseMouseLeakScrolls(pending)) {
         emitWheelInput(dir);
       }
-      agentDebugLog(
-        "mouseFilteredStdin.ts:stripLeak",
-        "stdin filter stripped embedded mouse leak",
-        { len: pending.length, preview: pending.slice(0, 24) },
-        "F"
-      );
       forward += stripped;
       pending = "";
       continue;
