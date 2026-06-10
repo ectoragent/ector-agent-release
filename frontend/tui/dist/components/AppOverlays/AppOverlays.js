@@ -7,7 +7,6 @@ import { $overlayState, patchOverlayState } from '../../app/overlayStore.js';
 import { $uiState } from '../../app/uiStore.js';
 import { WISER_USER_CANCELLED } from '../../content/wiserMessages.js';
 import { FloatBox } from '../AppChrome/index.js';
-import { MaskedPrompt } from '../MaskedPrompt/index.js';
 import { ModelPicker } from '../ModelPicker/index.js';
 import { OverlayHint } from '../OverlayControls/index.js';
 import { ApprovalPrompt, ConfirmPrompt, WiserPrompt } from '../Prompts/index.js';
@@ -102,13 +101,11 @@ export function CompletionMenu(t0) {
   return t4;
 }
 export function PromptZone(t0) {
-  const $ = _c(27);
+  const $ = _c(17);
   const {
     cols,
     onApprovalChoice,
-    onWiserAnswer,
-    onSecretSubmit,
-    onSudoSubmit
+    onWiserAnswer
   } = t0;
   const overlay = useStore($overlayState);
   const ui = useStore($uiState);
@@ -206,59 +203,6 @@ export function PromptZone(t0) {
       $[14] = t1;
     } else {
       t1 = $[14];
-    }
-    return t1;
-  }
-  if (overlay.sudo) {
-    let t1;
-    if ($[17] !== cols || $[18] !== onSudoSubmit || $[19] !== ui.theme) {
-      t1 = _jsx(Box, {
-        flexDirection: "column",
-        flexShrink: 0,
-        paddingX: 1,
-        paddingY: 1,
-        children: _jsx(MaskedPrompt, {
-          cols,
-          icon: "\uD83D\uDD10",
-          label: "senha sudo necess\xE1ria",
-          onSubmit: onSudoSubmit,
-          t: ui.theme
-        })
-      });
-      $[17] = cols;
-      $[18] = onSudoSubmit;
-      $[19] = ui.theme;
-      $[20] = t1;
-    } else {
-      t1 = $[20];
-    }
-    return t1;
-  }
-  if (overlay.secret) {
-    let t1;
-    if ($[21] !== cols || $[22] !== onSecretSubmit || $[23] !== overlay.secret.envVar || $[24] !== overlay.secret.prompt || $[25] !== ui.theme) {
-      t1 = _jsx(Box, {
-        flexDirection: "column",
-        flexShrink: 0,
-        paddingX: 1,
-        paddingY: 1,
-        children: _jsx(MaskedPrompt, {
-          cols,
-          icon: "\uD83D\uDD11",
-          label: overlay.secret.prompt,
-          onSubmit: onSecretSubmit,
-          sub: `para ${overlay.secret.envVar}`,
-          t: ui.theme
-        })
-      });
-      $[21] = cols;
-      $[22] = onSecretSubmit;
-      $[23] = overlay.secret.envVar;
-      $[24] = overlay.secret.prompt;
-      $[25] = ui.theme;
-      $[26] = t1;
-    } else {
-      t1 = $[26];
     }
     return t1;
   }

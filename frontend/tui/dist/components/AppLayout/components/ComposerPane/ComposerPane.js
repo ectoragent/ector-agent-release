@@ -10,11 +10,12 @@ import { isComposerReady, isLoadingStatus, STATUS, STATUS_ERROR_DOT } from '../.
 import { COMPOSER_PROMPT_GAP, composerCardWidth, stableComposerColumns } from '../../../../lib/inputMetrics.js';
 import { CompletionMenu, FloatingOverlays } from '../../../AppOverlays/index.js';
 import { ComposerFooter } from '../../../ComposerFooter/index.js';
+import { MaskedPrompt } from '../../../MaskedPrompt/index.js';
 import { QueuedMessages } from '../../../QueuedMessages/index.js';
 import { TextInput } from '../../../TextInput/index.js';
 import { Spinner } from '../../../Thinking/index.js';
 export const ComposerPane = memo(function ComposerPane(t0) {
-  const $ = _c(14);
+  const $ = _c(16);
   const {
     actions,
     composer,
@@ -45,7 +46,7 @@ export const ComposerPane = memo(function ComposerPane(t0) {
   const sh = t3;
   const promptColW = sh ? 2 : composer.inputBuf.length > 0 ? 2 : 0;
   let t4;
-  if ($[4] !== actions || $[5] !== composer || $[6] !== composerReady || $[7] !== isBlocked || $[8] !== menuOverlay || $[9] !== promptColW || $[10] !== sh || $[11] !== status || $[12] !== ui) {
+  if ($[4] !== actions || $[5] !== composer || $[6] !== composerReady || $[7] !== isBlocked || $[8] !== menuOverlay || $[9] !== overlay.secret || $[10] !== overlay.sudo || $[11] !== promptColW || $[12] !== sh || $[13] !== status || $[14] !== ui) {
     const inputColumns = stableComposerColumns(composer.cols, promptColW);
     const statusHud = {
       bgCount: ui.bgTasks.size,
@@ -164,10 +165,23 @@ export const ComposerPane = memo(function ComposerPane(t0) {
                 value: composer.input
               }, "ti")
             }, "ti-wrap")].filter(Boolean)
-          }, "comp-active")].flat() : null, !isBlocked || menuOverlay ? null : _jsx(Text, {
+          }, "comp-active")].flat() : null, !isBlocked || menuOverlay || overlay.sudo || overlay.secret ? null : _jsx(Text, {
             color: ui.theme.color.dim,
             children: ui.status
-          }, "comp-blocked")].filter(Boolean)
+          }, "comp-blocked"), overlay.sudo ? _jsx(MaskedPrompt, {
+            cols: composer.cols,
+            icon: "\uD83D\uDD10",
+            label: "senha sudo necess\xE1ria",
+            onSubmit: actions.answerSudo,
+            t: ui.theme
+          }, "comp-sudo") : null, overlay.secret ? _jsx(MaskedPrompt, {
+            cols: composer.cols,
+            icon: "\uD83D\uDD11",
+            label: overlay.secret.prompt,
+            onSubmit: actions.answerSecret,
+            sub: `para ${overlay.secret.envVar}`,
+            t: ui.theme
+          }, "comp-secret") : null].filter(Boolean)
         }, "composer-body") : !isBlocked ? _jsx(Text, {
           color: ui.theme.color.dim,
           children: isLoadingStatus(ui.status) ? _jsxs(_Fragment, {
@@ -200,13 +214,15 @@ export const ComposerPane = memo(function ComposerPane(t0) {
     $[6] = composerReady;
     $[7] = isBlocked;
     $[8] = menuOverlay;
-    $[9] = promptColW;
-    $[10] = sh;
-    $[11] = status;
-    $[12] = ui;
-    $[13] = t4;
+    $[9] = overlay.secret;
+    $[10] = overlay.sudo;
+    $[11] = promptColW;
+    $[12] = sh;
+    $[13] = status;
+    $[14] = ui;
+    $[15] = t4;
   } else {
-    t4 = $[13];
+    t4 = $[15];
   }
   return t4;
 });

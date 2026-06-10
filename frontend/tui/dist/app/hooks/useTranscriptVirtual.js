@@ -4,12 +4,12 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef } from 'react'
 import { TYPING_IDLE_MS } from '../../config/timing.js';
 import { sectionMode } from '../../domain/details.js';
 import { useVirtualHistory } from '../../hooks/useVirtualHistory.js';
-import { debugSessionLog } from '../../lib/debugSessionLog.js';
-import { getViewportSnapshot } from '../../lib/viewportStore.js';
+import { getViewportSnapshot, useViewportSnapshot } from '../../lib/viewportStore.js';
 import { messageHeightKey } from '../../lib/virtualHeights.js';
 import { buildInitialHeightEstimates, shouldAutoScrollTail, shouldClearHeightCacheOnBusyEnd } from '../transcriptVirtualLogic.js';
 import { turnController } from '../turnController.js';
 import { useTurnSelector } from '../turnStore.js';
+import { $isBlocked } from '../overlayStore.js';
 import { $uiState } from '../uiStore.js';
 const MAX_HEIGHT_CACHE_BUCKETS = 12;
 const CHASE_BOTTOM_MAX_FRAMES = 12;
@@ -30,18 +30,14 @@ export function useTranscriptVirtual(opts) {
   const {
     busy
   } = useStore($uiState);
+  const isBlocked = useStore($isBlocked);
+  const viewport = useViewportSnapshot(scrollRef);
   const streamingLiveTail = useTurnSelector(state => Boolean(state.streaming.trim()));
   const liveScrollFingerprint = useTurnSelector(state_0 => `${state_0.streaming.length}:${state_0.reasoning.length}:${state_0.streamSegments.length}`);
   const prevBusyRef = useRef(busy);
   const prevLiveTailRef = useRef(liveTailActive);
-  const debugScrollBurstRef = useRef({
-    count: 0,
-    windowStart: 0
-  });
-  const debugTailFlagsRef = useRef({
-    live: false,
-    stream: false
-  });
+  const prevFlowBlockRef = useRef(isBlocked);
+  const prevViewportHeightRef = useRef(0);
   const msgIdsRef = useRef(new WeakMap());
   const msgIdSeqRef = useRef(0);
   const heightCachesRef = useRef(new Map());
@@ -290,28 +286,6 @@ export function useTranscriptVirtual(opts) {
       return;
     }
     scrollTranscriptToBottom();
-    // #region agent log
-    {
-      const now_0 = Date.now();
-      const burst = debugScrollBurstRef.current;
-      if (now_0 - burst.windowStart > 500) {
-        burst.windowStart = now_0;
-        burst.count = 0;
-      }
-      burst.count++;
-      const s_5 = scrollRef.current;
-      const snap_2 = s_5 ? getViewportSnapshot(s_5) : null;
-      debugSessionLog('useTranscriptVirtual.ts:liveTailScroll', 'live tail scroll effect', {
-        burstCount: burst.count,
-        liveScrollFingerprint,
-        liveTailActive,
-        scrollTop: s_5?.getScrollTop() ?? -1,
-        streamingLiveTail,
-        atBottom: snap_2?.atBottom ?? false,
-        viewportHeight: snap_2?.viewportHeight ?? 0
-      }, 'B');
-    }
-    // #endregion
     let frame = 0;
     let cancelled_0 = false;
     const settle = () => {
@@ -319,8 +293,8 @@ export function useTranscriptVirtual(opts) {
         return;
       }
       scrollTranscriptToBottom();
-      const snap_3 = getViewportSnapshot(scrollRef.current);
-      if (!snap_3.atBottom) {
+      const snap_2 = getViewportSnapshot(scrollRef.current);
+      if (!snap_2.atBottom) {
         requestAnimationFrame(settle);
       }
     };
@@ -329,27 +303,33 @@ export function useTranscriptVirtual(opts) {
       cancelled_0 = true;
     };
   }, [liveTailActive, liveScrollFingerprint, scrollRef, scrollTranscriptToBottom]);
-  useEffect(() => {
-    const prev = debugTailFlagsRef.current;
-    if (prev.live === liveTailActive && prev.stream === streamingLiveTail) {
+  useLayoutEffect(() => {
+    const vp_0 = viewport.viewportHeight;
+    const blockChanged = isBlocked !== prevFlowBlockRef.current;
+    const vpChanged = vp_0 > 0 && prevViewportHeightRef.current > 0 && vp_0 !== prevViewportHeightRef.current;
+    prevFlowBlockRef.current = isBlocked;
+    prevViewportHeightRef.current = vp_0;
+    if (!liveTailActive || !blockChanged && !vpChanged) {
       return;
     }
-    debugTailFlagsRef.current = {
-      live: liveTailActive,
-      stream: streamingLiveTail
+    if (!tailFollowRef.current && !turnEndFollowLatchRef.current) {
+      return;
+    }
+    scrollTranscriptToBottom();
+    let frame_0 = 0;
+    let cancelled_1 = false;
+    const settle_0 = () => {
+      if (cancelled_1 || frame_0++ > 3) {
+        return;
+      }
+      scrollTranscriptToBottom();
+      requestAnimationFrame(settle_0);
     };
-    // #region agent log
-    debugSessionLog('useTranscriptVirtual.ts:tailFlags', 'tail flags changed', {
-      bottomSpacer: virtualHistory.bottomSpacer,
-      liveScrollFingerprint,
-      liveTailActive,
-      streamingLiveTail,
-      virtualEnd: virtualHistory.end,
-      virtualRows: virtualRows.length,
-      virtualStart: virtualHistory.start
-    }, 'D');
-    // #endregion
-  }, [liveTailActive, liveScrollFingerprint, streamingLiveTail, virtualHistory.bottomSpacer, virtualHistory.end, virtualHistory.start, virtualRows.length]);
+    requestAnimationFrame(settle_0);
+    return () => {
+      cancelled_1 = true;
+    };
+  }, [isBlocked, liveTailActive, scrollRef, scrollTranscriptToBottom, viewport.viewportHeight]);
   return {
     virtualHistory,
     virtualRows
