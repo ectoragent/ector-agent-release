@@ -4,6 +4,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef } from 'react'
 import { TYPING_IDLE_MS } from '../../config/timing.js';
 import { sectionMode } from '../../domain/details.js';
 import { useVirtualHistory } from '../../hooks/useVirtualHistory.js';
+import { debugSessionLog } from '../../lib/debugSessionLog.js';
 import { getViewportSnapshot } from '../../lib/viewportStore.js';
 import { messageHeightKey } from '../../lib/virtualHeights.js';
 import { buildInitialHeightEstimates, shouldAutoScrollTail, shouldClearHeightCacheOnBusyEnd } from '../transcriptVirtualLogic.js';
@@ -29,9 +30,18 @@ export function useTranscriptVirtual(opts) {
   const {
     busy
   } = useStore($uiState);
-  const liveTailFingerprint = useTurnSelector(state => `${state.streaming.length}:${state.streamPendingTools.length}:${state.streamSegments.length}:${state.reasoning.length}:${state.tools.length}:${state.turnTrail.length}:${state.subagents.length}`);
+  const streamingLiveTail = useTurnSelector(state => Boolean(state.streaming.trim()));
+  const liveScrollFingerprint = useTurnSelector(state_0 => `${state_0.streaming.length}:${state_0.reasoning.length}:${state_0.streamSegments.length}`);
   const prevBusyRef = useRef(busy);
   const prevLiveTailRef = useRef(liveTailActive);
+  const debugScrollBurstRef = useRef({
+    count: 0,
+    windowStart: 0
+  });
+  const debugTailFlagsRef = useRef({
+    live: false,
+    stream: false
+  });
   const msgIdsRef = useRef(new WeakMap());
   const msgIdSeqRef = useRef(0);
   const heightCachesRef = useRef(new Map());
@@ -99,7 +109,9 @@ export function useTranscriptVirtual(opts) {
   }, [heightCache]);
   const virtualHistory = useVirtualHistory(scrollRef, virtualRows, cols, {
     initialHeights,
-    liveTailActive,
+    // Only growing stream text disables the bottomSpacer yoga cap — tools-only
+    // live UI must keep the cap or virtual spacers balloon and corrupt the frame.
+    liveTailActive: streamingLiveTail,
     onHeightsChange: syncHeightCache
   });
   const transcriptLenRef = useRef(0);
@@ -278,6 +290,28 @@ export function useTranscriptVirtual(opts) {
       return;
     }
     scrollTranscriptToBottom();
+    // #region agent log
+    {
+      const now_0 = Date.now();
+      const burst = debugScrollBurstRef.current;
+      if (now_0 - burst.windowStart > 500) {
+        burst.windowStart = now_0;
+        burst.count = 0;
+      }
+      burst.count++;
+      const s_5 = scrollRef.current;
+      const snap_2 = s_5 ? getViewportSnapshot(s_5) : null;
+      debugSessionLog('useTranscriptVirtual.ts:liveTailScroll', 'live tail scroll effect', {
+        burstCount: burst.count,
+        liveScrollFingerprint,
+        liveTailActive,
+        scrollTop: s_5?.getScrollTop() ?? -1,
+        streamingLiveTail,
+        atBottom: snap_2?.atBottom ?? false,
+        viewportHeight: snap_2?.viewportHeight ?? 0
+      }, 'B');
+    }
+    // #endregion
     let frame = 0;
     let cancelled_0 = false;
     const settle = () => {
@@ -285,8 +319,8 @@ export function useTranscriptVirtual(opts) {
         return;
       }
       scrollTranscriptToBottom();
-      const snap_2 = getViewportSnapshot(scrollRef.current);
-      if (!snap_2.atBottom) {
+      const snap_3 = getViewportSnapshot(scrollRef.current);
+      if (!snap_3.atBottom) {
         requestAnimationFrame(settle);
       }
     };
@@ -294,7 +328,28 @@ export function useTranscriptVirtual(opts) {
     return () => {
       cancelled_0 = true;
     };
-  }, [liveTailActive, liveTailFingerprint, scrollRef, scrollTranscriptToBottom, virtualHistory.end, virtualRows.length]);
+  }, [liveTailActive, liveScrollFingerprint, scrollRef, scrollTranscriptToBottom]);
+  useEffect(() => {
+    const prev = debugTailFlagsRef.current;
+    if (prev.live === liveTailActive && prev.stream === streamingLiveTail) {
+      return;
+    }
+    debugTailFlagsRef.current = {
+      live: liveTailActive,
+      stream: streamingLiveTail
+    };
+    // #region agent log
+    debugSessionLog('useTranscriptVirtual.ts:tailFlags', 'tail flags changed', {
+      bottomSpacer: virtualHistory.bottomSpacer,
+      liveScrollFingerprint,
+      liveTailActive,
+      streamingLiveTail,
+      virtualEnd: virtualHistory.end,
+      virtualRows: virtualRows.length,
+      virtualStart: virtualHistory.start
+    }, 'D');
+    // #endregion
+  }, [liveTailActive, liveScrollFingerprint, streamingLiveTail, virtualHistory.bottomSpacer, virtualHistory.end, virtualHistory.start, virtualRows.length]);
   return {
     virtualHistory,
     virtualRows

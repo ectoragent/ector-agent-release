@@ -1,4 +1,5 @@
 import { useCallback, useDeferredValue, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
+import { debugSessionLog } from '../lib/debugSessionLog.js';
 const ESTIMATE = 4;
 // Overscan was 40 (= viewport) which is way more than needed when heights
 // are well-estimated.  Cutting in half saves ~20 mounted items per scroll
@@ -89,6 +90,7 @@ export function useVirtualHistory(scrollRef, items, columns, {
   const prevItemsHeadRef = useRef(undefined);
   const prevItemCountRef = useRef(0);
   const forceTailFollowRef = useRef(false);
+  const debugSpacerSigRef = useRef('');
   // Width change: scale cached heights by oldCols/newCols instead of clearing
   // (clearing forces a pessimistic back-walk mounting ~190 rows at once, each
   // a fresh marked.lexer + syntax highlight ≈ 3ms). Freeze the mount range
@@ -418,6 +420,9 @@ export function useVirtualHistory(scrollRef, items, columns, {
   });
   let topSpacer = offsets[effStart] ?? 0;
   let bottomSpacer = Math.max(0, total - (offsets[effEnd] ?? total));
+  let rawBottomSpacer = bottomSpacer;
+  let yogaBottom = 0;
+  let mountedSum = 0;
   // When per-item estimates overshoot rendered height (large tables truncated
   // in MessageLine), total - offsets[end] invents a huge bottomSpacer and the
   // user scrolls through blank rows. Tie spacers to Yoga when possible.
@@ -425,7 +430,7 @@ export function useVirtualHistory(scrollRef, items, columns, {
   // so capping bottomSpacer to (reported - mounted) double-counts stream height
   // and invents blank rows the user scrolls through at the tail.
   if (s_0 && reportedScrollH > 0 && vp > 0 && !liveTailActive) {
-    let mountedSum = 0;
+    mountedSum = 0;
     for (let i_3 = effStart; i_3 < effEnd; i_3++) {
       const k_2 = items[i_3]?.key;
       if (!k_2) {
@@ -434,12 +439,37 @@ export function useVirtualHistory(scrollRef, items, columns, {
       const measured = measuredHeight(nodes.current.get(k_2));
       mountedSum += measured > 0 ? measured : Math.max(1, Math.floor(heights.current.get(k_2) ?? estimate));
     }
-    const yogaBottom = Math.max(0, reportedScrollH - topSpacer - mountedSum);
+    yogaBottom = Math.max(0, reportedScrollH - topSpacer - mountedSum);
     bottomSpacer = Math.min(bottomSpacer, yogaBottom);
     if (!nearBottom) {
       topSpacer = Math.min(topSpacer, target_0);
     }
   }
+  // #region agent log
+  {
+    const sig = `${bottomSpacer}|${rawBottomSpacer}|${effStart}|${effEnd}|${liveTailActive}|${vp}`;
+    const capApplied = rawBottomSpacer > bottomSpacer + 1;
+    const suspicious = bottomSpacer > Math.max(vp * 2, 80) || capApplied;
+    if (suspicious && sig !== debugSpacerSigRef.current) {
+      debugSpacerSigRef.current = sig;
+      debugSessionLog('useVirtualHistory.ts:spacers', 'virtual spacer anomaly', {
+        bottomSpacer,
+        capApplied,
+        effEnd,
+        effStart,
+        itemCount: items.length,
+        liveTailActive,
+        mountedSum,
+        rawBottomSpacer,
+        reportedScrollH,
+        topSpacer,
+        total,
+        viewportHeight: vp,
+        yogaBottom
+      }, capApplied ? 'C' : 'A');
+    }
+  }
+  // #endregion
   return {
     bottomSpacer,
     end: effEnd,

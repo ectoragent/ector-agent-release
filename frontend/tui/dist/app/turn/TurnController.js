@@ -1,6 +1,7 @@
 import { REASONING_PULSE_MS, STREAM_BATCH_MS, STREAM_HEAVY_BATCH_MS, STREAM_HEAVY_CHARS, STREAM_IDLE_BATCH_MS, STREAM_SCROLL_BATCH_MS, STREAM_TYPING_BATCH_MS } from '../../config/timing.js';
 import { INTERRUPT_USER_LABEL, STATUS } from '../../content/uiStatus.js';
 import { appendToolShelfMessage, isToolShelfMessage } from '../../lib/liveProgress.js';
+import { debugSessionLog } from '../../lib/debugSessionLog.js';
 import { hasReasoningTag, splitReasoning } from '../../lib/reasoning.js';
 import { boundedLiveRenderText, buildToolTrailLine, estimateTokensRough, isTransientTrailLine, sameToolTrailGroup } from '../../lib/text.js';
 import { estimateMarkdownBodyLines } from '../../lib/virtualHeights.js';
@@ -538,6 +539,10 @@ export class TurnController {
     }, STREAM_BATCH_MS);
   }
   recordToolStart(toolId, name, context, technical = '') {
+    // #region agent log
+    const preStreaming = this.bufRef.trim();
+    const preSegments = this.segmentMessages.length;
+    // #endregion
     this.flushStreamingSegment();
     this.closeReasoningSegment();
     this.pruneTransient();
@@ -557,6 +562,17 @@ export class TurnController {
       toolTokens: this.toolTokenAcc,
       tools: this.activeTools
     });
+    // #region agent log
+    debugSessionLog('TurnController.ts:recordToolStart', 'tool.start state transition', {
+      contextLen: context.length,
+      name,
+      postSegments: this.segmentMessages.length,
+      postTools: this.activeTools.length,
+      preSegments,
+      preStreamingLen: preStreaming.length,
+      toolId
+    }, 'E');
+    // #endregion
   }
   reset() {
     this.clearReasoning();
