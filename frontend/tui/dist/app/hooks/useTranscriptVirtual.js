@@ -2,11 +2,13 @@ import { MANUAL_SCROLL_GRACE_MS, maxScrollTop } from '@ector/ink';
 import { useStore } from '@nanostores/react';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef } from 'react';
 import { FULL_RENDER_TAIL_ITEMS } from '../../config/limits.js';
+import { TYPING_IDLE_MS } from '../../config/timing.js';
 import { sectionMode } from '../../domain/details.js';
 import { useVirtualHistory } from '../../hooks/useVirtualHistory.js';
 import { getViewportSnapshot } from '../../lib/viewportStore.js';
 import { estimatedMsgHeight, isHeavyTranscriptMessage, messageHeightKey } from '../../lib/virtualHeights.js';
 import { shouldClearHeightCacheOnBusyEnd, shouldFollowNewHistoryAtBottom } from '../transcriptVirtualLogic.js';
+import { turnController } from '../turnController.js';
 import { $uiState } from '../uiStore.js';
 const MAX_HEIGHT_CACHE_BUCKETS = 12;
 export function useTranscriptVirtual(opts) {
@@ -93,6 +95,32 @@ export function useTranscriptVirtual(opts) {
   const transcriptLenRef = useRef(0);
   const prevSidRef = useRef(undefined);
   const chaseBottomRef = useRef(false);
+  const lastManualScrollAtRef = useRef(0);
+  const scrollBoostTimerRef = useRef(null);
+  useEffect(() => {
+    const s = scrollRef.current;
+    if (!s) {
+      return;
+    }
+    const unsub = s.subscribe(() => {
+      const manualAt = s.getLastManualScrollAt();
+      if (!manualAt || manualAt === lastManualScrollAtRef.current || !busy) {
+        return;
+      }
+      lastManualScrollAtRef.current = manualAt;
+      turnController.boostStreamingForScroll();
+      clearTimeout(scrollBoostTimerRef.current ?? undefined);
+      scrollBoostTimerRef.current = setTimeout(() => {
+        scrollBoostTimerRef.current = null;
+        turnController.relaxStreaming();
+      }, TYPING_IDLE_MS);
+    });
+    return () => {
+      clearTimeout(scrollBoostTimerRef.current ?? undefined);
+      scrollBoostTimerRef.current = null;
+      unsub();
+    };
+  }, [busy, scrollRef]);
   useEffect(() => {
     const wasBusy = prevBusyRef.current;
     prevBusyRef.current = busy;
@@ -107,16 +135,16 @@ export function useTranscriptVirtual(opts) {
     }
   }, [busy, scrollRef, sid]);
   const scrollTranscriptToBottom = useCallback(contentHeight => {
-    const s = scrollRef.current;
-    if (!s) {
+    const s_0 = scrollRef.current;
+    if (!s_0) {
       return;
     }
-    s.setClampBounds(undefined, undefined);
-    const vp = s.getViewportHeight();
+    s_0.setClampBounds(undefined, undefined);
+    const vp = s_0.getViewportHeight();
     if (contentHeight != null && contentHeight > 0 && vp > 0) {
-      s.scrollTo(Math.max(0, contentHeight - vp));
+      s_0.scrollTo(Math.max(0, contentHeight - vp));
     }
-    s.scrollToBottom();
+    s_0.scrollToBottom();
     queueMicrotask(() => {
       const sb = scrollRef.current;
       if (!sb) {
@@ -144,13 +172,13 @@ export function useTranscriptVirtual(opts) {
       return;
     }
     if (len > transcriptLenRef.current) {
-      const s_0 = scrollRef.current;
-      const snap = getViewportSnapshot(s_0);
+      const s_1 = scrollRef.current;
+      const snap = getViewportSnapshot(s_1);
       transcriptLenRef.current = len;
-      if (s_0 && shouldFollowNewHistoryAtBottom({
+      if (s_1 && shouldFollowNewHistoryAtBottom({
         atBottom: snap.atBottom,
-        isSticky: s_0.isSticky(),
-        lastManualScrollAt: s_0.getLastManualScrollAt() || 0,
+        isSticky: s_1.isSticky(),
+        lastManualScrollAt: s_1.getLastManualScrollAt() || 0,
         manualGraceMs: MANUAL_SCROLL_GRACE_MS,
         now: Date.now(),
         viewportHeight: snap.viewportHeight
@@ -172,8 +200,8 @@ export function useTranscriptVirtual(opts) {
         chaseBottomRef.current = false;
         return;
       }
-      const s_1 = scrollRef.current;
-      if (s_1 && Date.now() - s_1.getLastManualScrollAt() < 2500) {
+      const s_2 = scrollRef.current;
+      if (s_2 && Date.now() - s_2.getLastManualScrollAt() < 2500) {
         chaseBottomRef.current = false;
         return;
       }
@@ -194,25 +222,25 @@ export function useTranscriptVirtual(opts) {
     if (!liveTailActive) {
       return;
     }
-    const s_2 = scrollRef.current;
-    if (!s_2) {
+    const s_3 = scrollRef.current;
+    if (!s_3) {
       return;
     }
     // scrollBy clears stickyScroll; do not snap back while the user reads
     // history (each stream paint used to call scrollToBottom and felt stuck).
-    if (!s_2.isSticky() || Date.now() - s_2.getLastManualScrollAt() < MANUAL_SCROLL_GRACE_MS) {
+    if (!s_3.isSticky() || Date.now() - s_3.getLastManualScrollAt() < MANUAL_SCROLL_GRACE_MS) {
       return;
     }
-    const scrollH = Math.max(s_2.getScrollHeight(), s_2.getFreshScrollHeight?.() ?? 0);
-    const vp_0 = Math.max(0, s_2.getViewportHeight());
+    const scrollH = Math.max(s_3.getScrollHeight(), s_3.getFreshScrollHeight?.() ?? 0);
+    const vp_0 = Math.max(0, s_3.getViewportHeight());
     const maxTop = maxScrollTop(scrollH, vp_0);
-    const cur = s_2.getScrollTop() + s_2.getPendingDelta();
+    const cur = s_3.getScrollTop() + s_3.getPendingDelta();
     // Already docked — skip redundant scrollTo (was causing micro-jitter at bottom).
     if (cur >= maxTop - 1) {
       return;
     }
-    s_2.setClampBounds(undefined, undefined);
-    s_2.scrollTo(maxTop);
+    s_3.setClampBounds(undefined, undefined);
+    s_3.scrollTo(maxTop);
   }, [liveTailActive, scrollRef, virtualHistory.bottomSpacer, virtualHistory.end, virtualHistory.offsets, virtualHistory.topSpacer, virtualRows.length]);
   return {
     virtualHistory,

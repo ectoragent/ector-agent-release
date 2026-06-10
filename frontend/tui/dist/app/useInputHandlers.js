@@ -32,22 +32,52 @@ export function useInputHandlers(ctx) {
   const isBlocked = useStore($isBlocked);
   const pagerPageSize = Math.max(5, (terminal.stdout?.rows ?? 24) - 6);
   const scrollIdleTimer = useRef(null);
+  const pendingScrollRef = useRef(0);
+  const scrollRafRef = useRef(null);
   const lastCtrlCRef = useRef(0);
   // Wheel accel ported from claude-code: inter-event timing drives step size,
   // direction flips reset. wheelStep (WHEEL_SCROLL_STEP) is the base; final
   // rows = wheelStep × accelMult. State mutates in place across renders.
   const wheelAccelRef = useRef(initWheelAccelForHost());
-  useEffect(() => () => clearTimeout(scrollIdleTimer.current ?? undefined), []);
-  const scrollTranscript = delta => {
-    if (getUiState().busy) {
-      turnController.boostStreamingForScroll();
-      clearTimeout(scrollIdleTimer.current ?? undefined);
-      scrollIdleTimer.current = setTimeout(() => {
-        scrollIdleTimer.current = null;
-        turnController.relaxStreaming();
-      }, TYPING_IDLE_MS);
+  useEffect(() => () => {
+    clearTimeout(scrollIdleTimer.current ?? undefined);
+    if (scrollRafRef.current !== null) {
+      cancelAnimationFrame(scrollRafRef.current);
     }
+  }, []);
+  const relaxScrollBoost = () => {
+    clearTimeout(scrollIdleTimer.current ?? undefined);
+    scrollIdleTimer.current = setTimeout(() => {
+      scrollIdleTimer.current = null;
+      turnController.relaxStreaming();
+    }, TYPING_IDLE_MS);
+  };
+  const boostScrollWhileBusy = () => {
+    if (!getUiState().busy) {
+      return;
+    }
+    turnController.boostStreamingForScroll();
+    relaxScrollBoost();
+  };
+  const flushPendingScroll = () => {
+    scrollRafRef.current = null;
+    const delta = pendingScrollRef.current;
+    pendingScrollRef.current = 0;
+    if (!delta) {
+      return;
+    }
+    boostScrollWhileBusy();
     terminal.scrollWithSelection(delta);
+  };
+  const scrollTranscript = delta_0 => {
+    if (!delta_0) {
+      return;
+    }
+    pendingScrollRef.current += delta_0;
+    if (scrollRafRef.current !== null) {
+      return;
+    }
+    scrollRafRef.current = requestAnimationFrame(flushPendingScroll);
   };
   const copySelection = () => {
     void terminal.selection.copySelection();
@@ -196,7 +226,7 @@ export function useInputHandlers(ctx) {
             pager: null
           });
         }
-        const move = delta_0 => patchOverlayState(prev => {
+        const move = delta_1 => patchOverlayState(prev => {
           if (!prev.pager) {
             return prev;
           }
@@ -205,7 +235,7 @@ export function useInputHandlers(ctx) {
             offset
           } = prev.pager;
           const max = Math.max(0, lines.length - pagerPageSize);
-          const step = delta_0 === 'top' ? -lines.length : delta_0 === 'bottom' ? lines.length : delta_0;
+          const step = delta_1 === 'top' ? -lines.length : delta_1 === 'bottom' ? lines.length : delta_1;
           const next_0 = Math.max(0, Math.min(offset + step, max));
           return next_0 === offset ? prev : {
             ...prev,

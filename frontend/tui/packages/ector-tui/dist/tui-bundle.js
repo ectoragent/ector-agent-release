@@ -1127,10 +1127,11 @@ var stripMouseLeakFragments = (text) => {
 // src/lib/inputPipeline.ts
 var createSwallowMouseSequence = (mouseParser) => {
   return (sequence) => {
-    if (sequenceContainsMouseLeak(sequence) || isMouseInputLeak(sequence)) {
-      return true;
+    const event = mouseParser.parseMouseEvent(Buffer.from(sequence));
+    if (event !== null) {
+      return event.type !== "scroll";
     }
-    return mouseParser.parseMouseEvent(Buffer.from(sequence)) !== null;
+    return sequenceContainsMouseLeak(sequence) || isMouseInputLeak(sequence);
   };
 };
 

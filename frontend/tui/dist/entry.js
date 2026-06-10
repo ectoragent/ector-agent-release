@@ -34,8 +34,10 @@ const stopMemoryMonitor = startMemoryMonitor({
 if (process.env.ECTOR_HEAPDUMP_ON_START === '1') {
   void performHeapDump('manual');
 }
+// Do not call shutdownTui() here — a momentarily idle loop must not tear down
+// the renderer while the gateway child is still running (leaves alt-screen and
+// scrolls the host terminal scrollback).
 process.on('beforeExit', () => {
-  shutdownTui();
   stopMemoryMonitor();
 });
 const [ink, {

@@ -338,7 +338,7 @@ def _optional_update_row() -> Optional[Tuple[str, str]]:
     )
 
 
-def print_version_screen() -> None:
+def print_version_screen(*, version_label: str | None = None) -> None:
     """Print a TUI-aligned version screen (``ector version`` / ``--version``)."""
     console = Console(highlight=False)
     width = shutil.get_terminal_size((80, 24)).columns
@@ -350,8 +350,9 @@ def print_version_screen() -> None:
     sys.stdout.flush()
 
     console.print()
+    label = (version_label or "").strip() or format_version_label()
     console.print(
-        f"[{_TUI_DIM}]{format_version_label()}[/]",
+        f"[{_TUI_DIM}]{label}[/]",
         justify="center",
     )
 

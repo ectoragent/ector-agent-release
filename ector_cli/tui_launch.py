@@ -109,11 +109,38 @@ def snapshot_tui_prebuild_cache(tui_dir: Path) -> None:
         pass
 
 
-def restore_tui_prebuild_from_package(tui_dir: Path) -> bool:
-    """Restore release dist from ``ector_cli/bundled_tui`` (shipped in every release wheel)."""
-    src_entry = _bundled_tui_dir() / "entry.js"
-    src_bundle = _bundled_tui_dir() / "tui-bundle.js"
-    if not src_entry.is_file() or not src_bundle.is_file():
+def _bundled_tui_source_dirs(install_root: Path | None) -> list[Path]:
+    dirs: list[Path] = []
+    seen: set[str] = set()
+    for candidate in (
+        _bundled_tui_dir(),
+        (install_root / "ector_cli" / "bundled_tui") if install_root is not None else None,
+    ):
+        if candidate is None:
+            continue
+        key = str(candidate.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        dirs.append(candidate)
+    return dirs
+
+
+def restore_tui_prebuild_from_package(
+    tui_dir: Path,
+    install_root: Path | None = None,
+) -> bool:
+    """Restore release dist from ``ector_cli/bundled_tui`` (wheel or git checkout)."""
+    src_entry = None
+    src_bundle = None
+    for bundled in _bundled_tui_source_dirs(install_root):
+        entry = bundled / "entry.js"
+        bundle = bundled / "tui-bundle.js"
+        if entry.is_file() and bundle.is_file():
+            src_entry = entry
+            src_bundle = bundle
+            break
+    if src_entry is None or src_bundle is None:
         return False
     entry = tui_dir / "dist" / "entry.js"
     bundle = tui_dir / "packages" / "ector-tui" / "dist" / "tui-bundle.js"
@@ -255,7 +282,7 @@ def ensure_tui_prebuild_artifacts(install_root: Path) -> bool:
         tui_dir, install_root
     ):
         return True
-    if restore_tui_prebuild_from_package(tui_dir) and _finalize_tui_prebuild_restore(
+    if restore_tui_prebuild_from_package(tui_dir, install_root) and _finalize_tui_prebuild_restore(
         tui_dir, install_root
     ):
         return True

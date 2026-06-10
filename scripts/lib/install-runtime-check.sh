@@ -445,7 +445,7 @@ import sys
 from ector_cli.tui_launch import ensure_tui_prebuild_artifacts
 root = Path(os.environ["_PY_ENSURE_ROOT"])
 sys.exit(0 if ensure_tui_prebuild_artifacts(root) else 1)
-' 2>/dev/null
+'
 }
 
 finalize_ector_tui_after_update() {

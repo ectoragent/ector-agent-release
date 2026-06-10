@@ -12,7 +12,9 @@ export function useMouseTrackingSync(enabled) {
       if (!renderer || renderer.isDestroyed) {
         return;
       }
-      renderer.useMouse = enabled;
+      if (renderer.useMouse !== enabled) {
+        renderer.useMouse = enabled;
+      }
     };
     t1 = [enabled];
     $[0] = enabled;

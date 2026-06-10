@@ -1302,11 +1302,30 @@ SOUL_EOF
 }
 
 install_node_deps() {
-    if [ "$HAS_NODE" = false ]; then
+    if [ "$DISTRO" = "termux" ]; then
         return 0
     fi
 
-    if [ "$DISTRO" = "termux" ]; then
+    # Update: repair prebuilt TUI dist before Node/Bun gates (copy only needs Python).
+    if _is_update_mode && [ -f "$INSTALL_DIR/frontend/tui/package.json" ]; then
+        _INSTALL_RUNTIME_LIB="${_INSTALL_RUNTIME_LIB:-$INSTALL_DIR/scripts/lib/install-runtime-check.sh}"
+        if [ ! -f "$_INSTALL_RUNTIME_LIB" ]; then
+            _INSTALL_RUNTIME_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/install-runtime-check.sh"
+        fi
+        if [ -f "$_INSTALL_RUNTIME_LIB" ]; then
+            # shellcheck source=scripts/lib/install-runtime-check.sh
+            # shellcheck disable=SC1090
+            source "$_INSTALL_RUNTIME_LIB"
+            if declare -F _install_step >/dev/null 2>&1; then
+                _install_step "Chat no terminal (reparo)" _py_ensure_tui_prebuild "$INSTALL_DIR" || return 1
+            else
+                restore_ector_tui_prebuild_from_git "$INSTALL_DIR" || true
+                _py_ensure_tui_prebuild "$INSTALL_DIR" || return 1
+            fi
+        fi
+    fi
+
+    if [ "$HAS_NODE" = false ]; then
         return 0
     fi
 
@@ -1362,14 +1381,13 @@ install_node_deps() {
                 if _is_update_mode; then
                     install_ector_tui_deps "$INSTALL_DIR" || return 1
                     build_ector_tui "$INSTALL_DIR" || return 1
-                    finalize_ector_tui_after_update "$INSTALL_DIR" || return 1
+                    finalize_ector_tui_after_update "$INSTALL_DIR" || true
                 else
                     install_ector_tui_deps "$INSTALL_DIR" || true
                     build_ector_tui "$INSTALL_DIR" || true
                 fi
             elif _is_update_mode; then
                 _install_step_warn "Runtime Bun (necessário para ector chat)"
-                return 1
             else
                 _install_step_warn "Runtime Bun (necessário para ector chat)"
             fi
