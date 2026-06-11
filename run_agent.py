@@ -5028,7 +5028,7 @@ class AIAgent:
 
         prompt_parts.append(USER_FACING_RESPONSE_GUIDANCE)
 
-        # Pointer to the ector-agent skill + docs (only when skills tools are loaded).
+        # Ector CLI/docs guidance (only when skills tools are loaded).
         if has_skills_index_tools(self.valid_tool_names):
             prompt_parts.append(ECTOR_AGENT_HELP_GUIDANCE)
         prompt_parts.append(EXPLICIT_ITERATIVE_WORKFLOW_GUIDANCE)

@@ -1,6 +1,6 @@
 import { REASONING_PULSE_MS, STREAM_BATCH_MS, STREAM_HEAVY_BATCH_MS, STREAM_HEAVY_CHARS, STREAM_IDLE_BATCH_MS, STREAM_SCROLL_BATCH_MS, STREAM_TYPING_BATCH_MS } from '../../config/timing.js';
 import { INTERRUPT_USER_LABEL, STATUS } from '../../content/uiStatus.js';
-import { appendToolShelfMessage, isToolShelfMessage } from '../../lib/liveProgress.js';
+import { appendToolShelfMessage } from '../../lib/liveProgress.js';
 import { hasReasoningTag, splitReasoning } from '../../lib/reasoning.js';
 import { boundedLiveRenderText, buildToolTrailLine, estimateTokensRough, isTransientTrailLine, sameToolTrailGroup } from '../../lib/text.js';
 import { estimateMarkdownBodyLines } from '../../lib/virtualHeights.js';
@@ -192,6 +192,9 @@ export class TurnController {
   }
   pushSegment(msg) {
     this.segmentMessages = appendToolShelfMessage(this.segmentMessages, msg);
+    patchTurnState({
+      streamSegments: this.segmentMessages
+    });
   }
   flushStreamingSegment() {
     const raw = this.bufRef.trimStart();
@@ -216,9 +219,6 @@ export class TurnController {
       text: split.text,
       ...(!split.text && {
         kind: 'trail'
-      }),
-      ...(this.pendingSegmentTools.length && {
-        tools: this.pendingSegmentTools
       })
     };
     this.streamTimer = clear(this.streamTimer);
@@ -366,26 +366,26 @@ export class TurnController {
     const existingReasoning = this.reasoningText.trim() || String(payload.reasoning ?? '').trim();
     const savedReasoning = [existingReasoning, existingReasoning ? '' : split.reasoning].filter(Boolean).join('\n\n');
     const savedToolTokens = this.toolTokenAcc;
-    let tools = this.pendingSegmentTools;
-    const last = this.segmentMessages[this.segmentMessages.length - 1];
-    if (tools.length && isToolShelfMessage(last)) {
-      this.segmentMessages = [...this.segmentMessages.slice(0, -1), {
-        ...last,
-        tools: [...(last.tools ?? []), ...tools]
-      }];
-      this.pendingSegmentTools = [];
-      tools = [];
-    }
+    const orphanTools = this.pendingSegmentTools;
+    this.pendingSegmentTools = [];
     // Drop diff-only segments the agent is about to narrate in the final
     // reply. Without this, a closing "here's the diff …" message would
     // render two stacked copies of the same patch. Only touches segments
     // with `kind: 'diff'` emitted by pushInlineDiffSegment — real
     // assistant narration stays put.
     const finalHasOwnDiffFence = /```(?:diff|patch)\b/i.test(finalText);
-    const segments = this.segmentMessages.filter(msg => {
+    let segments = this.segmentMessages.filter(msg => {
       const body = diffSegmentBody(msg);
       return body === null || !finalHasOwnDiffFence && !finalText.includes(body);
     });
+    for (const line of orphanTools) {
+      segments = appendToolShelfMessage(segments, {
+        kind: 'trail',
+        role: 'system',
+        text: '',
+        tools: [line]
+      });
+    }
     const hasReasoningSegment = this.reasoningSegmentIndex !== null || segments.some(msg => Boolean(msg.thinking?.trim()));
     const finalThinking = hasReasoningSegment ? '' : savedReasoning.trim();
     const finalDetails = {
@@ -394,19 +394,16 @@ export class TurnController {
       text: '',
       thinking: finalThinking || undefined,
       thinkingTokens: finalThinking ? estimateTokensRough(finalThinking) : undefined,
-      toolTokens: savedToolTokens || undefined,
-      ...(tools.length && {
-        tools
-      })
+      toolTokens: savedToolTokens || undefined
     };
-    // Archive prepended so the trail msg anchors under the user prompt,
-    // not between thinking/tools and final assistant text.
-    const finalMessages = [...archiveDoneTodos(), ...segments, ...(hasDetails(finalDetails) ? [finalDetails] : [])];
+    const finalMessages = [...archiveDoneTodos(), ...(hasDetails(finalDetails) && finalThinking ? [finalDetails] : []), ...segments];
     if (finalText) {
       finalMessages.push({
         role: 'assistant',
         text: finalText
       });
+    } else if (hasDetails(finalDetails) && !finalThinking) {
+      finalMessages.push(finalDetails);
     }
     const wasInterrupted = this.interrupted;
     // Archive the turn's spawn tree to history BEFORE idle() drops subagents
@@ -487,8 +484,13 @@ export class TurnController {
   recordToolComplete(toolId, fallbackName, error, summary, duration, todos) {
     this.recordTodos(todos);
     const line = this.completeTool(toolId, fallbackName, error, summary, duration);
-    this.pendingSegmentTools = [...this.pendingSegmentTools, line];
-    this.flushPendingToolsIntoLastSegment();
+    this.pushSegment({
+      kind: 'trail',
+      role: 'system',
+      text: '',
+      tools: [line]
+    });
+    this.pendingSegmentTools = [];
     this.publishToolState();
   }
   recordInlineDiffToolComplete(diffText, toolId, fallbackName, error, duration) {

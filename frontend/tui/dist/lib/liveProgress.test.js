@@ -65,7 +65,7 @@ describe('tool shelf helpers', () => {
   });
 });
 describe('appendToolShelfMessage', () => {
-  it('merges adjacent tool shelves into one contextual shelf', () => {
+  it('keeps adjacent tool-only shelves separate for interleaved narration', () => {
     const merged = appendToolShelfMessage([{
       kind: 'trail',
       role: 'system',
@@ -77,12 +77,9 @@ describe('appendToolShelfMessage', () => {
       text: '',
       tools: ['two ✓']
     });
-    expect(merged).toEqual([{
-      kind: 'trail',
-      role: 'system',
-      text: '',
-      tools: ['one ✓', 'two ✓']
-    }]);
+    expect(merged).toHaveLength(2);
+    expect(merged[0]?.tools).toEqual(['one ✓']);
+    expect(merged[1]?.tools).toEqual(['two ✓']);
   });
   it('adds tools to the nearest contextual thinking shelf', () => {
     const merged = appendToolShelfMessage([{
@@ -139,7 +136,7 @@ describe('appendToolShelfMessage', () => {
       thinking: 'more plan'
     });
   });
-  it('collapses a chronological thinking/tool/thinking/tool stream into one shelf', () => {
+  it('merges tools into thinking shelves but keeps tool-only shelves separate', () => {
     const events = [{
       kind: 'trail',
       role: 'system',

@@ -1444,3 +1444,163 @@ def list_authenticated_providers(
     results.sort(key=lambda r: (not r["is_current"], -r["total_models"]))
 
     return results
+
+
+def _models_from_provider_config(ep_cfg: dict) -> List[str]:
+    """Extract explicit model IDs from a ``providers:`` config entry."""
+    models_list: List[str] = []
+    default_model = ep_cfg.get("default_model", "") or ep_cfg.get("model", "")
+    if default_model:
+        models_list.append(str(default_model).strip())
+    cfg_models = ep_cfg.get("models", [])
+    if isinstance(cfg_models, dict):
+        for mid in cfg_models:
+            m = str(mid or "").strip()
+            if m and m not in models_list:
+                models_list.append(m)
+    elif isinstance(cfg_models, list):
+        for mid in cfg_models:
+            m = str(mid or "").strip()
+            if m and m not in models_list:
+                models_list.append(m)
+    return models_list
+
+
+def _custom_provider_display_name(raw_name: str) -> str:
+    display_name = (raw_name or "").strip()
+    for sep in ("—", " - "):
+        if sep in display_name:
+            display_name = display_name.split(sep)[0].strip()
+            break
+    return display_name or (raw_name or "").strip()
+
+
+def _collect_configured_provider_slugs(
+    cfg: dict | None,
+    *,
+    current_provider: str = "",
+) -> set[str]:
+    """Provider slugs the user explicitly set up in config.yaml."""
+    from ector_cli.config import get_compatible_custom_providers
+    from ector_cli.models import normalize_provider, resolve_display_provider_id
+    from ector_cli.providers import custom_provider_slug
+
+    slugs: set[str] = set()
+    cfg = cfg if isinstance(cfg, dict) else {}
+
+    display_id = resolve_display_provider_id(cfg)
+    if display_id:
+        slugs.add(str(display_id).strip().lower())
+
+    model_section = cfg.get("model") or {}
+    if isinstance(model_section, dict):
+        provider = str(model_section.get("provider") or "").strip().lower()
+        if provider and provider not in ("", "auto"):
+            slugs.add(normalize_provider(provider))
+
+    user_providers = cfg.get("providers") or {}
+    if isinstance(user_providers, dict):
+        for slug in user_providers:
+            s = str(slug).strip().lower()
+            if s:
+                slugs.add(s)
+
+    for entry in get_compatible_custom_providers(cfg):
+        if not isinstance(entry, dict):
+            continue
+        provider_key = str(entry.get("provider_key") or "").strip().lower()
+        if provider_key:
+            slugs.add(provider_key)
+        raw_name = str(entry.get("name") or "").strip()
+        if raw_name:
+            display_name = _custom_provider_display_name(raw_name)
+            if display_name:
+                slugs.add(custom_provider_slug(display_name).lower())
+
+    if current_provider:
+        slugs.add(str(current_provider).strip().lower())
+
+    return slugs
+
+
+def narrow_picker_providers_to_configured(
+    providers: List[dict],
+    *,
+    user_providers: dict | None = None,
+    config: dict | None = None,
+    current_model: str = "",
+    current_provider: str = "",
+) -> List[dict]:
+    """Keep only configured providers; show their full curated model lists.
+
+    ``list_authenticated_providers`` returns every provider with credentials
+    (including stray env keys). The web composer picker limits rows to providers
+    declared in ``model.provider``, ``providers:``, or ``custom_providers``,
+    then lists the curated catalog for each — not unrelated authenticated
+    providers.
+    """
+    from ector_cli.provider_model_catalog import get_recommended_models
+
+    cfg = config if isinstance(config, dict) else {}
+    if not cfg and isinstance(user_providers, dict):
+        cfg = {"providers": user_providers}
+
+    cfg_providers = cfg.get("providers") if isinstance(cfg.get("providers"), dict) else {}
+    if not isinstance(cfg_providers, dict):
+        cfg_providers = {}
+    if isinstance(user_providers, dict):
+        cfg_providers = {**cfg_providers, **user_providers}
+
+    configured_slugs = _collect_configured_provider_slugs(
+        cfg,
+        current_provider=current_provider,
+    )
+    if not configured_slugs:
+        return []
+
+    active_model = (current_model or "").strip()
+    active_provider = (current_provider or "").strip().lower()
+    narrowed: List[dict] = []
+
+    for row in providers or []:
+        if not isinstance(row, dict):
+            continue
+        slug = str(row.get("slug") or "").strip()
+        if not slug:
+            continue
+        slug_l = slug.lower()
+        if slug_l not in configured_slugs:
+            continue
+
+        ep_cfg = cfg_providers.get(slug) or cfg_providers.get(slug_l)
+        if isinstance(ep_cfg, dict):
+            models = _models_from_provider_config(ep_cfg)
+        else:
+            models = []
+
+        if not models:
+            models = [
+                str(m).strip()
+                for m in (row.get("models") or [])
+                if str(m).strip()
+            ]
+        if not models:
+            models = [
+                str(m).strip()
+                for m in get_recommended_models(slug)
+                if str(m).strip()
+            ]
+
+        if slug_l == active_provider and active_model and active_model not in models:
+            models = [active_model, *models]
+
+        if not models:
+            continue
+
+        item = dict(row)
+        item["models"] = models
+        item["total_models"] = len(models)
+        narrowed.append(item)
+
+    narrowed.sort(key=lambda r: (not r.get("is_current"), -int(r.get("total_models") or 0)))
+    return narrowed

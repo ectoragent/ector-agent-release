@@ -49,6 +49,28 @@ from ector_cli.config import get_ector_home
 
 logger = logging.getLogger(__name__)
 
+_PROCESS_ALREADY_EXITED_MSG = "O processo já foi encerrado"
+_PROCESS_STDIN_UNAVAILABLE_MSG = (
+    "Entrada do processo indisponível (backend remoto ou stdin fechado)"
+)
+_PROCESS_RECOVERED_KILL_MSG = (
+    "Não foi possível encerrar: o processo foi recuperado após reinício "
+    "e o handle original não está mais disponível"
+)
+
+
+def _session_not_found(session_id: str) -> dict:
+    """Payload pt-BR quando o ID de processo em segundo plano não existe."""
+    sid = (session_id or "").strip() or "?"
+    return {
+        "status": "not_found",
+        "error": (
+            f"Processo em segundo plano não encontrado ({sid}). "
+            "Pode já ter encerrado ou o registro expirou — use "
+            'process(action="list") para ver processos ativos.'
+        ),
+    }
+
 
 # Checkpoint file for crash recovery (gateway only)
 CHECKPOINT_PATH = get_ector_home() / "processes.json"
@@ -806,7 +828,7 @@ class ProcessRegistry:
 
         session = self.get(session_id)
         if session is None:
-            return {"status": "not_found", "error": f"No process with ID {session_id}"}
+            return _session_not_found(session_id)
 
         with session._lock:
             output_preview = strip_ansi(session.output_buffer[-1000:]) if session.output_buffer else ""
@@ -833,7 +855,7 @@ class ProcessRegistry:
 
         session = self.get(session_id)
         if session is None:
-            return {"status": "not_found", "error": f"No process with ID {session_id}"}
+            return _session_not_found(session_id)
 
         with session._lock:
             full_output = strip_ansi(session.output_buffer)
@@ -892,7 +914,7 @@ class ProcessRegistry:
 
         session = self.get(session_id)
         if session is None:
-            return {"status": "not_found", "error": f"No process with ID {session_id}"}
+            return _session_not_found(session_id)
 
         deadline = time.monotonic() + effective_timeout
 
@@ -935,7 +957,7 @@ class ProcessRegistry:
         """Kill a background process."""
         session = self.get(session_id)
         if session is None:
-            return {"status": "not_found", "error": f"No process with ID {session_id}"}
+            return _session_not_found(session_id)
 
         if session.exited:
             return {
@@ -978,10 +1000,7 @@ class ProcessRegistry:
             else:
                 return {
                     "status": "error",
-                    "error": (
-                        "Recovered process cannot be killed after restart because "
-                        "its original runtime handle is no longer available"
-                    ),
+                    "error": _PROCESS_RECOVERED_KILL_MSG,
                 }
             session.exited = True
             session.exit_code = -15  # SIGTERM
@@ -995,9 +1014,9 @@ class ProcessRegistry:
         """Send raw data to a running process's stdin (no newline appended)."""
         session = self.get(session_id)
         if session is None:
-            return {"status": "not_found", "error": f"No process with ID {session_id}"}
+            return _session_not_found(session_id)
         if session.exited:
-            return {"status": "already_exited", "error": "Process has already finished"}
+            return {"status": "already_exited", "error": _PROCESS_ALREADY_EXITED_MSG}
 
         # PTY mode -- write through pty handle (expects bytes)
         if hasattr(session, '_pty') and session._pty:
@@ -1010,7 +1029,7 @@ class ProcessRegistry:
 
         # Popen mode -- write through stdin pipe
         if not session.process or not session.process.stdin:
-            return {"status": "error", "error": "Process stdin not available (non-local backend or stdin closed)"}
+            return {"status": "error", "error": _PROCESS_STDIN_UNAVAILABLE_MSG}
         try:
             session.process.stdin.write(data)
             session.process.stdin.flush()
@@ -1026,22 +1045,22 @@ class ProcessRegistry:
         """Close a running process's stdin / send EOF without killing the process."""
         session = self.get(session_id)
         if session is None:
-            return {"status": "not_found", "error": f"No process with ID {session_id}"}
+            return _session_not_found(session_id)
         if session.exited:
-            return {"status": "already_exited", "error": "Process has already finished"}
+            return {"status": "already_exited", "error": _PROCESS_ALREADY_EXITED_MSG}
 
         if hasattr(session, '_pty') and session._pty:
             try:
                 session._pty.sendeof()
-                return {"status": "ok", "message": "EOF sent"}
+                return {"status": "ok", "message": "Fim de entrada (EOF) enviado"}
             except Exception as e:
                 return {"status": "error", "error": str(e)}
 
         if not session.process or not session.process.stdin:
-            return {"status": "error", "error": "Process stdin not available (non-local backend or stdin closed)"}
+            return {"status": "error", "error": _PROCESS_STDIN_UNAVAILABLE_MSG}
         try:
             session.process.stdin.close()
-            return {"status": "ok", "message": "stdin closed"}
+            return {"status": "ok", "message": "Entrada do processo fechada"}
         except Exception as e:
             return {"status": "error", "error": str(e)}
 
@@ -1326,7 +1345,9 @@ def _handle_process(args, **kw):
         return json.dumps({"processes": process_registry.list_sessions(task_id=task_id)}, ensure_ascii=False)
     elif action in ("poll", "log", "wait", "kill", "write", "submit", "close"):
         if not session_id:
-            return tool_error(f"session_id is required for {action}")
+            return tool_error(
+                f'session_id é obrigatório para a ação «{action}»'
+            )
         if action == "poll":
             return json.dumps(process_registry.poll(session_id), ensure_ascii=False)
         elif action == "log":
@@ -1342,7 +1363,10 @@ def _handle_process(args, **kw):
             return json.dumps(process_registry.submit_stdin(session_id, str(args.get("data", ""))), ensure_ascii=False)
         elif action == "close":
             return json.dumps(process_registry.close_stdin(session_id), ensure_ascii=False)
-    return tool_error(f"Unknown process action: {action}. Use: list, poll, log, wait, kill, write, submit, close")
+    return tool_error(
+        f'Ação de processo desconhecida: «{action}». '
+        "Use: list, poll, log, wait, kill, write, submit, close"
+    )
 
 
 registry.register(

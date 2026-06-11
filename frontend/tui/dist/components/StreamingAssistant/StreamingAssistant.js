@@ -7,14 +7,12 @@ import { toggleTodoCollapsed, useTurnSelector } from '../../app/turnStore.js';
 import { $uiState } from '../../app/uiStore.js';
 import { STATUS } from '../../content/uiStatus.js';
 import { sectionMode } from '../../domain/details.js';
-import { appendToolShelfMessage } from '../../lib/liveProgress.js';
 import { MessageLine } from '../MessageLine/index.js';
 import { ChatLoadingRow } from '../Thinking/components/ChatLoadingRow/index.js';
 import { Spinner } from '../Thinking/index.js';
 import { liveToolTrailProps } from '../Thinking/lib/liveToolTrail.js';
 import { TodoPanel } from '../TodoPanel/index.js';
 import { TranscriptCard } from '../TranscriptCard/index.js';
-const groupedSegments = segments => segments.reduce((acc, msg) => appendToolShelfMessage(acc, msg), []);
 function useLiveToolTrailFeed() {
   const $ = _c(10);
   const activity = useTurnSelector(_temp);
@@ -141,7 +139,7 @@ export const StreamingAssistant = memo(function StreamingAssistant(t0) {
         break bb0;
       }
       t4 = _jsx(Fragment, {
-        children: [...groupedSegments(streamSegments).map((msg, i) => _jsx(MessageLine, {
+        children: [...streamSegments.map((msg, i) => _jsx(MessageLine, {
           cols,
           compact,
           detailsMode,

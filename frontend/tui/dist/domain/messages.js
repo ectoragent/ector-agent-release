@@ -1,5 +1,5 @@
 import { LONG_MSG, MAX_HISTORY } from '../config/limits.js';
-import { buildToolTrailLine, fmtK } from '../lib/text.js';
+import { buildToolTrailLine, fmtK, inferToolFailedFromResult, toolFailureHeadline } from '../lib/text.js';
 export const introMsg = info => ({
   info,
   kind: 'intro',
@@ -73,23 +73,26 @@ export const toTranscriptMessages = rows => {
     if (role === 'tool') {
       const ctx = (context ?? '').trim();
       const tech = (technical ?? '').trim();
-      const note = tech && tech !== ctx ? tech : undefined;
-      pending.push(buildToolTrailLine(name ?? 'tool', ctx, false, note));
+      const resultText = (typeof text === 'string' ? text : '').trim();
+      const toolName = name ?? 'tool';
+      const failed = inferToolFailedFromResult(toolName, resultText);
+      const note = failed ? toolFailureHeadline(toolName, resultText) ?? (tech && tech !== ctx ? tech : undefined) : tech && tech !== ctx ? tech : undefined;
+      pending.push(buildToolTrailLine(toolName, ctx, failed, note));
       continue;
     }
     if (typeof text !== 'string' || !text.trim()) {
       continue;
     }
     if (role === 'assistant') {
-      if (pending.length) {
+      for (const line of pending) {
         out.push({
           kind: 'trail',
           role: 'system',
           text: '',
-          tools: [...pending]
+          tools: [line]
         });
-        pending = [];
       }
+      pending = [];
       out.push({
         role,
         text

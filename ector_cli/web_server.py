@@ -2041,6 +2041,57 @@ def get_chat_context(session_id: Optional[str] = None):
         }
 
 
+@app.get("/api/model/options")
+def get_model_options(session_id: Optional[str] = None):
+    """Authenticated providers + curated models for the web composer picker (TUI parity)."""
+    try:
+        from ector_cli.model_switch import list_authenticated_providers
+
+        cfg = load_config()
+        current_model, current_provider = _resolve_web_chat_model_for_footer()
+        sid = (session_id or "").strip()
+        if sid:
+            with _CHAT_AGENTS_LOCK:
+                agent = _CHAT_AGENTS.get(sid)
+            if agent is not None:
+                agent_model = getattr(agent, "model", None)
+                agent_provider = getattr(agent, "provider", None)
+                if agent_model and str(agent_model).strip():
+                    current_model = str(agent_model).strip()
+                if agent_provider and str(agent_provider).strip():
+                    current_provider = str(agent_provider).strip()
+        user_providers = (
+            cfg.get("providers") if isinstance(cfg.get("providers"), dict) else {}
+        )
+        custom_providers = (
+            cfg.get("custom_providers")
+            if isinstance(cfg.get("custom_providers"), list)
+            else []
+        )
+        providers = list_authenticated_providers(
+            current_provider=current_provider,
+            user_providers=user_providers,
+            custom_providers=custom_providers,
+            max_models=50,
+        )
+        from ector_cli.model_switch import narrow_picker_providers_to_configured
+
+        providers = narrow_picker_providers_to_configured(
+            providers,
+            config=cfg,
+            current_model=current_model,
+            current_provider=current_provider,
+        )
+        return {
+            "providers": providers,
+            "model": current_model,
+            "provider": current_provider,
+        }
+    except Exception:
+        _log.exception("GET /api/model/options failed")
+        return {"providers": [], "model": "", "provider": ""}
+
+
 @app.get("/api/model/info")
 def get_model_info(session_id: Optional[str] = None):
     """Return resolved model metadata for the currently configured model.
@@ -3828,6 +3879,19 @@ async def chat_send(request: Request):
         return _CHAT_SESSION_DB
 
     async def event_stream():
+        with _CHAT_AGENTS_LOCK:
+            if session_id in _CHAT_INFLIGHT:
+                yield (
+                    "data: TEXT|*Aguarde a resposta anterior terminar antes de enviar outra mensagem.*\n\n"
+                )
+                yield "data: DONE\n\n"
+                return
+            _mark_chat_inflight(session_id, request_id)
+
+        from ector_cli import web_chat_live as _web_chat_live
+
+        _web_chat_live.begin_turn(session_id, request_id)
+
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[str | None] = asyncio.Queue()
 
@@ -3848,14 +3912,28 @@ async def chat_send(request: Request):
             nonlocal streamed_text
             if chunk:
                 streamed_text = True
+                _web_chat_live.append_text(session_id, chunk)
                 _send("TEXT", chunk)
+
+        def on_stream_delta(delta):
+            if delta is None:
+                return
+            on_chunk(delta)
+
+        def on_interim_assistant(text: str, *, already_streamed: bool = False):
+            if already_streamed or not str(text or "").strip():
+                return
+            on_chunk(text)
 
         def on_status(kind: str, text: str = None):
             if text:
+                _web_chat_live.set_status(session_id, text)
                 _send("STATUS", text)
 
         def on_tool_start(tc_id, name, args):
             import json as _j
+            context = ""
+            technical = ""
             try:
                 from agent.display import (
                     build_tool_preview,
@@ -3876,12 +3954,23 @@ async def chat_send(request: Request):
                 )
             except Exception:
                 payload = f"{name}|{_j.dumps(args)[:200]}"
+            args_str = args if isinstance(args, str) else _j.dumps(args)
+            _web_chat_live.tool_start(
+                session_id,
+                tool_id=str(tc_id or ""),
+                name=str(name or "tool"),
+                args=args_str,
+                live_label=context,
+                live_technical=technical,
+            )
             _send("TOOL_START", payload)
 
         def on_tool_complete(tc_id, name, args, result):
             import json as _j
             if name in ("terminal", "shell", "process"):
                 _sync_web_session_cwd_from_env(session_id, allow_default_env=True)
+            footer_cwd = None
+            result_str = str(result) if result is not None else None
             try:
                 payload_obj: dict = {
                     "id": tc_id,
@@ -3892,13 +3981,19 @@ async def chat_send(request: Request):
                     if footer_cwd:
                         payload_obj["cwd"] = footer_cwd
                         payload_obj["cwd_label"] = _short_display_cwd(footer_cwd)
-                if result:
-                    result_str = str(result)
+                if result_str is not None:
                     if name == "text_to_speech" or len(result_str) <= 8192:
                         payload_obj["result"] = result_str
                 payload = _j.dumps(payload_obj, ensure_ascii=False)
             except Exception:
                 payload = name
+            _web_chat_live.tool_complete(
+                session_id,
+                tool_id=str(tc_id or ""),
+                name=str(name or "tool"),
+                result=result_str,
+                cwd=footer_cwd,
+            )
             _send("TOOL_COMPLETE", payload)
             if name == "text_to_speech" and result:
                 try:
@@ -4005,10 +4100,17 @@ async def chat_send(request: Request):
                 )
             except Exception:
                 payload = f"{event_type}|{name or ''}|{preview_text[:240]}"
+            _web_chat_live.tool_progress(
+                session_id,
+                tool_name=str(name or ""),
+                preview=preview_text,
+                technical=technical,
+            )
             _send("TOOL_PROGRESS", payload)
 
         def on_thinking(text: str):
             if text:
+                _web_chat_live.set_thinking(session_id)
                 _send("THINKING", text[:500])
 
         def on_approval_request(approval_data: dict):
@@ -4131,11 +4233,20 @@ async def chat_send(request: Request):
             agent.tool_progress_callback = on_tool_progress
             agent.thinking_callback = on_thinking
             agent.status_callback = on_status
+            agent.stream_delta_callback = on_stream_delta
+            _display_cfg = (load_config() or {}).get("display") or {}
+            _interim_raw = _display_cfg.get("interim_assistant_messages", True)
+            _interim_on = (
+                _interim_raw is not False
+                and str(_interim_raw).strip().lower() not in {"0", "false", "off", "no", "none"}
+            )
+            agent.interim_assistant_callback = (
+                on_interim_assistant if _interim_on else None
+            )
 
         _prime_web_session_cwd(session_id)
 
         def run():
-            _mark_chat_inflight(session_id, request_id)
             title_thread = None
             try:
                 with _web_chat_approval_context(session_id, on_approval_request):
@@ -4191,10 +4302,11 @@ async def chat_send(request: Request):
                             message, image_paths, document_paths
                         )
 
+                    # Stream only via stream_delta_callback — passing stream_callback
+                    # too would double-fire on_chunk for every token (_fire_stream_delta).
                     result = agent.run_conversation(
                         prompt,
                         conversation_history=conversation_history,
-                        stream_callback=on_chunk,
                         task_id=session_id,
                     )
                     final = (result or {}).get("final_response") or ""
@@ -4263,7 +4375,6 @@ async def chat_send(request: Request):
                         session_id,
                     )
             finally:
-                _clear_chat_inflight(session_id)
                 _sync_web_session_cwd_from_env(session_id, allow_default_env=True)
                 if title_thread is not None:
                     title_thread.join(timeout=2.5)
@@ -4284,7 +4395,10 @@ async def chat_send(request: Request):
                 safe = chunk.replace("\n", "\\n")
                 yield f"data: {safe}\n\n"
         finally:
-            if not stream_completed_normally:
+            if stream_completed_normally:
+                _clear_chat_inflight(session_id)
+                _web_chat_live.clear_turn(session_id)
+            else:
                 _web_chat_client_disconnect(session_id)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
@@ -4564,6 +4678,12 @@ async def chat_interrupt(request: Request):
         except Exception as exc:
             return JSONResponse({"error": str(exc)}, status_code=500)
     _clear_chat_inflight(session_id)
+    try:
+        from ector_cli import web_chat_live as _web_chat_live
+
+        _web_chat_live.clear_turn(session_id)
+    except Exception:
+        pass
     return {"ok": True}
 
 
@@ -4577,6 +4697,44 @@ async def chat_status(request: Request, session_id: str = ""):
         "session_id": sid,
         "busy": _is_chat_inflight(sid),
         "pending_approval": _web_chat_pending_approval(sid),
+    }
+
+
+@app.get("/api/chat/turn")
+async def chat_turn(request: Request, session_id: str = ""):
+    """Authoritative chat view: persisted messages + optional live turn overlay."""
+    sid = str(session_id or "").strip()
+    if not sid:
+        return JSONResponse({"error": "session_id is required"}, status_code=400)
+
+    from ector_cli.chat_message_media import prepare_session_messages_for_dashboard
+    from ector_cli import web_chat_live as _web_chat_live
+
+    busy = _is_chat_inflight(sid)
+    pending_approval = _web_chat_pending_approval(sid)
+    messages: list[dict[str, Any]] = []
+    try:
+        from ector_state import SessionDB
+
+        db = SessionDB()
+        try:
+            messages = prepare_session_messages_for_dashboard(
+                db.get_messages(sid), session_id=sid
+            )
+        finally:
+            db.close()
+    except Exception:
+        messages = []
+
+    live = _web_chat_live.live_for_api(sid) if busy else None
+    revision = int((live or {}).get("revision") or 0)
+    return {
+        "session_id": sid,
+        "busy": busy,
+        "revision": revision,
+        "pending_approval": pending_approval,
+        "messages": messages,
+        "live": live,
     }
 
 

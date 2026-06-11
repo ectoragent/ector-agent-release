@@ -459,10 +459,112 @@ export const toolCallDisplayLines = (toolName, call, detail = '', technical = ''
     subline
   };
 };
+const DELEGATE_FAILURE_STATUSES = new Set(['failed', 'error', 'interrupted', 'timeout']);
+const LEGACY_PROCESS_NOT_FOUND_RE = /^No process with ID (proc_[\w]+)$/i;
+/** Normaliza mensagens legadas em inglês (sessões antigas). */
+export const humanizeKnownToolError = message => {
+  const trimmed = message.trim();
+  if (!trimmed) return trimmed;
+  const notFound = trimmed.match(LEGACY_PROCESS_NOT_FOUND_RE);
+  if (notFound) {
+    const sid = notFound[1] ?? '?';
+    return `Processo em segundo plano não encontrado (${sid}). Pode já ter encerrado ou o registro expirou.`;
+  }
+  if (/^Process has already finished$/i.test(trimmed)) {
+    return 'O processo já foi encerrado';
+  }
+  if (/^Process stdin not available/i.test(trimmed)) {
+    return 'Entrada do processo indisponível (backend remoto ou stdin fechado)';
+  }
+  if (trimmed.startsWith('Recovered process cannot be killed after restart because')) {
+    return 'Não foi possível encerrar: o processo foi recuperado após reinício e o handle original não está mais disponível';
+  }
+  return trimmed;
+};
+const TOOL_ERROR_HINT_RE = /\b(traceback \(most recent|navigation failed|net::err_|could not navigate|operation failed|permission denied|access denied)\b/i;
+const parseJsonRecord = raw => {
+  try {
+    const parsed = JSON.parse(raw);
+    if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+      return parsed;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+};
+/** Espelha agent/tool_result_status.infer_tool_failed para replay de sessão. */
+export const inferToolFailedFromResult = (toolName, raw) => {
+  const text = (raw ?? '').trim();
+  if (!text) return false;
+  const data = parseJsonRecord(text);
+  if (data) {
+    if (data.success === false) return true;
+    if (typeof data.error === 'string' && data.error.trim()) return true;
+    const status = String(data.status ?? '').toLowerCase();
+    if (status === 'not_found' || status === 'error') return true;
+    const key = toolName.trim().toLowerCase();
+    if (key === 'delegate_task' && Array.isArray(data.results)) {
+      const rows = data.results;
+      const failed = rows.some(row => {
+        const status = String(row.status ?? '').toLowerCase();
+        return DELEGATE_FAILURE_STATUSES.has(status);
+      });
+      const completed = rows.some(row => String(row.status ?? '').toLowerCase() === 'completed');
+      if (failed && !completed) return true;
+    }
+  }
+  return TOOL_ERROR_HINT_RE.test(text);
+};
+/** Headline curta para trilha quando inferToolFailedFromResult é true. */
+export const toolFailureHeadline = (toolName, raw) => {
+  const text = (raw ?? '').trim();
+  if (!text) return null;
+  const data = parseJsonRecord(text);
+  if (data) {
+    if (typeof data.error === 'string' && data.error.trim()) {
+      return humanizeKnownToolError(data.error).slice(0, 200);
+    }
+    if (String(data.status ?? '').toLowerCase() === 'not_found') {
+      return 'Processo em segundo plano não encontrado';
+    }
+    const key = toolName.trim().toLowerCase();
+    if (key === 'delegate_task' && Array.isArray(data.results)) {
+      const rows = data.results;
+      if (rows.length) {
+        const failed = rows.filter(row => DELEGATE_FAILURE_STATUSES.has(String(row.status ?? '').toLowerCase())).length;
+        const completed = rows.filter(row => String(row.status ?? '').toLowerCase() === 'completed').length;
+        if (failed && !completed) return `Delegação falhou (0/${rows.length})`;
+        if (failed) return `${completed}/${rows.length} subagentes concluídos`;
+      }
+    }
+  }
+  const first = text.split('\n', 1)[0]?.trim() ?? '';
+  if (/^traceback/i.test(first)) {
+    const errLine = [...text.split(/\r?\n/)].reverse().find(line => /Error:|Exception:/i.test(line));
+    return errLine?.trim().slice(0, 200) ?? 'Erro ao executar';
+  }
+  if (TOOL_ERROR_HINT_RE.test(text)) return first.slice(0, 200);
+  return first.slice(0, 200) || null;
+};
 /** Título humano + linha técnica para um passo do painel Ferramentas. */
-export const toolStepDisplay = (toolName, callLabel, tech, parsedDetail = '') => {
+export const toolStepDisplay = (toolName, callLabel, tech, parsedDetail = '', failed = false) => {
   const callForDisplay = isToolTechnicalSubline(callLabel) ? '' : callLabel;
-  return toolCallDisplayLines(toolName, callForDisplay, isToolTechnicalSubline(tech) ? '' : parsedDetail, tech);
+  const lines = toolCallDisplayLines(toolName, callForDisplay, isToolTechnicalSubline(tech) ? '' : parsedDetail, tech);
+  const key = (toolName ?? '').trim().toLowerCase();
+  if (failed && key === 'delegate_task') {
+    const errDetail = (parsedDetail || tech).trim();
+    if (errDetail && errDetail !== callLabel.trim()) {
+      const headline = humanizeToolContextPt(errDetail);
+      if (headline) {
+        return {
+          headline,
+          subline: lines.subline && lines.subline !== headline ? lines.subline : ''
+        };
+      }
+    }
+  }
+  return lines;
 };
 const inferKindFromCallLabel = call => {
   for (const label of Object.values(TOOL_LABELS_PT)) {

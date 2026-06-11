@@ -175,8 +175,10 @@ DEFAULT_AGENT_IDENTITY = (
 
 ECTOR_AGENT_HELP_GUIDANCE = (
     "Se o usuário perguntar sobre configurar, instalar ou usar o próprio Ector Agent, "
-    "carregue o skill `ector-agent` com skill_view(name='ector-agent') "
-    "antes de responder. Documentação: https://ector.cc/docs"
+    "consulte https://ector.cc/docs e os subcomandos CLI reais "
+    "(ex.: `ector setup`, `ector config edit`, `ector tools`, `ector provider`, `ector doctor`). "
+    "Não invente nem assuma um skill fixo para isso — só carregue skill_view(name) se o nome "
+    "aparecer na lista retornada por skills_list."
 )
 
 EXPLICIT_ITERATIVE_WORKFLOW_GUIDANCE = (
@@ -1204,9 +1206,10 @@ def build_skills_system_prompt(
             "já domina, porque o skill define como fazer *aqui*.\n"
             "Quando o usuário pedir para configurar, instalar, habilitar, desabilitar, modificar "
             "ou depurar o próprio Ector Agent — CLI, config, modelos, provedores, tools, "
-            "skills, voz, gateway, plugins ou qualquer recurso — carregue primeiro o skill "
-            "`ector-agent`. Ele traz os comandos reais (ex.: `ector config edit`, `ector tools`, "
-            "`ector setup`) para não inventar atalhos.\n"
+            "skills, voz, gateway, plugins ou qualquer recurso — use https://ector.cc/docs e "
+            "os comandos `ector` reais (`ector config edit`, `ector tools`, `ector setup`, "
+            "`ector doctor`). Se skills_list incluir um skill claramente sobre o Ector, "
+            "carregue-o; não assuma um slug fixo que não esteja na lista.\n"
             "Se um skill estiver errado, corrija com skill_manage(action='patch').\n"
             "Após tarefas difíceis ou iterativas, ofereça salvar como skill. "
             "Se o skill carregado faltou passos, tinha comando errado ou precisou de armadilhas "

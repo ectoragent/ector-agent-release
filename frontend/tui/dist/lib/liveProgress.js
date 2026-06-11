@@ -31,9 +31,14 @@ export const appendToolShelfMessage = (prev, msg) => {
   for (let index = prev.length - 1; index >= 0; index--) {
     const candidate = prev[index];
     if (isToolCarryingTrail(candidate)) {
-      const next = [...prev];
-      next[index] = mergeToolShelfInto(candidate, msg);
-      return next;
+      // Merge tools into a thinking shelf only — keep tool-only trails separate
+      // so assistant narration can sit between consecutive tool cards.
+      if (candidate.thinking?.trim()) {
+        const next = [...prev];
+        next[index] = mergeToolShelfInto(candidate, msg);
+        return next;
+      }
+      break;
     }
     if (fallbackHolder === null && canHoldToolShelf(candidate)) {
       fallbackHolder = index;

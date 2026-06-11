@@ -2166,6 +2166,20 @@ _client_cache_lock = threading.Lock()
 _CLIENT_CACHE_MAX_SIZE = 64  # safety belt — evict oldest when exceeded
 
 
+def _is_embedding_model_name(model: Optional[str]) -> bool:
+    """True when *model* looks like an OpenAI-style embedding slug."""
+    name = (model or "").strip().lower()
+    return bool(name) and "embedding" in name
+
+
+def _client_cache_purpose(model: Optional[str]) -> str:
+    """Isolate embedding client cache entries from chat auxiliary tasks."""
+    name = (model or "").strip().lower()
+    if name and _is_embedding_model_name(name):
+        return f"embed:{name}"
+    return "chat"
+
+
 def _client_cache_key(
     provider: str,
     *,
@@ -2174,10 +2188,19 @@ def _client_cache_key(
     api_key: Optional[str] = None,
     api_mode: Optional[str] = None,
     main_runtime: Optional[Dict[str, Any]] = None,
+    model: Optional[str] = None,
 ) -> tuple:
     runtime = _normalize_main_runtime(main_runtime)
     runtime_key = tuple(runtime.get(field, "") for field in _MAIN_RUNTIME_FIELDS) if provider == "auto" else ()
-    return (provider, async_mode, base_url or "", api_key or "", api_mode or "", runtime_key)
+    return (
+        provider,
+        async_mode,
+        base_url or "",
+        api_key or "",
+        api_mode or "",
+        runtime_key,
+        _client_cache_purpose(model),
+    )
 
 
 def _store_cached_client(cache_key: tuple, client: Any, default_model: Optional[str], *, bound_loop: Any = None) -> None:
@@ -2304,10 +2327,17 @@ def _compat_model(client: Any, model: Optional[str], cached_default: Optional[st
     """Drop OpenRouter-format model slugs (with '/') for non-OpenRouter clients.
 
     Mirrors the guard in resolve_provider_client() which is skipped on cache hits.
+    Embedding defaults must not leak into chat callers that pass model=None.
     """
     if model and "/" in model and not _is_openrouter_client(client):
-        return cached_default
-    return model or cached_default
+        fallback = cached_default
+        if fallback and _is_embedding_model_name(fallback):
+            fallback = None
+        return fallback
+    effective = model or cached_default
+    if not model and _is_embedding_model_name(effective):
+        return None
+    return effective
 
 
 def _get_cached_client(
@@ -2354,6 +2384,7 @@ def _get_cached_client(
         api_key=api_key,
         api_mode=api_mode,
         main_runtime=main_runtime,
+        model=model,
     )
     with _client_cache_lock:
         if cache_key in _client_cache:
@@ -2401,13 +2432,10 @@ def _get_cached_client(
                 _client_cache[cache_key] = (client, default_model, bound_loop)
             else:
                 client, default_model, _ = _client_cache[cache_key]
-    return client, model or default_model
-
-
-def _is_embedding_model_name(model: Optional[str]) -> bool:
-    """True when *model* looks like an OpenAI-style embedding slug."""
-    name = (model or "").strip().lower()
-    return bool(name) and "embedding" in name
+    effective_default = default_model
+    if not model and _is_embedding_model_name(effective_default):
+        effective_default = None
+    return client, model or effective_default
 
 
 def _coerce_chat_aux_model(task: Optional[str], model: Optional[str]) -> Optional[str]:

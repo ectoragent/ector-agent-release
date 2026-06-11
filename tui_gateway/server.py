@@ -644,6 +644,15 @@ def _load_tool_progress_mode() -> str:
     return mode if mode in {"off", "new", "all", "verbose"} else "all"
 
 
+def _load_interim_assistant_messages() -> bool:
+    raw = (_load_cfg().get("display") or {}).get("interim_assistant_messages", True)
+    if raw is False:
+        return False
+    if raw is True:
+        return True
+    return str(raw).strip().lower() not in {"0", "false", "off", "no", "none"}
+
+
 def _load_enabled_toolsets() -> list[str] | None:
     try:
         from ector_cli.config import load_config
@@ -1082,6 +1091,40 @@ def _tool_summary(name: str, result: str, duration_s: float | None) -> str | Non
     suffix = f" in {dur}" if dur else ""
     text = None
 
+    if name == "delegate_task" and isinstance(data, dict):
+        err = data.get("error")
+        if isinstance(err, str) and err.strip():
+            text = err.strip()[:120]
+        elif data.get("success") is False:
+            text = "Delegação falhou"
+        else:
+            rows = data.get("results")
+            if isinstance(rows, list) and rows:
+                completed = sum(
+                    1
+                    for row in rows
+                    if isinstance(row, dict)
+                    and str(row.get("status") or "").lower() == "completed"
+                )
+                failed = sum(
+                    1
+                    for row in rows
+                    if isinstance(row, dict)
+                    and str(row.get("status") or "").lower()
+                    in ("failed", "error", "interrupted", "timeout")
+                )
+                if failed and not completed:
+                    text = f"Delegação falhou (0/{len(rows)})"
+                else:
+                    text = f"{completed}/{len(rows)} subagente(s)"
+
+    elif isinstance(result, str) and result.strip():
+        first = result.strip().split("\n", 1)[0].strip()
+        if first.lower().startswith("traceback"):
+            text = "erro ao executar"
+        elif "navigation failed" in first.lower() or "net::err_" in first.lower():
+            text = first[:120]
+
     if name == "web_search" and isinstance(data, dict):
         n = _count_list(data, "data", "web")
         if n is not None:
@@ -1136,6 +1179,15 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
     summary = _tool_summary(name, result, duration_s)
     if summary:
         payload["summary"] = summary
+    try:
+        from agent.tool_result_status import infer_tool_failed, tool_failure_message
+
+        if infer_tool_failed(name, result):
+            err_msg = tool_failure_message(name, result) or summary
+            if err_msg:
+                payload["error"] = err_msg
+    except Exception:
+        pass
     if name == "todo":
         try:
             data = json.loads(result)
@@ -1576,12 +1628,14 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
             name = (tc_info[0] if tc_info else None) or m.get("tool_name") or "tool"
             args = (tc_info[1] if tc_info else None) or {}
             technical = _tool_technical(name, args)
+            content = (m.get("content") or "").strip()
             messages.append(
                 {
                     "role": "tool",
                     "name": name,
                     "context": _tool_ctx(name, args),
                     **({"technical": technical} if technical else {}),
+                    **({"text": content} if content else {}),
                 }
             )
             continue
@@ -2429,10 +2483,25 @@ def _(rid, params: dict) -> dict:
             prompt = _enrich_with_attached_images(prompt, images) if images else prompt
 
             def _stream(delta):
+                if delta is None:
+                    return
                 payload = {"text": delta}
                 if streamer and (r := streamer.feed(delta)) is not None:
                     payload["rendered"] = r
                 _emit("message.delta", sid, payload)
+
+            if _load_interim_assistant_messages():
+
+                def _interim_assistant(text, *, already_streamed=False):
+                    if already_streamed or not str(text or "").strip():
+                        return
+                    _stream(text)
+
+                agent.interim_assistant_callback = _interim_assistant
+            else:
+                agent.interim_assistant_callback = None
+
+            agent.stream_delta_callback = _stream
 
             result = agent.run_conversation(
                 prompt,

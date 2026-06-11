@@ -197,7 +197,7 @@ export const ToolTrail = memo(function ToolTrail(t0) {
       const {
         headline: title,
         subline: technical
-      } = toolStepDisplay(toolName, callLabel, tech, parsed.detail);
+      } = toolStepDisplay(toolName, callLabel, tech, parsed.detail, parsed.mark === "\u2717");
       groups.push({
         color: parsed.mark === "\u2717" ? t.color.error : t.color.text,
         content: parsed.call,

@@ -97,6 +97,30 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
     # Anthropic Claude 4.5+ generation — new pricing table (includes caching columns).
     (
         "anthropic",
+        "claude-fable-5",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("10.00"),
+        output_cost_per_million=Decimal("50.00"),
+        cache_read_cost_per_million=Decimal("1.00"),
+        cache_write_cost_per_million=Decimal("12.50"),  # 5m cache write
+        source="official_docs_snapshot",
+        source_url="https://docs.anthropic.com/en/docs/about-claude/pricing",
+        pricing_version="anthropic-pricing-2026-06-09",
+    ),
+    (
+        "anthropic",
+        "claude-opus-4-8",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("5.00"),
+        output_cost_per_million=Decimal("25.00"),
+        cache_read_cost_per_million=Decimal("0.50"),
+        cache_write_cost_per_million=Decimal("6.25"),  # 5m cache write
+        source="official_docs_snapshot",
+        source_url="https://docs.anthropic.com/en/docs/about-claude/pricing",
+        pricing_version="anthropic-pricing-2026-05-28",
+    ),
+    (
+        "anthropic",
         "claude-opus-4.7",
     ): PricingEntry(
         input_cost_per_million=Decimal("5.00"),
