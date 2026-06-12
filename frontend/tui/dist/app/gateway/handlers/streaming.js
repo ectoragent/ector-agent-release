@@ -1,7 +1,7 @@
 import { STATUS } from '../../../content/uiStatus.js';
+import { turnTimingMsg } from '../../../domain/turnTiming.js';
 import { getUiState } from '../../uiStore.js';
 import { patchUiState } from '../../uiStore.js';
-import { turnTimingMsg } from '../../../domain/turnTiming.js';
 export function handleThinkingDelta(ev, api) {
   const p = ev.payload;
   const text = p?.text;

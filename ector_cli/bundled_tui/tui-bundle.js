@@ -1203,6 +1203,8 @@ var forceQuitOnSecondCtrlC = (sequence) => {
 
 // src/lib/mouseInputLeak.ts
 var ESC = "\x1B";
+var CSI_COMPLETE_RE = new RegExp(`^${ESC}\\[[0-9;]*[A-Za-z]$`);
+var CSI_MOUSE_PREFIX_RE = new RegExp(`^${ESC}\\[<\\d*(?:;\\d*)*$`, "i");
 var SGR_MOUSE_FULL_RE = new RegExp(`^${ESC}\\[<\\d+(?:;\\d+){0,2}[Mm]$`);
 var SGR_MOUSE_BRACKET_LEAK_RE = /^\[<\d+(?:;\d+){0,2}[Mm]$/;
 var SGR_MOUSE_LEAK_RE = /^(?:<)?\d+(?:;\d+){0,2}[Mm]$/;
@@ -1228,7 +1230,7 @@ var isIncompleteMouseEscape = (sequence) => {
   if (isMouseInputLeak(sequence) || sequenceContainsMouseLeak(sequence)) {
     return false;
   }
-  if (/^\x1b\[[0-9;]*[A-Za-z]$/.test(sequence)) {
+  if (CSI_COMPLETE_RE.test(sequence)) {
     return false;
   }
   if (sequence === "\x1B" || sequence === "\x1B[" || sequence === "\x1B[<" || sequence === "[<") {
@@ -1237,7 +1239,7 @@ var isIncompleteMouseEscape = (sequence) => {
   if (/^\[<\d*(?:;\d*)*$/i.test(sequence) && !/[Mm]$/.test(sequence)) {
     return true;
   }
-  if (/^\x1b\[<\d*(?:;\d*)*$/i.test(sequence) && !/[Mm]$/.test(sequence)) {
+  if (CSI_MOUSE_PREFIX_RE.test(sequence) && !/[Mm]$/.test(sequence)) {
     return true;
   }
   return false;
@@ -1357,7 +1359,12 @@ function InputBridge() {
 
 // src/lib/mouseFilteredStdin.ts
 import { PassThrough } from "node:stream";
-var MOUSE_PREFIX_RE = /^(?:\x1b\[<\d+(?:;\d+)*[Mm]|\[<\d+(?:;\d+)*[Mm]|\d+;\d+;\d+[Mm])/;
+var ESC2 = "\x1B";
+var MOUSE_PREFIX_RE = new RegExp(
+  `^(?:${ESC2}\\[<\\d+(?:;\\d+)*[Mm]|\\[<\\d+(?:;\\d+)*[Mm]|\\d+;\\d+;\\d+[Mm])`
+);
+var CSI_KEY_RE = new RegExp(`^${ESC2}\\[[\\d;]*[A-Za-z]`);
+var SS3_KEY_RE = new RegExp(`^${ESC2}O[A-Za-z]`);
 var stripMouseFromStdinChunk = (buffer) => {
   let pending = buffer;
   let forward = "";
@@ -1393,14 +1400,14 @@ var stripMouseFromStdinChunk = (buffer) => {
       pending = "";
       continue;
     }
-    if (pending.startsWith("\x1B")) {
-      const csi = pending.match(/^\x1b\[[\d;]*[A-Za-z]/);
+    if (pending.startsWith(ESC2)) {
+      const csi = pending.match(CSI_KEY_RE);
       if (csi) {
         forward += csi[0];
         pending = pending.slice(csi[0].length);
         continue;
       }
-      const ss3 = pending.match(/^\x1bO[A-Za-z]/);
+      const ss3 = pending.match(SS3_KEY_RE);
       if (ss3) {
         forward += ss3[0];
         pending = pending.slice(ss3[0].length);

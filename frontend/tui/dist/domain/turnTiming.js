@@ -4,7 +4,9 @@ export function normalizeEpochMs(ts) {
 }
 export function formatCompletionClock(endMs) {
   const date = new Date(normalizeEpochMs(endMs));
-  if (Number.isNaN(date.getTime())) return '';
+  if (Number.isNaN(date.getTime())) {
+    return '';
+  }
   const now = new Date();
   const sameDay = date.getFullYear() === now.getFullYear() && date.getMonth() === now.getMonth() && date.getDate() === now.getDate();
   const options = sameDay ? {
@@ -21,9 +23,15 @@ export function formatCompletionClock(endMs) {
 export function formatInteractionFooter(timing) {
   const elapsed = fmtDuration(timing.completedAt - timing.startedAt);
   const clock = formatCompletionClock(timing.completedAt);
-  if (!elapsed && !clock) return '';
-  if (!clock) return elapsed;
-  if (!elapsed) return clock;
+  if (!elapsed && !clock) {
+    return '';
+  }
+  if (!clock) {
+    return elapsed;
+  }
+  if (!elapsed) {
+    return clock;
+  }
   return `${elapsed} · ${clock}`;
 }
 export function turnTimingMsg(startedAt, completedAt) {
