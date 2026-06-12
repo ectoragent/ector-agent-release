@@ -1,6 +1,7 @@
 import { STATUS } from '../../../content/uiStatus.js';
 import { getUiState } from '../../uiStore.js';
 import { patchUiState } from '../../uiStore.js';
+import { turnTimingMsg } from '../../../domain/turnTiming.js';
 export function handleThinkingDelta(ev, api) {
   const p = ev.payload;
   const text = p?.text;
@@ -68,6 +69,10 @@ export function handleMessageComplete(ev, api) {
       role: 'assistant',
       text: finalText
     }];
+    const startedAt = api.turnStartedAtRef.current;
+    if (startedAt != null) {
+      msgs.push(turnTimingMsg(startedAt, Date.now()));
+    }
     api.appendMessages(msgs);
     if (api.bellOnComplete && process.stderr.isTTY) {
       process.stderr.write('\x07');

@@ -63,6 +63,7 @@ export function useMainApp(gw) {
   const [voiceProcessing, setVoiceProcessing] = useState(false);
   const [sessionStartedAt, setSessionStartedAt] = useState(() => Date.now());
   const [turnStartedAt, setTurnStartedAt] = useState(null);
+  const turnStartedAtRef = useRef(null);
   const [goodVibesTick, setGoodVibesTick] = useState(0);
   const [bellOnComplete, setBellOnComplete] = useState(false);
   const ui = useStore($uiState);
@@ -215,9 +216,14 @@ export function useMainApp(gw) {
   });
   useEffect(() => {
     if (ui.busy) {
-      setTurnStartedAt(prev_2 => prev_2 ?? Date.now());
+      setTurnStartedAt(prev_2 => {
+        const next_0 = prev_2 ?? Date.now();
+        turnStartedAtRef.current = next_0;
+        return next_0;
+      });
     } else {
       setTurnStartedAt(null);
+      turnStartedAtRef.current = null;
     }
   }, [ui.busy]);
   useConfigSync({
@@ -314,13 +320,13 @@ export function useMainApp(gw) {
       if (!isComposerReady(getUiState()) || getUiState().busy || composerRefs.queueEditRef.current !== null || composerRefs.queueRef.current.length === 0) {
         return;
       }
-      const next_0 = composerActions.dequeue();
-      if (next_0) {
+      const next_1 = composerActions.dequeue();
+      if (next_1) {
         patchUiState({
           busy: true,
           status: STATUS.running
         });
-        sendQueued(next_0);
+        sendQueued(next_1);
       }
     });
   }, [ui.sid, ui.busy, composerActions, composerRefs, sendQueued]);
@@ -380,7 +386,8 @@ export function useMainApp(gw) {
     system: {
       bellOnComplete,
       stdout,
-      sys
+      sys,
+      turnStartedAtRef
     },
     transcript: {
       appendMessage,

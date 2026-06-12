@@ -65,11 +65,31 @@ export const toTranscriptMessages = rows => {
     }
     const {
       context,
+      kind,
       name,
       role,
       technical,
-      text
+      text,
+      turn_timing: turnTimingRaw
     } = row;
+    if (kind === 'turnTiming' && turnTimingRaw) {
+      const startedAt = Number(turnTimingRaw.started_at);
+      const completedAt = Number(turnTimingRaw.completed_at);
+      if (Number.isFinite(startedAt) && Number.isFinite(completedAt)) {
+        const startedMs = startedAt < 10_000_000_000 ? startedAt * 1000 : startedAt;
+        const completedMs = completedAt < 10_000_000_000 ? completedAt * 1000 : completedAt;
+        out.push({
+          kind: 'turnTiming',
+          role: 'system',
+          text: typeof text === 'string' ? text : '',
+          turnTiming: {
+            startedAt: startedMs,
+            completedAt: completedMs
+          }
+        });
+      }
+      continue;
+    }
     if (role === 'tool') {
       const ctx = (context ?? '').trim();
       const tech = (technical ?? '').trim();

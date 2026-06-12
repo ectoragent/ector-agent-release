@@ -8,6 +8,7 @@ import { ROLE } from '../../domain/roles.js';
 import { TOOL_BLOCK_MARGIN_LEFT, TRANSCRIPT_BUBBLE_PAD_X, TRANSCRIPT_BUBBLE_PAD_Y, transcriptContentCols } from '../../domain/transcriptLayout.js';
 import { boundedHistoryRenderText, boundedLiveRenderText, compactPreview, hasAnsi, isPasteBackedText, stripAnsi } from '../../lib/text.js';
 import { isHeavyTranscriptMessage } from '../../lib/virtualHeights.js';
+import { formatInteractionFooter } from '../../domain/turnTiming.js';
 import { Md } from '../Markdown/index.js';
 import { StreamingMd } from '../StreamingMarkdown/index.js';
 import { ToolTrail } from '../Thinking/index.js';
@@ -27,6 +28,20 @@ export const MessageLine = memo(function MessageLine({
   toolTrailLive,
   tools = []
 }) {
+  if (msg.kind === 'turnTiming') {
+    const label = msg.turnTiming != null ? formatInteractionFooter(msg.turnTiming) : msg.text.trim();
+    if (!label) return null;
+    return _jsx(Box, {
+      flexDirection: "row",
+      justifyContent: "flex-start",
+      width: transcriptContentCols(cols),
+      children: _jsx(Text, {
+        color: t.color.dim,
+        dimColor: true,
+        children: label
+      })
+    });
+  }
   const boundedRender = limitHistoryRender || isHeavyTranscriptMessage(msg.text, cols);
   const trailExtras = toolTrailLive ?? {};
   const liveTools = trailExtras.tools ?? tools;

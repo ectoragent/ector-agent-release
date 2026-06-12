@@ -31,7 +31,8 @@ export function buildHandlerApi(ctx) {
   const {
     bellOnComplete,
     stdout,
-    sys
+    sys,
+    turnStartedAtRef
   } = ctx.system;
   const {
     appendMessage,
@@ -118,6 +119,7 @@ export function buildHandlerApi(ctx) {
     stdout,
     submitRef,
     sys,
-    turnController
+    turnController,
+    turnStartedAtRef
   };
 }

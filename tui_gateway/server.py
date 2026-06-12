@@ -1600,9 +1600,55 @@ def _enrich_with_attached_images(user_text: str, image_paths: list[str]) -> str:
     return enrich_with_attached_images(user_text, image_paths)
 
 
+def _coerce_history_timestamp(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _append_turn_timing_footer(
+    messages: list[dict],
+    turn_user_ts: float | None,
+    turn_end_ts: float | None,
+) -> None:
+    if turn_user_ts is None or turn_end_ts is None:
+        return
+    if turn_end_ts <= turn_user_ts:
+        return
+    messages.append(
+        {
+            "role": "system",
+            "kind": "turnTiming",
+            "text": "",
+            "turn_timing": {
+                "started_at": turn_user_ts,
+                "completed_at": turn_end_ts,
+            },
+        }
+    )
+
+
 def _history_to_messages(history: list[dict]) -> list[dict]:
-    messages = []
-    tool_call_args = {}
+    messages: list[dict] = []
+    tool_call_args: dict[str, tuple[str, dict]] = {}
+    turn_user_ts: float | None = None
+    turn_end_ts: float | None = None
+
+    def bump_turn_end(ts: float | None) -> None:
+        nonlocal turn_end_ts
+        if ts is None:
+            return
+        if turn_end_ts is None or ts > turn_end_ts:
+            turn_end_ts = ts
+
+    def flush_turn() -> None:
+        nonlocal turn_user_ts, turn_end_ts
+        _append_turn_timing_footer(messages, turn_user_ts, turn_end_ts)
+        turn_user_ts = None
+        turn_end_ts = None
 
     for m in history:
         if not isinstance(m, dict):
@@ -1610,6 +1656,13 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         role = m.get("role")
         if role not in ("user", "assistant", "tool", "system"):
             continue
+        row_ts = _coerce_history_timestamp(m.get("timestamp"))
+        if role == "user":
+            flush_turn()
+            turn_user_ts = row_ts
+            turn_end_ts = None
+        elif role in ("assistant", "tool"):
+            bump_turn_end(row_ts)
         if role == "assistant" and m.get("tool_calls"):
             for tc in m["tool_calls"]:
                 fn = tc.get("function", {})
@@ -1643,6 +1696,7 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
             continue
         messages.append({"role": role, "text": m.get("content") or ""})
 
+    flush_turn()
     return messages
 
 

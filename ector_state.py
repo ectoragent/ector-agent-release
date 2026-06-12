@@ -1292,7 +1292,7 @@ class SessionDB:
             rows = self._conn.execute(
                 "SELECT role, content, tool_call_id, tool_calls, tool_name, "
                 "reasoning, reasoning_content, reasoning_details, codex_reasoning_items, "
-                "codex_message_items "
+                "codex_message_items, timestamp "
                 f"FROM messages WHERE session_id IN ({placeholders}) ORDER BY timestamp, id",
                 tuple(session_ids),
             ).fetchall()
@@ -1300,6 +1300,8 @@ class SessionDB:
         messages = []
         for row in rows:
             msg = {"role": row["role"], "content": row["content"]}
+            if row["timestamp"] is not None:
+                msg["timestamp"] = row["timestamp"]
             if row["tool_call_id"]:
                 msg["tool_call_id"] = row["tool_call_id"]
             if row["tool_name"]:
