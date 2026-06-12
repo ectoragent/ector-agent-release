@@ -1,8 +1,8 @@
 #!/usr/bin/env bun
 import { jsx as _jsx } from "react/jsx-runtime";
 import { shutdownTui } from '@ector/ink';
-import { MOUSE_MOVEMENT_TRACKING, MOUSE_TRACKING } from './config/env.js';
 import { getUiState } from './app/uiStore.js';
+import { MOUSE_MOVEMENT_TRACKING, MOUSE_TRACKING } from './config/env.js';
 import { GatewayClient } from './gatewayClient.js';
 import { withBootSpinner } from './lib/bootSpinner.js';
 import { forceProcessExit, setupGracefulExit } from './lib/gracefulExit.js';
