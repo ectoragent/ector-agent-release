@@ -1015,6 +1015,11 @@ class EnvVarReveal(BaseModel):
     key: str
 
 
+class OpenProjectBody(BaseModel):
+    path: str
+    session_id: Optional[str] = None
+
+
 class SetupInferenceBlock(BaseModel):
     """Provedor + modelo + segredos opcionais (mesma semântica do ``ector setup`` rápido)."""
 
@@ -2039,6 +2044,62 @@ def get_chat_context(session_id: Optional[str] = None):
             "cwd": cwd,
             "cwd_label": label or cwd,
         }
+
+
+@app.get("/api/projects/recent")
+def get_recent_projects(limit: int = 10):
+    """Recently opened project directories for the web chat landing page."""
+    from ector_cli.recent_projects import list_recent_projects
+
+    rows = list_recent_projects(limit=limit)
+    return {
+        "projects": [
+            {
+                **row,
+                "path_label": _short_display_cwd(row["path"]),
+            }
+            for row in rows
+        ]
+    }
+
+
+@app.post("/api/projects/open")
+def open_project(body: OpenProjectBody):
+    """Set the working directory for web chat and record it as a recent project."""
+    from ector_cli.recent_projects import record_project_open, validate_project_directory
+
+    try:
+        resolved = validate_project_directory(body.path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    sid = (body.session_id or "").strip()
+    if sid:
+        _apply_web_session_cwd(sid, resolved)
+        _persist_web_session_cwd(sid, resolved)
+    else:
+        os.environ["TERMINAL_CWD"] = resolved
+
+    record_project_open(resolved)
+    label = _short_display_cwd(resolved)
+    return {"cwd": resolved, "cwd_label": label or resolved}
+
+
+@app.get("/api/fs/browse")
+def browse_folders(path: str = "", q: str = "", hide_hidden: bool = False):
+    """List directories for the web folder picker."""
+    from ector_cli.fs_browse import browse_directory
+
+    try:
+        payload = browse_directory(
+            path,
+            query=q,
+            hide_hidden=hide_hidden,
+            label_fn=_short_display_cwd,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return payload
 
 
 @app.get("/api/model/options")
@@ -3561,7 +3622,7 @@ async def update_session_title(session_id: str, body: SessionTitleBody):
 # ---------------------------------------------------------------------------
 
 _CHAT_AGENTS: dict[str, Any] = {}
-_CHAT_AGENTS_LOCK = threading.Lock()
+_CHAT_AGENTS_LOCK = threading.RLock()
 _CHAT_INFLIGHT: dict[str, dict[str, Any]] = {}  # session_id → {request_id, started_at}
 _CHAT_SESSION_DB: Any | None = None
 
@@ -3577,6 +3638,84 @@ def _mark_chat_inflight(session_id: str, request_id: str) -> None:
 def _clear_chat_inflight(session_id: str) -> None:
     with _CHAT_AGENTS_LOCK:
         _CHAT_INFLIGHT.pop(session_id, None)
+
+
+def _release_web_chat_turn(session_id: str) -> None:
+    """Drop in-flight markers and live overlay when a turn ends (idempotent)."""
+    _clear_chat_inflight(session_id)
+    try:
+        from ector_cli import web_chat_live as _web_chat_live
+
+        _web_chat_live.clear_turn(session_id)
+    except Exception:
+        pass
+
+
+
+
+_CHAT_INFLIGHT_STALE_SEC = 600.0
+
+
+def _chat_inflight_age_sec(session_id: str) -> float | None:
+    with _CHAT_AGENTS_LOCK:
+        entry = _CHAT_INFLIGHT.get(session_id)
+    if not entry:
+        return None
+    return time.time() - float(entry.get("started_at") or 0.0)
+
+
+def _interrupt_web_chat_agent(session_id: str) -> None:
+    with _CHAT_AGENTS_LOCK:
+        agent = _CHAT_AGENTS.get(session_id)
+    if agent is None:
+        return
+    try:
+        agent.interrupt()
+    except Exception:
+        pass
+
+
+def _repair_orphan_chat_inflight(
+    session_id: str,
+    *,
+    min_age_sec: float = 5.0,
+) -> bool:
+    """Inflight flag without a live snapshot — broken state after a dropped SSE client."""
+    if not _is_chat_inflight(session_id):
+        return False
+    age = _chat_inflight_age_sec(session_id)
+    if age is None or age < min_age_sec:
+        return False
+    try:
+        from ector_cli import web_chat_live as _web_chat_live
+
+        if _web_chat_live.snapshot(session_id) is not None:
+            return False
+    except Exception:
+        return False
+    _release_web_chat_turn(session_id)
+    return True
+
+
+def _repair_stale_chat_inflight(
+    session_id: str,
+    *,
+    interrupt_agent: bool = True,
+) -> bool:
+    age = _chat_inflight_age_sec(session_id)
+    if age is None or age < _CHAT_INFLIGHT_STALE_SEC:
+        return False
+    if interrupt_agent:
+        _interrupt_web_chat_agent(session_id)
+    _release_web_chat_turn(session_id)
+    return True
+
+
+def _heal_chat_inflight(session_id: str) -> bool:
+    """Best-effort recovery for stuck web-chat turns (idempotent)."""
+    repaired = _repair_orphan_chat_inflight(session_id)
+    repaired = _repair_stale_chat_inflight(session_id) or repaired
+    return repaired
 
 
 def _is_chat_inflight(session_id: str) -> bool:
@@ -3853,20 +3992,6 @@ async def chat_send(request: Request):
             len(document_paths),
         )
 
-    try:
-        _ensure_web_runtime_paths_writable()
-    except OSError as exc:
-        return JSONResponse(
-            {
-                "error": (
-                    "Não foi possível inicializar diretório de runtime/logs "
-                    f"do web chat: {exc}"
-                )
-            },
-            status_code=500,
-        )
-    from run_agent import AIAgent
-
     def _get_chat_session_db():
         global _CHAT_SESSION_DB
         if _CHAT_SESSION_DB is not None:
@@ -3878,290 +4003,350 @@ async def chat_send(request: Request):
                 _CHAT_SESSION_DB = SessionDB()
         return _CHAT_SESSION_DB
 
-    async def event_stream():
-        with _CHAT_AGENTS_LOCK:
-            if session_id in _CHAT_INFLIGHT:
-                yield (
-                    "data: TEXT|*Aguarde a resposta anterior terminar antes de enviar outra mensagem.*\n\n"
-                )
-                yield "data: DONE\n\n"
-                return
-            _mark_chat_inflight(session_id, request_id)
+    from ector_cli import web_chat_live as _web_chat_live
 
-        from ector_cli import web_chat_live as _web_chat_live
+    _SSE_HEADERS = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
 
-        _web_chat_live.begin_turn(session_id, request_id)
 
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[str | None] = asyncio.Queue()
+    age = _chat_inflight_age_sec(session_id)
+    if age is not None and age >= _CHAT_INFLIGHT_STALE_SEC:
+        _interrupt_web_chat_agent(session_id)
+        _release_web_chat_turn(session_id)
 
-        def _send(kind: str, payload: str = ""):
-            loop.call_soon_threadsafe(queue.put_nowait, f"{kind}|{payload}")
-            if _WEB_CHAT_DEBUG and kind != "TEXT":
-                _log.info(
-                    "[web-chat] sse event request_id=%s session=%s kind=%s payload_preview=%r",
-                    request_id,
-                    session_id,
-                    kind,
-                    (payload[:120] if isinstance(payload, str) else payload),
-                )
+    reject_duplicate = False
+    with _CHAT_AGENTS_LOCK:
+        if session_id in _CHAT_INFLIGHT:
+            reject_duplicate = True
+        else:
+            _CHAT_INFLIGHT[session_id] = {
+                "request_id": request_id,
+                "started_at": time.time(),
+            }
 
-        streamed_text = False
+    if reject_duplicate:
 
-        def on_chunk(chunk: str):
-            nonlocal streamed_text
-            if chunk:
-                streamed_text = True
-                _web_chat_live.append_text(session_id, chunk)
-                _send("TEXT", chunk)
-
-        def on_stream_delta(delta):
-            if delta is None:
-                return
-            on_chunk(delta)
-
-        def on_interim_assistant(text: str, *, already_streamed: bool = False):
-            if already_streamed or not str(text or "").strip():
-                return
-            on_chunk(text)
-
-        def on_status(kind: str, text: str = None):
-            if text:
-                _web_chat_live.set_status(session_id, text)
-                _send("STATUS", text)
-
-        def on_tool_start(tc_id, name, args):
-            import json as _j
-            context = ""
-            technical = ""
-            try:
-                from agent.display import (
-                    build_tool_preview,
-                    build_tool_technical_summary,
-                )
-
-                context = build_tool_preview(name, args, max_len=240) or ""
-                technical = build_tool_technical_summary(name, args) or ""
-                payload = _j.dumps(
-                    {
-                        "id": tc_id,
-                        "name": name,
-                        "args": args,
-                        "context": context,
-                        "technical": technical,
-                    },
-                    ensure_ascii=False,
-                )
-            except Exception:
-                payload = f"{name}|{_j.dumps(args)[:200]}"
-            args_str = args if isinstance(args, str) else _j.dumps(args)
-            _web_chat_live.tool_start(
-                session_id,
-                tool_id=str(tc_id or ""),
-                name=str(name or "tool"),
-                args=args_str,
-                live_label=context,
-                live_technical=technical,
+        async def _reject_duplicate_stream():
+            yield (
+                "data: TEXT|*Aguarde a resposta anterior terminar antes de enviar outra mensagem.*\n\n"
             )
-            _send("TOOL_START", payload)
+            yield "data: DONE\n\n"
 
-        def on_tool_complete(tc_id, name, args, result):
-            import json as _j
-            if name in ("terminal", "shell", "process"):
-                _sync_web_session_cwd_from_env(session_id, allow_default_env=True)
-            footer_cwd = None
-            result_str = str(result) if result is not None else None
-            try:
-                payload_obj: dict = {
+        return StreamingResponse(
+            _reject_duplicate_stream(),
+            media_type="text/event-stream",
+            headers=_SSE_HEADERS,
+        )
+
+
+    _web_chat_live.begin_turn(session_id, request_id)
+
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue[str | None] = asyncio.Queue()
+    queue.put_nowait("STATUS|Conectando…")
+    queue.put_nowait(f"STATUS|{_web_chat_live.PREPARING_STATUS}")
+
+    def _send(kind: str, payload: str = ""):
+        loop.call_soon_threadsafe(queue.put_nowait, f"{kind}|{payload}")
+        if _WEB_CHAT_DEBUG and kind != "TEXT":
+            _log.info(
+                "[web-chat] sse event request_id=%s session=%s kind=%s payload_preview=%r",
+                request_id,
+                session_id,
+                kind,
+                (payload[:120] if isinstance(payload, str) else payload),
+            )
+
+    streamed_text = False
+
+    def on_chunk(chunk: str):
+        nonlocal streamed_text
+        if chunk:
+            streamed_text = True
+            _web_chat_live.append_text(session_id, chunk)
+            _send("TEXT", chunk)
+
+    def on_stream_delta(delta):
+        if delta is None:
+            return
+        on_chunk(delta)
+
+    def on_interim_assistant(text: str, *, already_streamed: bool = False):
+        if already_streamed or not str(text or "").strip():
+            return
+        on_chunk(text)
+
+    def on_status(kind: str, text: str = None):
+        if text:
+            _web_chat_live.set_status(session_id, text)
+            _send("STATUS", text)
+
+    def on_tool_start(tc_id, name, args):
+        import json as _j
+        context = ""
+        technical = ""
+        try:
+            from agent.display import (
+                build_tool_preview,
+                build_tool_technical_summary,
+            )
+
+            context = build_tool_preview(name, args, max_len=240) or ""
+            technical = build_tool_technical_summary(name, args) or ""
+            payload = _j.dumps(
+                {
                     "id": tc_id,
                     "name": name,
-                }
-                if name in ("terminal", "shell", "process"):
-                    footer_cwd = _resolve_web_chat_cwd(session_id)
-                    if footer_cwd:
-                        payload_obj["cwd"] = footer_cwd
-                        payload_obj["cwd_label"] = _short_display_cwd(footer_cwd)
-                if result_str is not None:
-                    if name == "text_to_speech" or len(result_str) <= 8192:
-                        payload_obj["result"] = result_str
-                payload = _j.dumps(payload_obj, ensure_ascii=False)
-            except Exception:
-                payload = name
-            _web_chat_live.tool_complete(
-                session_id,
-                tool_id=str(tc_id or ""),
-                name=str(name or "tool"),
-                result=result_str,
-                cwd=footer_cwd,
+                    "args": args,
+                    "context": context,
+                    "technical": technical,
+                },
+                ensure_ascii=False,
             )
-            _send("TOOL_COMPLETE", payload)
-            if name == "text_to_speech" and result:
-                try:
-                    tts_data = _j.loads(str(result))
-                    file_path = str(tts_data.get("file_path") or "").strip()
-                    if tts_data.get("success") and file_path:
-                        _send(
-                            "TTS_AUDIO",
-                            _j.dumps(
-                                {
-                                    "tool_call_id": tc_id,
-                                    "file_path": file_path,
-                                },
-                                ensure_ascii=False,
-                            ),
-                        )
-                except Exception:
-                    pass
-            if name in ("write_file", "edit_file", "patch", "execute_code") and result:
-                try:
-                    from pathlib import Path as _Path
-                    from ector_cli.agent_images import (
-                        extract_chat_media_from_tool_result,
-                        markdown_from_tool_result,
-                    )
-                    from ector_cli.chat_media_paths import (
-                        chat_file_preview_url,
-                        chat_image_api_url,
-                    )
+        except Exception:
+            payload = f"{name}|{_j.dumps(args)[:200]}"
+        args_str = args if isinstance(args, str) else _j.dumps(args)
+        _web_chat_live.tool_start(
+            session_id,
+            tool_id=str(tc_id or ""),
+            name=str(name or "tool"),
+            args=args_str,
+            live_label=context,
+            live_technical=technical,
+        )
+        _send("TOOL_START", payload)
 
-                    md = markdown_from_tool_result(name, str(result))
-                    media = extract_chat_media_from_tool_result(name, str(result))
-                    attachments = []
-                    for item in media:
-                        raw_path = str(item.get("path") or "").strip()
-                        kind = str(item.get("kind") or "").strip() or "document"
-                        suffix = _Path(raw_path).suffix.lower()
-                        if not raw_path:
-                            continue
-                        download_url = (
-                            chat_image_api_url(raw_path)
-                            if kind == "image"
-                            else (
-                                "/api/chat/files/download?"
-                                f"path={urllib.parse.quote(raw_path, safe='')}"
-                                f"&session_id={urllib.parse.quote(session_id, safe='')}"
-                            )
-                        )
-                        preview_url = (
-                            chat_image_api_url(raw_path)
-                            if kind == "image"
-                            else (
-                                chat_file_preview_url(raw_path, session_id)
-                                if suffix in {".svg", ".html", ".htm"}
-                                else download_url
-                            )
-                        )
-                        if not preview_url:
-                            continue
-                        attachments.append(
-                            {
-                                "id": f"tool-media-{_Path(raw_path).name}",
-                                "name": _Path(raw_path).name,
-                                "kind": "image"
-                                if (kind == "image" or suffix == ".svg")
-                                else "document",
-                                "url": download_url,
-                                "previewUrl": preview_url,
-                                "path": raw_path,
-                            }
-                        )
-                    if md or attachments:
-                        _send(
-                            "CHAT_IMAGE",
-                            _j.dumps(
-                                {"markdown": md or "", "attachments": attachments},
-                                ensure_ascii=False,
-                            ),
-                        )
-                except Exception:
-                    pass
-
-        def on_tool_progress(event_type, name=None, preview=None, args=None, **kwargs):
-            import json as _j
-
-            preview_text = str(preview or "")
-            technical = ""
+    def on_tool_complete(tc_id, name, args, result):
+        import json as _j
+        if name in ("terminal", "shell", "process"):
+            _sync_web_session_cwd_from_env(session_id, allow_default_env=True)
+        footer_cwd = None
+        result_str = str(result) if result is not None else None
+        try:
+            payload_obj: dict = {
+                "id": tc_id,
+                "name": name,
+            }
+            if name in ("terminal", "shell", "process"):
+                footer_cwd = _resolve_web_chat_cwd(session_id)
+                if footer_cwd:
+                    payload_obj["cwd"] = footer_cwd
+                    payload_obj["cwd_label"] = _short_display_cwd(footer_cwd)
+            if result_str is not None:
+                if name == "text_to_speech" or len(result_str) <= 8192:
+                    payload_obj["result"] = result_str
+            payload = _j.dumps(payload_obj, ensure_ascii=False)
+        except Exception:
+            payload = name
+        _web_chat_live.tool_complete(
+            session_id,
+            tool_id=str(tc_id or ""),
+            name=str(name or "tool"),
+            result=result_str,
+            cwd=footer_cwd,
+        )
+        _send("TOOL_COMPLETE", payload)
+        if name == "text_to_speech" and result:
             try:
-                from agent.display import build_tool_technical_summary
-
-                if isinstance(args, dict) and name:
-                    technical = build_tool_technical_summary(name, args) or ""
+                tts_data = _j.loads(str(result))
+                file_path = str(tts_data.get("file_path") or "").strip()
+                if tts_data.get("success") and file_path:
+                    _send(
+                        "TTS_AUDIO",
+                        _j.dumps(
+                            {
+                                "tool_call_id": tc_id,
+                                "file_path": file_path,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    )
             except Exception:
                 pass
+        if name in ("write_file", "edit_file", "patch", "execute_code") and result:
             try:
-                payload = _j.dumps(
-                    {
-                        "event": event_type,
-                        "name": name or "",
-                        "preview": preview_text[:240],
-                        "technical": technical[:240],
-                    },
-                    ensure_ascii=False,
+                from pathlib import Path as _Path
+                from ector_cli.agent_images import (
+                    extract_chat_media_from_tool_result,
+                    markdown_from_tool_result,
                 )
+                from ector_cli.chat_media_paths import (
+                    chat_file_preview_url,
+                    chat_image_api_url,
+                )
+
+                md = markdown_from_tool_result(name, str(result))
+                media = extract_chat_media_from_tool_result(name, str(result))
+                attachments = []
+                for item in media:
+                    raw_path = str(item.get("path") or "").strip()
+                    kind = str(item.get("kind") or "").strip() or "document"
+                    suffix = _Path(raw_path).suffix.lower()
+                    if not raw_path:
+                        continue
+                    download_url = (
+                        chat_image_api_url(raw_path)
+                        if kind == "image"
+                        else (
+                            "/api/chat/files/download?"
+                            f"path={urllib.parse.quote(raw_path, safe='')}"
+                            f"&session_id={urllib.parse.quote(session_id, safe='')}"
+                        )
+                    )
+                    preview_url = (
+                        chat_image_api_url(raw_path)
+                        if kind == "image"
+                        else (
+                            chat_file_preview_url(raw_path, session_id)
+                            if suffix in {".svg", ".html", ".htm"}
+                            else download_url
+                        )
+                    )
+                    if not preview_url:
+                        continue
+                    attachments.append(
+                        {
+                            "id": f"tool-media-{_Path(raw_path).name}",
+                            "name": _Path(raw_path).name,
+                            "kind": "image"
+                            if (kind == "image" or suffix == ".svg")
+                            else "document",
+                            "url": download_url,
+                            "previewUrl": preview_url,
+                            "path": raw_path,
+                        }
+                    )
+                if md or attachments:
+                    _send(
+                        "CHAT_IMAGE",
+                        _j.dumps(
+                            {"markdown": md or "", "attachments": attachments},
+                            ensure_ascii=False,
+                        ),
+                    )
             except Exception:
-                payload = f"{event_type}|{name or ''}|{preview_text[:240]}"
-            _web_chat_live.tool_progress(
-                session_id,
-                tool_name=str(name or ""),
-                preview=preview_text,
-                technical=technical,
+                pass
+
+    def on_tool_progress(event_type, name=None, preview=None, args=None, **kwargs):
+        import json as _j
+
+        preview_text = str(preview or "")
+        technical = ""
+        try:
+            from agent.display import build_tool_technical_summary
+
+            if isinstance(args, dict) and name:
+                technical = build_tool_technical_summary(name, args) or ""
+        except Exception:
+            pass
+        try:
+            payload = _j.dumps(
+                {
+                    "event": event_type,
+                    "name": name or "",
+                    "preview": preview_text[:240],
+                    "technical": technical[:240],
+                },
+                ensure_ascii=False,
             )
-            _send("TOOL_PROGRESS", payload)
+        except Exception:
+            payload = f"{event_type}|{name or ''}|{preview_text[:240]}"
+        _web_chat_live.tool_progress(
+            session_id,
+            tool_name=str(name or ""),
+            preview=preview_text,
+            technical=technical,
+        )
+        _send("TOOL_PROGRESS", payload)
 
-        def on_thinking(text: str):
-            if text:
-                _web_chat_live.set_thinking(session_id)
-                _send("THINKING", text[:500])
+    def on_thinking(text: str):
+        if text:
+            _web_chat_live.set_thinking(session_id)
+            _send("THINKING", text[:500])
 
-        def on_approval_request(approval_data: dict):
-            import json as _j
+    def on_approval_request(approval_data: dict):
+        import json as _j
 
+        try:
+            payload_data = dict(approval_data or {})
+            payload_data.setdefault("session_id", session_id)
+            payload = _j.dumps(payload_data, ensure_ascii=False)
+        except Exception:
+            payload = "{}"
+        _send("APPROVAL_REQUEST", payload)
+
+    def on_done():
+        loop.call_soon_threadsafe(queue.put_nowait, None)
+        loop.call_soon_threadsafe(_release_web_chat_turn, session_id)
+
+    agent = None
+
+    def run():
+        nonlocal agent
+        title_thread = None
+        try:
             try:
-                payload_data = dict(approval_data or {})
-                payload_data.setdefault("session_id", session_id)
-                payload = _j.dumps(payload_data, ensure_ascii=False)
-            except Exception:
-                payload = "{}"
-            _send("APPROVAL_REQUEST", payload)
+                _ensure_web_runtime_paths_writable()
+            except OSError as exc:
+                _send(
+                    "TEXT",
+                    "*Não foi possível inicializar runtime do web chat: "
+                    f"{exc}*",
+                )
+                return
 
-        def on_done():
-            loop.call_soon_threadsafe(queue.put_nowait, None)
+            from run_agent import AIAgent
 
-        # Create agent lazily inside event_stream so it gets the callbacks
-        should_start_thread = True
-        agent = _CHAT_AGENTS.get(session_id)
-        if agent is not None and _web_chat_cached_agent_stale(agent, body):
-            with _CHAT_AGENTS_LOCK:
-                _CHAT_AGENTS.pop(session_id, None)
-            agent = None
-        if agent is None:
-            with _CHAT_AGENTS_LOCK:
-                agent = _CHAT_AGENTS.get(session_id)
-                if agent is None:
-                    try:
-                        from ector_cli.config import load_config
-                        from ector_cli.runtime_provider import resolve_runtime_provider
-                        cfg = load_config() or {}
-                        _agent_cfg = cfg.get("agent") or {}
-                        _model_cfg = cfg.get("model") or {}
-                        raw_model = body.get("model") or ""
-                        if not raw_model:
-                            if isinstance(_model_cfg, str):
-                                raw_model = _model_cfg
-                            elif isinstance(_model_cfg, dict):
-                                raw_model = _model_cfg.get("default") or _model_cfg.get("name") or ""
-                        if not raw_model:
-                            raw_model = _agent_cfg.get("model", "") if isinstance(_agent_cfg, dict) else ""
-                        if not raw_model:
-                            raw_model = os.environ.get("ECTOR_MODEL", "") or os.environ.get("ECTOR_INFERENCE_MODEL", "")
-                        model = str(raw_model).strip()
-                        if not model:
-                            _send("TEXT", "Nenhum modelo configurado. Configure um modelo em /config ou passe model no body.")
-                            on_done()
-                            should_start_thread = False
-                        provider = body.get("provider") or ""
-                        if should_start_thread:
-                            runtime = resolve_runtime_provider(requested=provider, target_model=model or None)
+            agent = _CHAT_AGENTS.get(session_id)
+            if agent is not None and _web_chat_cached_agent_stale(agent, body):
+                with _CHAT_AGENTS_LOCK:
+                    _CHAT_AGENTS.pop(session_id, None)
+                agent = None
+            if agent is None:
+                with _CHAT_AGENTS_LOCK:
+                    agent = _CHAT_AGENTS.get(session_id)
+                    if agent is None:
+                        try:
+                            from ector_cli.config import load_config
+                            from ector_cli.runtime_provider import resolve_runtime_provider
+
+                            cfg = load_config() or {}
+                            _agent_cfg = cfg.get("agent") or {}
+                            _model_cfg = cfg.get("model") or {}
+                            raw_model = body.get("model") or ""
+                            if not raw_model:
+                                if isinstance(_model_cfg, str):
+                                    raw_model = _model_cfg
+                                elif isinstance(_model_cfg, dict):
+                                    raw_model = (
+                                        _model_cfg.get("default")
+                                        or _model_cfg.get("name")
+                                        or ""
+                                    )
+                            if not raw_model:
+                                raw_model = (
+                                    _agent_cfg.get("model", "")
+                                    if isinstance(_agent_cfg, dict)
+                                    else ""
+                                )
+                            if not raw_model:
+                                raw_model = os.environ.get(
+                                    "ECTOR_MODEL", ""
+                                ) or os.environ.get("ECTOR_INFERENCE_MODEL", "")
+                            model = str(raw_model).strip()
+                            if not model:
+                                _send(
+                                    "TEXT",
+                                    "Nenhum modelo configurado. Configure um modelo em /config ou passe model no body.",
+                                )
+                                return
+                            provider = body.get("provider") or ""
+                            runtime = resolve_runtime_provider(
+                                requested=provider, target_model=model or None
+                            )
                             try:
                                 agent = AIAgent(
                                     model=model,
@@ -4180,8 +4365,6 @@ async def chat_send(request: Request):
                                     session_db=_get_chat_session_db(),
                                 )
                             except OSError as init_exc:
-                                # Some environments block writes to ~/.ector/logs.
-                                # Force project-local fallback and retry once.
                                 if (
                                     "agent.log" in str(init_exc)
                                     and "Operation not permitted" in str(init_exc)
@@ -4210,180 +4393,178 @@ async def chat_send(request: Request):
                                     )
                                 else:
                                     raise
-                    except Exception as exc:
-                        _send("TEXT", f"\n\n*Erro ao criar agente: {exc}*")
-                        on_done()
-                        should_start_thread = False
-                    if should_start_thread and agent is not None:
-                        _CHAT_AGENTS[session_id] = agent
-                        try:
-                            from tools.terminal_tool import register_task_env_overrides
+                        except Exception as exc:
+                            _send("TEXT", f"\n\n*Erro ao criar agente: {exc}*")
+                            return
+                        if agent is not None:
+                            _CHAT_AGENTS[session_id] = agent
+                            try:
+                                from tools.terminal_tool import register_task_env_overrides
 
-                            register_task_env_overrides(
-                                session_id,
-                                {"cwd": _resolve_web_chat_cwd(session_id)},
-                            )
-                        except Exception:
-                            pass
-        if agent is not None:
-            # Agent instances are reused per session; refresh per-request callbacks
-            # so tool/status events are emitted to the current SSE queue.
+                                register_task_env_overrides(
+                                    session_id,
+                                    {"cwd": _resolve_web_chat_cwd(session_id)},
+                                )
+                            except Exception:
+                                pass
+
+            if agent is None:
+                return
+
             agent.tool_start_callback = on_tool_start
             agent.tool_complete_callback = on_tool_complete
             agent.tool_progress_callback = on_tool_progress
             agent.thinking_callback = on_thinking
             agent.status_callback = on_status
             agent.stream_delta_callback = on_stream_delta
+            from ector_cli.config import load_config
+
             _display_cfg = (load_config() or {}).get("display") or {}
             _interim_raw = _display_cfg.get("interim_assistant_messages", True)
             _interim_on = (
                 _interim_raw is not False
-                and str(_interim_raw).strip().lower() not in {"0", "false", "off", "no", "none"}
+                and str(_interim_raw).strip().lower()
+                not in {"0", "false", "off", "no", "none"}
             )
             agent.interim_assistant_callback = (
                 on_interim_assistant if _interim_on else None
             )
 
-        _prime_web_session_cwd(session_id)
-
-        def run():
-            title_thread = None
-            try:
-                with _web_chat_approval_context(session_id, on_approval_request):
-                    _prime_web_session_cwd(session_id)
-                    try:
-                        db = _get_chat_session_db()
-                        model_name = (
-                            getattr(agent, "model", None) if agent is not None else None
-                        )
-                        db.ensure_session(
+            with _web_chat_approval_context(session_id, on_approval_request):
+                _prime_web_session_cwd(session_id)
+                try:
+                    db = _get_chat_session_db()
+                    model_name = (
+                        getattr(agent, "model", None) if agent is not None else None
+                    )
+                    db.ensure_session(
+                        session_id,
+                        source="web",
+                        model=model_name,
+                    )
+                except Exception:
+                    if _WEB_CHAT_DEBUG:
+                        _log.debug(
+                            "[web-chat] ensure_session failed request_id=%s session=%s",
+                            request_id,
                             session_id,
-                            source="web",
-                            model=model_name,
+                            exc_info=True,
+                        )
+                conversation_history = None
+                try:
+                    history = _get_chat_session_db().get_messages_as_conversation(
+                        session_id
+                    )
+                    if history:
+                        conversation_history = history
+                    if _WEB_CHAT_DEBUG:
+                        _log.info(
+                            "[web-chat] history loaded request_id=%s session=%s count=%d",
+                            request_id,
+                            session_id,
+                            len(history or []),
+                        )
+                except Exception:
+                    conversation_history = None
+                    if _WEB_CHAT_DEBUG:
+                        _log.exception(
+                            "[web-chat] history load failed request_id=%s session=%s",
+                            request_id,
+                            session_id,
+                        )
+
+                prompt = message
+                if image_paths or document_paths:
+                    if image_paths:
+                        on_status("vision", "Analisando imagem…")
+                    if document_paths:
+                        on_status("documents", "Extraindo documentos…")
+                    prompt = prepare_web_chat_message(
+                        message, image_paths, document_paths
+                    )
+
+                # Stream only via stream_delta_callback — passing stream_callback
+                # too would double-fire on_chunk for every token (_fire_stream_delta).
+                result = agent.run_conversation(
+                    prompt,
+                    conversation_history=conversation_history,
+                    task_id=session_id,
+                )
+                final = (result or {}).get("final_response") or ""
+                if _WEB_CHAT_DEBUG:
+                    _log.info(
+                        "[web-chat] run complete request_id=%s session=%s final_len=%d streamed_text=%s",
+                        request_id,
+                        session_id,
+                        len(final),
+                        streamed_text,
+                    )
+                # Deltas already went to the client via on_chunk; re-sending
+                # ``final`` would duplicate the transcript on append-style UIs.
+                if final and not streamed_text:
+                    _send("TEXT", final)
+
+                failed = bool((result or {}).get("failed"))
+                partial = bool((result or {}).get("partial"))
+                if final and not failed and not partial:
+                    try:
+                        from agent.title_generator import maybe_auto_title
+
+                        history_after = None
+                        try:
+                            history_after = (
+                                _get_chat_session_db().get_messages_as_conversation(
+                                    session_id
+                                )
+                            )
+                        except Exception:
+                            history_after = conversation_history
+
+                        def _on_session_title(title: str) -> None:
+                            import json as _title_json
+
+                            _send(
+                                "SESSION_TITLE",
+                                _title_json.dumps(
+                                    {"session_id": session_id, "title": title},
+                                    ensure_ascii=False,
+                                ),
+                            )
+
+                        title_thread = maybe_auto_title(
+                            _get_chat_session_db(),
+                            session_id,
+                            message,
+                            final,
+                            history_after or [],
+                            title_callback=_on_session_title,
                         )
                     except Exception:
                         if _WEB_CHAT_DEBUG:
                             _log.debug(
-                                "[web-chat] ensure_session failed request_id=%s session=%s",
+                                "[web-chat] auto-title skipped request_id=%s session=%s",
                                 request_id,
                                 session_id,
                                 exc_info=True,
                             )
-                    conversation_history = None
-                    try:
-                        history = _get_chat_session_db().get_messages_as_conversation(
-                            session_id
-                        )
-                        if history:
-                            conversation_history = history
-                        if _WEB_CHAT_DEBUG:
-                            _log.info(
-                                "[web-chat] history loaded request_id=%s session=%s count=%d",
-                                request_id,
-                                session_id,
-                                len(history or []),
-                            )
-                    except Exception:
-                        conversation_history = None
-                        if _WEB_CHAT_DEBUG:
-                            _log.exception(
-                                "[web-chat] history load failed request_id=%s session=%s",
-                                request_id,
-                                session_id,
-                            )
+        except Exception as exc:
+            _send("TEXT", f"\n\n*Erro: {exc}*")
+            if _WEB_CHAT_DEBUG:
+                _log.exception(
+                    "[web-chat] run failed request_id=%s session=%s",
+                    request_id,
+                    session_id,
+                )
+        finally:
+            _sync_web_session_cwd_from_env(session_id, allow_default_env=True)
+            if title_thread is not None:
+                title_thread.join(timeout=2.5)
+            on_done()
 
-                    prompt = message
-                    if image_paths or document_paths:
-                        if image_paths:
-                            on_status("vision", "Analisando imagem…")
-                        if document_paths:
-                            on_status("documents", "Extraindo documentos…")
-                        prompt = prepare_web_chat_message(
-                            message, image_paths, document_paths
-                        )
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
 
-                    # Stream only via stream_delta_callback — passing stream_callback
-                    # too would double-fire on_chunk for every token (_fire_stream_delta).
-                    result = agent.run_conversation(
-                        prompt,
-                        conversation_history=conversation_history,
-                        task_id=session_id,
-                    )
-                    final = (result or {}).get("final_response") or ""
-                    if _WEB_CHAT_DEBUG:
-                        _log.info(
-                            "[web-chat] run complete request_id=%s session=%s final_len=%d streamed_text=%s",
-                            request_id,
-                            session_id,
-                            len(final),
-                            streamed_text,
-                        )
-                    # Deltas already went to the client via on_chunk; re-sending
-                    # ``final`` would duplicate the transcript on append-style UIs.
-                    if final and not streamed_text:
-                        _send("TEXT", final)
-
-                    failed = bool((result or {}).get("failed"))
-                    partial = bool((result or {}).get("partial"))
-                    if final and not failed and not partial:
-                        try:
-                            from agent.title_generator import maybe_auto_title
-
-                            history_after = None
-                            try:
-                                history_after = (
-                                    _get_chat_session_db().get_messages_as_conversation(
-                                        session_id
-                                    )
-                                )
-                            except Exception:
-                                history_after = conversation_history
-
-                            def _on_session_title(title: str) -> None:
-                                import json as _title_json
-
-                                _send(
-                                    "SESSION_TITLE",
-                                    _title_json.dumps(
-                                        {"session_id": session_id, "title": title},
-                                        ensure_ascii=False,
-                                    ),
-                                )
-
-                            title_thread = maybe_auto_title(
-                                _get_chat_session_db(),
-                                session_id,
-                                message,
-                                final,
-                                history_after or [],
-                                title_callback=_on_session_title,
-                            )
-                        except Exception:
-                            if _WEB_CHAT_DEBUG:
-                                _log.debug(
-                                    "[web-chat] auto-title skipped request_id=%s session=%s",
-                                    request_id,
-                                    session_id,
-                                    exc_info=True,
-                                )
-            except Exception as exc:
-                _send("TEXT", f"\n\n*Erro: {exc}*")
-                if _WEB_CHAT_DEBUG:
-                    _log.exception(
-                        "[web-chat] run failed request_id=%s session=%s",
-                        request_id,
-                        session_id,
-                    )
-            finally:
-                _sync_web_session_cwd_from_env(session_id, allow_default_env=True)
-                if title_thread is not None:
-                    title_thread.join(timeout=2.5)
-                on_done()
-
-        if should_start_thread and agent is not None:
-            thread = threading.Thread(target=run, daemon=True)
-            thread.start()
-
+    async def event_stream():
         stream_completed_normally = False
         try:
             while True:
@@ -4396,12 +4577,15 @@ async def chat_send(request: Request):
                 yield f"data: {safe}\n\n"
         finally:
             if stream_completed_normally:
-                _clear_chat_inflight(session_id)
-                _web_chat_live.clear_turn(session_id)
+                _release_web_chat_turn(session_id)
             else:
                 _web_chat_client_disconnect(session_id)
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers=_SSE_HEADERS,
+    )
 
 
 @app.post("/api/chat/transcribe")
@@ -4677,13 +4861,7 @@ async def chat_interrupt(request: Request):
             agent.interrupt()
         except Exception as exc:
             return JSONResponse({"error": str(exc)}, status_code=500)
-    _clear_chat_inflight(session_id)
-    try:
-        from ector_cli import web_chat_live as _web_chat_live
-
-        _web_chat_live.clear_turn(session_id)
-    except Exception:
-        pass
+    _release_web_chat_turn(session_id)
     return {"ok": True}
 
 
@@ -4693,6 +4871,7 @@ async def chat_status(request: Request, session_id: str = ""):
     sid = str(session_id or "").strip()
     if not sid:
         return JSONResponse({"error": "session_id is required"}, status_code=400)
+    _heal_chat_inflight(sid)
     return {
         "session_id": sid,
         "busy": _is_chat_inflight(sid),
@@ -4710,6 +4889,7 @@ async def chat_turn(request: Request, session_id: str = ""):
     from ector_cli.chat_message_media import prepare_session_messages_for_dashboard
     from ector_cli import web_chat_live as _web_chat_live
 
+    _heal_chat_inflight(sid)
     busy = _is_chat_inflight(sid)
     pending_approval = _web_chat_pending_approval(sid)
     messages: list[dict[str, Any]] = []
