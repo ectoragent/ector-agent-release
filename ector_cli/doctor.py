@@ -424,7 +424,10 @@ def run_doctor(args):
         if ocr_engines:
             check_ok("Motores OCR detectados", f"({', '.join(ocr_engines)})")
         else:
-            check_warn("Motores OCR não detectados", "(Docling pode depender de instalação adicional)")
+            check_info(
+                "OCR local sob demanda",
+                "(RapidOCR é auto-instalado na 1ª análise de imagem)",
+            )
 
         if engines.get("florence"):
             check_ok("Florence-2 (VLM local)", "(documents-vision)")

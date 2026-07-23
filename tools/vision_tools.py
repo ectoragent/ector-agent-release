@@ -668,14 +668,7 @@ async def vision_analyze_tool(
                 f"API provider account and try again. Error: {e}"
             )
         elif "no llm provider" in err_str:
-            analysis = (
-                "Nenhum provedor de visão (LLM multimodal) configurado e o "
-                "fallback local (Tesseract/Florence) também falhou ou não está "
-                "instalado. Configure OpenRouter/um modelo com visão, um "
-                "endpoint local em auxiliary.vision, ou instale tesseract / "
-                "`pip install 'ector-agent[documents-vision]'`. "
-                f"Error: {e}"
-            )
+            analysis = vision_unavailable_message(str(e))
         elif any(hint in err_str for hint in (
             "does not support", "not support image",
             "content_policy", "multimodal",
@@ -725,31 +718,40 @@ async def vision_analyze_tool(
 
 def check_vision_requirements() -> bool:
     """True when an LLM vision backend OR a local OCR/VLM backend is available."""
+    if vision_llm_available():
+        return True
+    return local_image_backend_available()
+
+
+def vision_llm_available() -> bool:
+    """True when a multimodal LLM client can be resolved for task=vision."""
     try:
         from agent.auxiliary_client import resolve_vision_provider_client
 
         _provider, client, _model = resolve_vision_provider_client()
-        if client is not None:
-            return True
+        return client is not None
     except Exception:
-        pass
-    try:
-        from agent.document_stack.florence import florence_available
-        from agent.document_stack.tesseract_ocr import tesseract_available
+        return False
 
-        return bool(tesseract_available() or florence_available())
+
+def local_image_backend_available() -> bool:
+    """True when Tesseract, RapidOCR (auto-install), and/or Florence can run."""
+    try:
+        from agent.document_stack.local_image import local_ocr_backend_available
+
+        return bool(local_ocr_backend_available(auto_install=True))
     except Exception:
         return False
 
 
 def _local_image_analysis(image_path: Path) -> Optional[dict]:
-    """Run Tesseract/Florence local understanding. Returns success payload or None."""
+    """Run Tesseract/RapidOCR/Florence local understanding. Returns success payload or None."""
     try:
         from agent.document_stack.local_image import understand_image_local
     except Exception:
         return None
     try:
-        local = understand_image_local(str(image_path))
+        local = understand_image_local(str(image_path), auto_install_ocr=True)
     except Exception as exc:
         logger.debug("Local image understanding failed: %s", exc)
         return None
@@ -762,6 +764,20 @@ def _local_image_analysis(image_path: Path) -> Optional[dict]:
         "analysis": markdown,
         "backend": backend,
     }
+
+
+def vision_unavailable_message(detail: str = "") -> str:
+    """Guidance when cloud vision and local OCR both failed — steer the agent away from retries."""
+    base = (
+        "Não foi possível analisar a imagem agora (sem modelo multimodal e o "
+        "OCR local automático não ficou disponível). Continue com "
+        "`browser_snapshot` / texto da página; não chame `browser_vision` de "
+        "novo nesta tarefa só para tentar o mesmo caminho."
+    )
+    detail = (detail or "").strip()
+    if not detail:
+        return base
+    return f"{base} Detalhe: {detail}"
 
 
 

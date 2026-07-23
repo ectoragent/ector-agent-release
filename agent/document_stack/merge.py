@@ -79,10 +79,17 @@ def merge_backend_label(
     """Stable backend string for markers / logging."""
     has_ocr = bool(ocr and ocr.get("success") and (ocr.get("markdown") or ocr.get("boxes")))
     has_flo = bool(florence and florence.get("success") and florence.get("caption"))
+    ocr_name = "tesseract"
+    if has_ocr and isinstance(ocr, dict):
+        raw = str(ocr.get("backend") or "").strip().lower()
+        if raw.startswith("rapid"):
+            ocr_name = "rapidocr"
+        elif raw:
+            ocr_name = raw
     if has_ocr and has_flo:
-        return "tesseract+florence"
+        return f"{ocr_name}+florence"
     if has_flo:
         return "florence-2"
     if has_ocr:
-        return "tesseract"
+        return ocr_name
     return "local"

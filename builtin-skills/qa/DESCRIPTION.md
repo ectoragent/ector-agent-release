@@ -1,7 +1,8 @@
 ---
-description: "Estratégia de testes e QA exploratório."
+description: "Estratégia de testes, QA exploratório e guardas de regressão."
 ---
 
 # qa
 
-Estratégia de testes e QA exploratório.
+Estratégia de testes, QA exploratório e testes que travam regressão após bugfix.
+

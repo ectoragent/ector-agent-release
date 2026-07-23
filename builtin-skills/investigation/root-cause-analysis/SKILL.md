@@ -12,6 +12,7 @@ metadata:
 
 ## Quando usar
 - Bug difícil de reproduzir, comportamento inesperado, decidir entre "corrigir sintoma" e achar a causa real
+- Em seguida use `bug-fix-workflow` para o patch + teste; se for outage, `production-hotfix`
 
 ## Passos
 1. Reproduza antes de teorizar; sem repro confiável, qualquer "causa" é chute.

@@ -2471,8 +2471,41 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
         data_url = f"data:image/png;base64,{_screenshot_b64}"
         
         from agent.vision_prompts import build_browser_vision_prompt
+        from tools.vision_tools import (
+            _local_image_analysis,
+            vision_llm_available,
+            vision_unavailable_message,
+        )
 
         vision_prompt = build_browser_vision_prompt(question)
+
+        def _with_annotations(payload: dict) -> dict:
+            if annotate and result.get("data", {}).get("annotations"):
+                payload = {**payload, "annotations": result["data"]["annotations"]}
+            payload["screenshot_path"] = str(screenshot_path)
+            return payload
+
+        # Sem LLM de visão: ir direto ao OCR/VLM local (evita erro "provider=auto").
+        if not vision_llm_available():
+            local = _local_image_analysis(screenshot_path)
+            if local:
+                logger.info(
+                    "browser_vision: sem LLM de visão — usando backend local (%s)",
+                    local.get("backend"),
+                )
+                return json.dumps(_with_annotations(local), ensure_ascii=False)
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": vision_unavailable_message(),
+                    "screenshot_path": str(screenshot_path),
+                    "note": (
+                        "Screenshot capturado. Configure visão LLM ou OCR local "
+                        "para analisar a imagem."
+                    ),
+                },
+                ensure_ascii=False,
+            )
 
         # Use the centralized LLM router
         vision_model = _get_vision_model()
@@ -2540,14 +2573,10 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
         # Redact secrets the vision LLM may have read from the screenshot.
         from agent.redact import redact_sensitive_text
         analysis = redact_sensitive_text(analysis)
-        response_data = {
+        response_data = _with_annotations({
             "success": True,
             "analysis": analysis or "Vision analysis returned no content.",
-            "screenshot_path": str(screenshot_path),
-        }
-        # Include annotation data if annotated screenshot was taken
-        if annotate and result.get("data", {}).get("annotations"):
-            response_data["annotations"] = result["data"]["annotations"]
+        })
         return json.dumps(response_data, ensure_ascii=False)
     
     except Exception as e:
@@ -2556,12 +2585,47 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
         # screenshot loses evidence the user might need.  The 24-hour cleanup
         # in _cleanup_old_screenshots prevents unbounded disk growth.
         logger.warning("browser_vision failed: %s", e, exc_info=True)
-        error_info = {"success": False, "error": f"Error during vision analysis: {str(e)}"}
         if screenshot_path.exists():
-            error_info["screenshot_path"] = str(screenshot_path)
-            error_info["note"] = "Screenshot was captured but vision analysis failed. You can still share it via MEDIA:<path>."
-        return json.dumps(error_info, ensure_ascii=False)
+            try:
+                from tools.vision_tools import (
+                    _local_image_analysis,
+                    vision_unavailable_message,
+                )
 
+                local = _local_image_analysis(screenshot_path)
+                if local:
+                    logger.info(
+                        "browser_vision: LLM falhou — fallback local (%s)",
+                        local.get("backend"),
+                    )
+                    local["screenshot_path"] = str(screenshot_path)
+                    return json.dumps(local, ensure_ascii=False)
+                err_text = str(e)
+                if "no llm provider" in err_text.lower():
+                    err_text = vision_unavailable_message(err_text)
+                else:
+                    err_text = f"Error during vision analysis: {err_text}"
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": err_text,
+                        "screenshot_path": str(screenshot_path),
+                        "note": (
+                            "Screenshot was captured but vision analysis failed. "
+                            "You can still share it via MEDIA:<path>."
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+            except Exception:
+                pass
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"Error during vision analysis: {str(e)}",
+            },
+            ensure_ascii=False,
+        )
 
 def _cleanup_old_screenshots(screenshots_dir, max_age_hours=24):
     """Remove browser screenshots older than max_age_hours to prevent disk bloat.

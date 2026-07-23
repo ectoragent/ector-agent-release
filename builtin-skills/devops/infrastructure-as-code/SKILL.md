@@ -12,6 +12,7 @@ metadata:
 
 ## Quando usar
 - Provisionar/alterar infra via código, revisar plano, resolver drift ou state travado
+- Para flags/receitas do binário Terraform, use também a skill `terraform-cli`
 
 ## Passos
 1. State remoto com lock (S3+DynamoDB, Terraform Cloud, etc.) — nunca state local em time.

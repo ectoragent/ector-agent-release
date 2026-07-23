@@ -595,19 +595,26 @@ def enrich_with_attached_images(user_text: str, image_paths: list[str]) -> str:
 
         vision_ok = False
         if mode in {"vision_then_ocr", "vision_only"}:
-            try:
-                r = json.loads(
-                    asyncio.run(vision_analyze_tool(image_url=str(p), user_prompt=prompt))
-                )
-                desc = r.get("analysis", "") if r.get("success") else None
-                if desc:
-                    vision_ok = True
-                    _append_part(format_image_context_block(desc, str(p)))
-                elif mode == "vision_only":
-                    _append_part(format_image_context_failed(str(p)))
-            except Exception:
-                if mode == "vision_only":
-                    _append_part(format_image_context_failed(str(p)))
+            from tools.vision_tools import vision_llm_available
+
+            if vision_llm_available():
+                try:
+                    r = json.loads(
+                        asyncio.run(
+                            vision_analyze_tool(image_url=str(p), user_prompt=prompt)
+                        )
+                    )
+                    desc = r.get("analysis", "") if r.get("success") else None
+                    if desc:
+                        vision_ok = True
+                        _append_part(format_image_context_block(desc, str(p)))
+                    elif mode == "vision_only":
+                        _append_part(format_image_context_failed(str(p)))
+                except Exception:
+                    if mode == "vision_only":
+                        _append_part(format_image_context_failed(str(p)))
+            elif mode == "vision_only":
+                _append_part(format_image_context_failed(str(p)))
 
         if vision_ok:
             continue

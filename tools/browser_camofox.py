@@ -28,6 +28,7 @@ import logging
 import os
 import threading
 import uuid
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import requests
@@ -536,11 +537,25 @@ def camofox_vision(question: str, annotate: bool = False,
 
         # Send to vision LLM
         from agent.auxiliary_client import call_llm
+        from tools.vision_tools import (
+            _local_image_analysis,
+            vision_llm_available,
+            vision_unavailable_message,
+        )
 
         vision_prompt = (
             f"Analyze this browser screenshot and answer: {question}"
             f"{annotation_context}"
         )
+
+        screenshot_path_obj = Path(screenshot_path)
+
+        if not vision_llm_available():
+            local = _local_image_analysis(screenshot_path_obj)
+            if local:
+                local["screenshot_path"] = screenshot_path
+                return json.dumps(local, ensure_ascii=False)
+            return tool_error(vision_unavailable_message(), success=False)
 
         try:
             _cfg = load_config()
@@ -551,37 +566,46 @@ def camofox_vision(question: str, annotate: bool = False,
             _vision_timeout = 120.0
             _vision_temperature = 0.1
 
-        response = call_llm(
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": vision_prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/png;base64,{img_b64}",
+        try:
+            response = call_llm(
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": vision_prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{img_b64}",
+                            },
                         },
-                    },
-                ],
-            }],
-            task="vision",
-            temperature=_vision_temperature,
-            timeout=_vision_timeout,
-        )
-        analysis = (response.choices[0].message.content or "").strip() if response.choices else ""
+                    ],
+                }],
+                task="vision",
+                temperature=_vision_temperature,
+                timeout=_vision_timeout,
+            )
+            analysis = (response.choices[0].message.content or "").strip() if response.choices else ""
 
-        # Redact secrets the vision LLM may have read from the screenshot.
-        from agent.redact import redact_sensitive_text
-        analysis = redact_sensitive_text(analysis)
+            # Redact secrets the vision LLM may have read from the screenshot.
+            from agent.redact import redact_sensitive_text
+            analysis = redact_sensitive_text(analysis)
 
-        return json.dumps({
-            "success": True,
-            "analysis": analysis,
-            "screenshot_path": screenshot_path,
-        })
+            return json.dumps({
+                "success": True,
+                "analysis": analysis,
+                "screenshot_path": screenshot_path,
+            })
+        except Exception as llm_err:
+            local = _local_image_analysis(screenshot_path_obj)
+            if local:
+                local["screenshot_path"] = screenshot_path
+                return json.dumps(local, ensure_ascii=False)
+            err = str(llm_err)
+            if "no llm provider" in err.lower():
+                return tool_error(vision_unavailable_message(err), success=False)
+            return tool_error(err, success=False)
     except Exception as e:
         return tool_error(str(e), success=False)
-
 
 def camofox_console(clear: bool = False, task_id: Optional[str] = None) -> str:
     """Get console output — limited support in Camofox.

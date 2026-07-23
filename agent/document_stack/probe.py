@@ -85,6 +85,10 @@ def probe_document_stack() -> Dict[str, Any]:
         install_hints.append("pip install 'ector-agent[documents-heavy]'")
     if not has_florence and not is_termux():
         install_hints.append("pip install 'ector-agent[documents-vision]'  # Florence-2 local VLM")
+    if not has_rapidocr and not has_tesseract:
+        install_hints.append(
+            "OCR: RapidOCR auto-instala na 1ª análise de imagem (sem brew/apt)"
+        )
     if is_termux():
         install_hints.append("Termux detected: use documents-lite only")
 

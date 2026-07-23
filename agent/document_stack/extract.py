@@ -290,25 +290,45 @@ def extract_document(
         except Exception as exc:
             last_error = str(exc)
 
-    # Last-resort local OCR: no Python extras needed, just the `tesseract`
-    # binary (already detected by probe_document_stack()["engines"]["tesseract"]
-    # but previously never consulted here). Images only for now.
-    if kind == "image" and probe.get("engines", {}).get("tesseract"):
-        tried.append("tesseract")
-        for candidate in try_paths:
-            try:
-                result = _extract_with_tesseract(Path(candidate))
-                if _markdown_text_len(result.get("markdown")) > 0:
-                    result["chunks"] = _build_chunks(result.get("markdown", ""))
-                    result["kind"] = kind
-                    result["cached_path"] = str(cache_path)
-                    cache_path.write_text(
-                        json.dumps(result, ensure_ascii=False), encoding="utf-8"
-                    )
-                    return result
-                last_error = "tesseract produced no text"
-            except Exception as exc:
-                last_error = str(exc)
+    # Last-resort local OCR: system Tesseract, else auto-install RapidOCR.
+    if kind == "image":
+        engines = probe.get("engines", {}) if isinstance(probe.get("engines"), dict) else {}
+        if engines.get("tesseract"):
+            tried.append("tesseract")
+            for candidate in try_paths:
+                try:
+                    result = _extract_with_tesseract(Path(candidate))
+                    if _markdown_text_len(result.get("markdown")) > 0:
+                        result["chunks"] = _build_chunks(result.get("markdown", ""))
+                        result["kind"] = kind
+                        result["cached_path"] = str(cache_path)
+                        cache_path.write_text(
+                            json.dumps(result, ensure_ascii=False), encoding="utf-8"
+                        )
+                        return result
+                    last_error = "tesseract produced no text"
+                except Exception as exc:
+                    last_error = str(exc)
+        tried.append("rapidocr")
+        try:
+            from agent.document_stack.rapidocr_engine import extract_with_rapidocr
+
+            for candidate in try_paths:
+                try:
+                    result = extract_with_rapidocr(Path(candidate), auto_install=True)
+                    if _markdown_text_len(result.get("markdown")) > 0:
+                        result["chunks"] = _build_chunks(result.get("markdown", ""))
+                        result["kind"] = kind
+                        result["cached_path"] = str(cache_path)
+                        cache_path.write_text(
+                            json.dumps(result, ensure_ascii=False), encoding="utf-8"
+                        )
+                        return result
+                    last_error = "rapidocr produced no text"
+                except Exception as exc:
+                    last_error = str(exc)
+        except Exception as exc:
+            last_error = str(exc)
 
     if last_thin_docling_result is not None:
         r = last_thin_docling_result
