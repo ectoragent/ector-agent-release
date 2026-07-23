@@ -464,7 +464,13 @@ def get_image_cache_dir() -> Path:
 
 
 def _looks_like_image(data: bytes) -> bool:
-    """Return True if *data* starts with a known image magic-byte sequence."""
+    """Return True if *data* starts with a known image magic-byte sequence.
+
+    Covers every format advertised as supported in IMAGE_EXTENSIONS /
+    _MIME_TO_EXT (ector_cli/attachments.py) and _CHAT_IMAGE_SUFFIXES
+    (ector_cli/chat_media_paths.py) — SVG/TIFF/ICO used to be accepted by
+    extension/mime but rejected here, silently failing the upload.
+    """
     if len(data) < 4:
         return False
     if data[:8] == b"\x89PNG\r\n\x1a\n":
@@ -476,6 +482,17 @@ def _looks_like_image(data: bytes) -> bool:
     if data[:2] == b"BM":
         return True
     if data[:4] == b"RIFF" and len(data) >= 12 and data[8:12] == b"WEBP":
+        return True
+    if data[:4] in (b"II*\x00", b"MM\x00*"):  # TIFF (little/big-endian)
+        return True
+    if data[:4] == b"\x00\x00\x01\x00":  # ICO
+        return True
+    # SVG is text/XML, not a fixed binary signature — sniff the stripped
+    # head instead (tolerant of a leading UTF-8 BOM / XML declaration).
+    # Require an actual `<svg` tag, not just any XML declaration, so this
+    # doesn't accept arbitrary XML files that merely start with `<?xml`.
+    head = data.lstrip(b"\xef\xbb\xbf \t\r\n")[:512].lower()
+    if head.startswith(b"<svg") or (head.startswith(b"<?xml") and b"<svg" in head):
         return True
     return False
 

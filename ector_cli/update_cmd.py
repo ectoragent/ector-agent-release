@@ -927,62 +927,6 @@ def _venv_python(install_dir: Path) -> Path | None:
     return candidate if candidate.is_file() else None
 
 
-def _run_post_update_tui_repair(install_dir: Path) -> tuple[bool, str]:
-    """Run TUI repair in the install venv so freshly pip-installed code is used."""
-    venv_py = _venv_python(install_dir)
-    if venv_py is None:
-        return False, "venv/bin/python não encontrado"
-
-    script = """
-import os
-import sys
-from pathlib import Path
-
-root = Path(os.environ["ECTOR_POST_UPDATE_INSTALL"])
-from ector_cli.tui_launch import ensure_tui_prebuild_artifacts
-
-sys.exit(0 if ensure_tui_prebuild_artifacts(root) else 1)
-"""
-    env = {**os.environ, "ECTOR_POST_UPDATE_INSTALL": str(install_dir)}
-    proc = subprocess.run(
-        [str(venv_py), "-c", script],
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    detail = "\n".join(
-        line for line in f"{proc.stdout or ''}\n{proc.stderr or ''}".splitlines() if line.strip()
-    )
-    return proc.returncode == 0, detail
-
-
-def _verify_tui_after_update(install_dir: Path) -> bool:
-    """Ensure release TUI artefacts exist and pnpm-store copies carry the bundle."""
-    tui_dir = install_dir / "frontend" / "tui"
-    if not (tui_dir / "package.json").is_file():
-        return True
-
-    venv_py = _venv_python(install_dir)
-    if venv_py is not None:
-        ok, detail = _run_post_update_tui_repair(install_dir)
-    else:
-        from ector_cli.tui_launch import ensure_tui_prebuild_artifacts
-
-        ok = ensure_tui_prebuild_artifacts(install_dir)
-        detail = ""
-    if ok:
-        return True
-
-    _fail(
-        "Pacote TUI incompleto após a atualização — "
-        "dist/tui-bundle.js ausente. Execute `ector update` novamente."
-    )
-    if detail:
-        print(color(f"  {detail.splitlines()[-1]}", Colors.DIM))
-    return False
-
-
 def _report_update_success(install_dir: Path) -> None:
     print()
     updated = _installed_version_label(install_dir)
@@ -1177,9 +1121,6 @@ def cmd_update(args) -> None:
         _restart_gateway_if_needed(was_gateway_active, progress=progress)
         if progress.enabled:
             progress.phase_done()
-
-    if not _verify_tui_after_update(install_dir):
-        sys.exit(1)
 
     _report_update_success(install_dir)
     _print_version_screen(install_dir)

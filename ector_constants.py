@@ -81,6 +81,21 @@ def get_optional_skills_dir(default: Path | None = None) -> Path:
     return get_ector_home() / "optional-skills"
 
 
+def get_builtin_skills_dir(default: Path | None = None) -> Path:
+    """Return the always-on builtin-skills directory (no Hub required).
+
+    Packaged installs may ship ``builtin-skills`` outside the Python package
+    tree and expose it via ``ECTOR_BUILTIN_SKILLS``.  Source checkouts resolve
+    to ``<repo>/builtin-skills`` next to this module.
+    """
+    override = os.getenv("ECTOR_BUILTIN_SKILLS", "").strip()
+    if override:
+        return Path(override)
+    if default is not None:
+        return default
+    return Path(__file__).resolve().parent / "builtin-skills"
+
+
 def get_agent_images_dir() -> Path:
     """Return ``{ECTOR_HOME}/images`` for agent-generated charts and exports.
 

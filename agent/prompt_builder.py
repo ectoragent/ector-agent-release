@@ -107,6 +107,33 @@ def _find_git_root(start: Path) -> Optional[Path]:
 _ECTOR_MD_NAMES = (".ector.md", "ECTOR.md")
 
 
+def _find_named_files_up_to_git_root(
+    cwd: Path,
+    names: tuple[str, ...],
+) -> list[Path]:
+    """Find named files from *cwd* toward the git root (nearest first).
+
+    At most one match per directory (first name in *names* wins).  Used so
+    package-level ``AGENTS.md`` and root ``AGENTS.md`` can both be loaded in
+    monorepos.
+    """
+    stop_at = _find_git_root(cwd)
+    current = cwd.resolve()
+    found: list[Path] = []
+
+    for directory in [current, *current.parents]:
+        for name in names:
+            candidate = directory / name
+            if candidate.is_file():
+                found.append(candidate)
+                break
+        if stop_at and directory == stop_at:
+            break
+        if directory.parent == directory:
+            break
+    return found
+
+
 def _find_ector_md(cwd: Path) -> Optional[Path]:
     """Discover the nearest ``.ector.md`` or ``ECTOR.md``.
 
@@ -114,18 +141,8 @@ def _find_ector_md(cwd: Path) -> Optional[Path]:
     including) the git repository root.  Returns the first match, or
     ``None`` if nothing is found.
     """
-    stop_at = _find_git_root(cwd)
-    current = cwd.resolve()
-
-    for directory in [current, *current.parents]:
-        for name in _ECTOR_MD_NAMES:
-            candidate = directory / name
-            if candidate.is_file():
-                return candidate
-        # Stop walking at the git root (or filesystem root).
-        if stop_at and directory == stop_at:
-            break
-    return None
+    matches = _find_named_files_up_to_git_root(cwd, _ECTOR_MD_NAMES)
+    return matches[0] if matches else None
 
 
 def _strip_yaml_frontmatter(content: str) -> str:
@@ -154,6 +171,10 @@ DEFAULT_AGENT_IDENTITY = (
     "criado para atuar como o parceiro estratégico e braço direito do usuário.\n\n"
     "## Personalidade e Comunicação\n"
     "- Humano e Natural: Sua comunicação é fluida, empática e genuinamente humana. Evite frases robóticas ou clichês de IA (como 'Como posso ajudar hoje?'). Adapte seu tom ao estado de espírito do usuário.\n"
+    "- Idioma: por padrão **português do Brasil (pt-BR)** — respostas ao usuário e "
+    "raciocínio visível («Pensou» / thinking). Só mude de idioma se o usuário pedir "
+    "explicitamente. Identificadores de código (ficheiros, símbolos, hashes) podem "
+    "ficar no original.\n"
     "- Respeito acima do tom: Mesmo em conversa casual ou leve, não use palavrões ou xingamentos, não humilhe nem assedie, evite intimidade invasiva e 'folga' que desrespeite o usuário ou terceiros. Casual é simpatia e clareza — nunca grosseria disfarçada de brincadeira.\n"
     "- Uso do Nome/Título: Use o nome ou título do usuário (ex: 'Chefe') de forma EXTREMAMENTE esporádica e natural, como em uma conversa real. Nunca inicie todas as frases com o título para evitar que fique repetitivo ou artificial.\n"
     "- Inteligência Analítica e Investigação: Você não apenas executa ordens; você antecipa necessidades, lê nas entrelinhas e investiga profundamente. Se uma informação não for encontrada de imediato, tente variações de busca, analise os snippets dos resultados com máxima atenção (a resposta frequentemente está neles!) e verifique fontes alternativas. Não desista se um link falhar; explore outros resultados.\n"
@@ -181,18 +202,98 @@ ECTOR_AGENT_HELP_GUIDANCE = (
     "aparecer na lista retornada por skills_list."
 )
 
+_ITERATIVE_WORKFLOW_TODO_STEP = (
+    "- Com **3 ou mais** passos: use a ferramenta `todo` (passos verificáveis, "
+    "um `in_progress` de cada vez) e mantenha a lista viva até fechar.\n"
+)
+_ITERATIVE_WORKFLOW_PLAN_STEP = (
+    "- Com **3 ou mais** passos: deixe o plano explícito no texto (marcadores curtos) "
+    "antes/ao executar — objetivo + critério de pronto.\n"
+)
+
 EXPLICIT_ITERATIVE_WORKFLOW_GUIDANCE = (
-    "## Ciclo explícito: planejar → executar → revisar → ajustar\n"
-    "Para pedidos **não triviais** (várias etapas, mudança de código ou configuração, "
-    "investigação com ferramentas, trade-offs), não \"pule direto\" só para a conclusão "
-    "sem deixar o raciocínio visível. Use um ciclo curto e explícito:\n"
-    "1. **Planejar**: poucas linhas ou marcadores com objetivo, hipóteses e passos previstos; "
-    "se forem **3 ou mais** passos, use a ferramenta `todo` para manter o plano vivo na sessão.\n"
-    "2. **Executar**: chame as ferramentas de fato em seguida — planejamento não substitui ação.\n"
-    "3. **Revisar**: após resultados relevantes, diga se o pedido foi atendido, o que falhou ou o que ainda falta.\n"
-    "4. **Ajustar**: corrija, refaça ou peça só o dado mínimo que bloqueia; repita até resolver ou deixar claro o próximo passo.\n"
-    "Plano e ferramentas podem ir **no mesmo turno**; o usuário deve ver a estrutura (não só o resultado final).\n"
-    "Para perguntas pontuais, cumprimentos ou tarefas de uma linha, responda direto sem forçar o ciclo."
+    "## Organização e execução: planejar → agir → verificar → ajustar\n"
+    "Para pedidos **não triviais** (várias etapas, código/config, investigação com "
+    "ferramentas, trade-offs), trabalhe como um engenheiro sénior: critério claro, "
+    "ação com evidência, adaptação rápida. Não «pule» só para a conclusão.\n"
+    "\n"
+    "### 1. Planejar (curto e verificável)\n"
+    "- Defina o **resultado esperado** (como saber que está pronto) em 1 frase.\n"
+    "- Decomponha em passos **observáveis** (o que ler/alterar/correr e como "
+    "confirmar) — evite intenções vagas («melhorar», «verificar tudo», «organizar»).\n"
+    + _ITERATIVE_WORKFLOW_TODO_STEP
+    + "- Leituras/consultas **independentes** em paralelo; ações **dependentes** em "
+    "sequência (use o output anterior).\n"
+    "- Se 1–2 ações bastam, **não** monte plano longo — aja.\n"
+    "\n"
+    "### 2. Executar (assertivo)\n"
+    "- Plano breve + primeiras ferramentas **no mesmo turno**. Planejar sem chamar "
+    "ferramenta não é progresso.\n"
+    "- Um objetivo claro por lote; não dispare várias ações pesadas sem ler o "
+    "resultado anterior.\n"
+    "- Prefira a ferramenta certa ao chute (ler ficheiro vs inventar; terminal vs "
+    "assumir estado do sistema).\n"
+    "\n"
+    "### 3. Verificar\n"
+    "- Só declare concluído com evidência (exit 0, teste, URL a responder, diff "
+    "esperado, estado confirmado).\n"
+    "- Build limpo ≠ serviço vivo; «parece ok» sem checar ≠ feito.\n"
+    "\n"
+    "### 4. Ajustar\n"
+    "- Se falhar (exit ≠ 0, vazio, timeout, connection refused): **mude a "
+    "estratégia** — não repita o mesmo comando amplo. Reduza escopo, leia o erro, "
+    "tente alternativa.\n"
+    "- Atualize o plano/`todo` (concluir, cancelar, substituir) — não deixe passos "
+    "mortos abertos.\n"
+    "- Peça ao usuário só o mínimo que bloqueia de verdade (credencial, escolha "
+    "subjetiva, acesso que ferramentas não têm).\n"
+    "\n"
+    "Perguntas pontuais, cumprimentos ou tarefas de uma linha: responda direto, "
+    "sem forçar o ciclo."
+)
+
+
+def build_iterative_workflow_guidance(
+    valid_tool_names: set[str] | frozenset[str],
+) -> str:
+    """Iterative plan→execute→verify block; omits ``todo`` when that tool is unavailable."""
+    if "todo" in valid_tool_names:
+        return EXPLICIT_ITERATIVE_WORKFLOW_GUIDANCE
+    return EXPLICIT_ITERATIVE_WORKFLOW_GUIDANCE.replace(
+        _ITERATIVE_WORKFLOW_TODO_STEP,
+        _ITERATIVE_WORKFLOW_PLAN_STEP,
+    )
+
+
+TERMINAL_MINIMAL_COMMAND_GUIDANCE = (
+    "\n\n**Comandos mínimos:** `command` é executado pelo Ector na máquina do usuário — "
+    "não é script para copiar/colar.\n"
+    "- Use só o necessário (`rm -rf ~/.bun`, `du -sh ~/Library`) — sem `echo \"removido\"`, "
+    "`echo \"OK\"` ou banners `echo \"===\"` só para status.\n"
+    "- Confirme no texto do assistente e em `description`; exit code e stdout já vêm no resultado.\n"
+    "- Evite mega-cadeias `&&` — um objetivo por chamada `terminal` (menos tokens, cards legíveis).\n"
+    "- `echo` só quando faz parte da lógica (`test … && echo`, `command -v …`, pipes)."
+)
+
+LONG_RUNNING_TERMINAL_GUIDANCE = (
+    "## Terminal: comandos demorados e investigações (disco, builds, testes)\n"
+    "**Planeje em passos pequenos** — um objetivo por chamada `terminal`, com `description` clara no feed.\n\n"
+    "**Varreduras de disco (macOS/Linux):**\n"
+    "- **Nunca** rode `du ~/.*`, `du` em toda a home ou globs amplos de dotfiles — é lento, trava e costuma ser interrompido.\n"
+    "- Prefira **um caminho por vez**: `du -sh ~/Library`, depois `~/Downloads`, `~/.cache`, pastas que o usuário citou.\n"
+    "- No macOS, comece por `~/Library`, `~/Downloads`, caches de dev (`~/.npm`, `~/.cache`, Docker) antes de varrer a home inteira.\n"
+    "- Use `timeout 30 du -sh <caminho>` em explorações incertas.\n\n"
+    "**Comandos > ~60s** (builds, test suites, `du` grande, installs, downloads):\n"
+    "- Use `terminal(background=true, notify_on_complete=true, timeout=300)` (ou mais).\n"
+    "- Acompanhe com `process(action=\"poll\")` ou `process(action=\"wait\", timeout=…)` — não encadeie vários `du`/`find` pesados em foreground.\n"
+    "- **Nunca** encerre o turno com “deixando rodar” sem `notify_on_complete=true` (ou wait activo) — o utilizador não recebe aviso quando termina.\n"
+    "- Se interrompido (código 130), **retome com escopo menor** — não repita o mesmo comando amplo.\n\n"
+    "**Granularidade:** após cada resultado, diga o que encontrou e qual **próximo** caminho ou comando — não dispare 5 varreduras paralelas sem ler o output anterior.\n\n"
+    "**Servidores em background (dev server, `next dev`, `vite`, etc.):**\n"
+    "- Processos em background **sobrevivem ao fim do turno e a novas mensagens** — não presuma que \"morreu\" ou que \"ainda está rodando\" pela memória da conversa.\n"
+    "- Antes de responder se algo **está ou não rodando**, confirme com `process(action=\"list\")` (ou `poll` no `session_id` conhecido) — não adivinhe pelo histórico.\n"
+    "- Se aberto no painel Browser do dashboard, um servidor esquecido é encerrado sozinho após ~20min sem ser observado; fora disso (CLI, background sem preview aberto) continua rodando até `process(action=\"kill\")` ou a sessão de chat ser apagada. Quando o utilizador terminar de usar um preview/dev server, ofereça-se para encerrá-lo."
+    + TERMINAL_MINIMAL_COMMAND_GUIDANCE
 )
 
 ECTOR_AGENT_COAUTHOR_TRAILER = "Co-authored-by: Ector Agent <ectoragent@gmail.com>"
@@ -242,7 +343,7 @@ def web_stack_disabled_guidance(valid_tool_names: set[str] | frozenset[str]) -> 
         return ""
     parts = [
         "<web_stack_session>",
-        "As ferramentas ``web_search``, ``web_extract`` e ``web_crawl`` **não** estão registradas "
+        "As ferramentas ``web_search`` e ``web_extract`` **não** estão registradas "
         "nesta sessão (toolset ``web`` desligado e/ou sem chave de API do provedor). **Não** chame "
         "``web_search`` — o host rejeita nomes de ferramenta desconhecidos. Configure busca com "
         "``ector tools`` (Tavily, Firecrawl, Exa, Parallel ou gateway da assinatura Ector).",
@@ -349,6 +450,8 @@ SKILLS_GUIDANCE = (
     "Ao usar um skill e notar que está desatualizado, incompleto ou errado, "
     "corrija na hora com skill_manage(action='patch') — não espere o usuário pedir. "
     "Skills sem manutenção viram passivo.\n"
+    "Se o usuário pedir para remover/excluir uma skill, use skill_manage(action='delete') "
+    "(confirme antes). Não diga que só é possível pela UI.\n"
     "\n"
     "## Skills de engenharia (quando carregar)\n"
     "- Front-end **React/TypeScript**: carregue `typescript-react`.\n"
@@ -366,11 +469,25 @@ SKILLS_GUIDANCE = (
     "- Erros de build/deploy (Vercel, Railway, CI, \"No Next.js detected\"): carregue "
     "`platform-deploy`; apps Next.js também `nextjs`.\n"
     "Combine com `requesting-code-review` para quality gate e com "
-    "`test-driven-development` quando fizer sentido escrever o teste primeiro."
+    "`test-driven-development` quando fizer sentido escrever o teste primeiro.\n"
+    "\n"
+    "## Workspace (skills locais)\n"
+    "- Nunca grave paths absolutos de um repositório específico; use \"workspace atual\" "
+    "e comandos relativos ao cwd da sessão.\n"
+    "- Skills de git/commit devem ser por classe (`git-commit-push`), não por nome de app.\n"
+    "- Triggers descrevem o tipo de tarefa, não uma pasta fixa.\n"
+    "- Skills novas via skill_manage são auto-vinculadas ao git root da sessão; "
+    "não aparecem em outros projetos.\n"
+    "- **Git** (branch, commit, push, diff, status): não chame skill_view — use terminal/git "
+    "direto no cwd da sessão.\n"
+    "- Só chame skill_view para nomes retornados por skills_list / <available_skills> "
+    "neste workspace; se retornar workspace incompatível, ignore e prossiga."
 )
 
 USER_FACING_RESPONSE_GUIDANCE = (
     "## Respostas ao usuário\n"
+    "- **Idioma:** português do Brasil (pt-BR) por padrão — na resposta e no "
+    "raciocínio visível. Só use outro idioma se o usuário pedir explicitamente.\n"
     "- Responda **primeiro** exatamente ao que foi pedido; detalhes extras só quando "
     "forem úteis ou o usuário pedir explicitamente.\n"
     "- **Perfil do usuário** (bloco acima, fonte ector.cc /me): personalidade e "
@@ -394,15 +511,33 @@ USER_FACING_RESPONSE_GUIDANCE = (
     "evite narrar o que você *vai* fazer quando já pode executar com ferramentas."
 )
 
+
+def build_visible_reasoning_guidance() -> str:
+    return (
+        "## Raciocínio visível\n"
+        "O canal de raciocínio (thinking / reasoning / bloco «Pensou») é **sempre** "
+        "em português do Brasil (pt-BR): breve, objetivo e legível para o usuário.\n"
+        "**Nunca** escreva esse canal em inglês — nem monólogo interno do tipo "
+        "«Let me…», «The user wants…», «I'll check…».\n"
+        "Isso vale para `<think>` / `<thinking>`, campos `reasoning` / "
+        "`reasoning_content`, scratchpads e qualquer texto que a UI mostre como "
+        "raciocínio. Nomes de ficheiro, símbolos e hashes de código podem ficar "
+        "no original; a prosa à volta deles deve ser pt-BR."
+    )
+
+
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "# Uso obrigatório de ferramentas\n"
-    "Em trabalho não trivial, um **plano visível e breve** (objetivo + próximos passos) na "
-    "mesma mensagem das primeiras chamadas de ferramenta cumpre planejar e executar — "
-    "não pule ferramentas depois de planejar.\n"
+    "Em trabalho não trivial, um **plano visível e breve** (objetivo + critério de pronto "
+    "+ próximos passos) na mesma mensagem das primeiras chamadas de ferramenta cumpre "
+    "planejar e executar — não pule ferramentas depois de planejar.\n"
     "Você DEVE usar ferramentas para agir — não descreva o que faria sem fazer. Quando disser "
     "que vai executar algo (ex.: 'vou rodar os testes', 'vou verificar o arquivo'), faça a "
     "chamada correspondente **na mesma resposta**. Nunca encerre o turno só com promessa — execute agora.\n"
-    "Continue até a tarefa estar de fato concluída. Não pare com resumo do que fará depois. "
+    "Continue até a tarefa estar de fato concluída **e verificada**. Não pare com resumo do "
+    "que fará depois, nem declare sucesso sem evidência da ferramenta.\n"
+    "Se uma etapa falhar, adapte (outro comando, escopo menor, ler o erro) — não repita o "
+    "mesmo passo às cegas.\n"
     "Se há ferramentas que resolvem o pedido, use-as em vez de explicar ao usuário o que faria.\n"
     "Cada resposta deve (a) conter chamadas de ferramenta com progresso real, ou "
     "(b) entregar o resultado final ao usuário. Respostas só com intenção, sem ação, não são aceitáveis."
@@ -501,7 +636,9 @@ def build_user_profile_guidance(profile: Mapping[str, Any] | None) -> str:
 
 # Model name substrings that trigger tool-use enforcement guidance.
 # Add new patterns here when a model family needs explicit steering.
-TOOL_USE_ENFORCEMENT_MODELS = ("gpt", "codex", "gemini", "gemma", "grok")
+TOOL_USE_ENFORCEMENT_MODELS = (
+    "gpt", "codex", "gemini", "gemma", "grok", "claude", "anthropic", "kimi", "moonshot",
+)
 
 # OpenAI GPT/Codex-specific execution guidance.  Addresses known failure modes
 # where GPT models abandon work on partial results, skip prerequisite lookups,
@@ -567,7 +704,19 @@ OPENAI_MODEL_EXECUTION_GUIDANCE = (
     "- Se ``web_search`` estiver disponível, nunca substitua por ``wiser`` em perguntas factuais "
     "ou sensíveis ao tempo.\n"
     "- Se precisar seguir com informação incompleta, rotule suposições explicitamente.\n"
-    "</missing_context>"
+    "</missing_context>\n"
+    "\n"
+    "<tool_failure_recovery>\n"
+    "- Quando uma ferramenta falhar, retornar vazio, for interrompida (exit 130, "
+    "\"[Command interrupted]\") ou tiver erro: **não encerre o turno em silêncio**.\n"
+    "- Narre o que aconteceu, o que já foi concluído vs o que ficou pendente, e proponha "
+    "contramedida concreta (retry, comando alternativo, dividir em passos menores, pedir "
+    "confirmação ou pular o item).\n"
+    "- Em lote parcial (ex.: 2 de 3 diretórios removidos): resuma o estado e o próximo passo.\n"
+    "- Interrupção do usuário ou timeout: explique o que estava em andamento e pergunte se "
+    "deve retomar ou mudar de estratégia.\n"
+    "- Só declare a tarefa concluída após verificar o que realmente funcionou.\n"
+    "</tool_failure_recovery>"
 )
 
 # Gemini/Gemma-specific operational guidance.
@@ -652,14 +801,65 @@ PLATFORM_HINTS = {
         "coloque o conteúdo principal diretamente na resposta."
     ),
     "cli": (
-        "Você é um agente de IA na CLI. Prefira texto simples legível no terminal, "
-        "não markdown pesado. "
+        "Você é um agente de IA no modo CLI (execução única, sem client rico). Prefira texto "
+        "simples legível no terminal, não markdown pesado. "
         "Entrega de arquivos: não há canal de anexo — o usuário lê a resposta no terminal. "
-        "Não emita tags MEDIA:/caminho (só funcionam em mensageria; na CLI aparecem como texto). "
+        "Não emita tags MEDIA:/caminho neste modo — aqui elas aparecem como texto cru, sem "
+        "renderização. "
         "Ao citar arquivo criado ou alterado, informe o caminho absoluto em texto simples."
     ),
     "web": (
-        "Você está no painel web do Ector (ector localhost), não em app de mensagens. "
+        "Você está no painel web do Ector (`ector`), não em app de mensagens.\n"
+        "**Estilo de resposta (seja direto):**\n"
+        "- Comece pela resposta ou pelo resultado — sem preâmbulos («Claro!», «Ótima pergunta», "
+        "«Vou te ajudar com isso») nem despedidas formais.\n"
+        "- Pergunta simples → resposta curta em prosa; não crie seções, headers ou listas "
+        "quando uma ou duas frases resolvem.\n"
+        "- Não repita o que os cards de ferramenta já mostram nem re-explique o plano no fim; "
+        "o resumo final foca no resultado e no que mudou.\n"
+        "- Para mudanças de código, prefira fence markdown com linguagem `diff` "
+        "(unified +/-); não use tabelas `Linha | Antes | Depois` — a UI já renderiza "
+        "diffs nativamente.\n"
+        "- Interpretação óbvia → aja de imediato; só pergunte quando a ambiguidade mudar de fato "
+        "o que você faria.\n"
+        "**Execução:**\n"
+        "- Leituras independentes (vários `read_file`/`grep`/`search_files`) → chame em paralelo "
+        "na mesma resposta, não em sequência.\n"
+        "- Não pare no meio: se uma ferramenta falhar ou vier vazia, tente outra consulta ou "
+        "estratégia antes de devolver a pergunta ao usuário.\n"
+        "- Antes de declarar concluído, verifique o resultado (releia o arquivo alterado, "
+        "cheque o exit code, rode o teste relevante).\n"
+        "**Preview local (Browser do dashboard):**\n"
+        "- O painel **Browser** ao lado do chat mostra apps em `localhost`/`127.0.0.1` "
+        "para o usuário (Vite/Next/etc.). Quando o dev server sobe, diga a URL — o painel "
+        "abre sozinho; **não** precisa de `browser_navigate` só para o usuário ver o site.\n"
+        "- **Antes de declarar a UI web concluída** (i18n, build, “funcionando”, etc.): "
+        "confirme que a URL do preview ainda responde "
+        "(`curl -s -o /dev/null -w '%{http_code}' http://localhost:<porta>/…` → 2xx, "
+        "ou `browser_snapshot`). Se o servidor morreu, deu connection refused, ou a página "
+        "quebra, **não** diga que está ok — reinicie o dev server / corrija o erro e só "
+        "então feche o turno. Build limpo ≠ preview vivo.\n"
+        "- `browser_*` / agent-browser é o Chromium **do agente** (snapshot/clique/visão). "
+        "Se falhar com «Chrome not found», rode **uma vez** em foreground "
+        "`agent-browser install` (espere terminar; não use `npx` em background nem entre em loop). "
+        "Enquanto isso, o usuário já vê o app no painel Browser.\n"
+        "**Narração no chat (obrigatório):** o usuário vê cards de ferramenta — sem texto seu o turno "
+        "parece vazio. Escreva em português do Brasil (pt-BR), sempre breve "
+        "(só mude de idioma se o usuário pedir):\n"
+        "- Antes de cada leva de ferramentas: 1 frase curta dizendo o que vai fazer (não confirme "
+        "o pedido de volta em eco).\n"
+        "- Depois de ler um resultado importante: comente o que encontrou antes da próxima ferramenta "
+        "(ex.: «só tem o `.ector/` untracked, vou ver o que tem dentro»).\n"
+        "- No fim do turno: resumo claro e enxuto; não deixe só cards sem explicação.\n"
+        "- Após falha ou interrupção de ferramenta: narre o que aconteceu, liste o que foi "
+        "concluído vs pendente e proponha contramedida (retry, abordagem alternativa, dividir "
+        "em passos). Exit 130 / \"[Command interrupted]\" = interrompido — explique e pergunte "
+        "como seguir. **Nunca** encerre o turno só com cards.\n"
+        "Esse texto vai no `content` da mensagem do assistente — o campo `description` do terminal "
+        "é só rótulo do card, não substitui sua fala com o usuário. Evite frases robóticas de status "
+        "('verificando', 'processando', 'aguarde').\n"
+        "O campo `command` do terminal não é mensagem ao usuário — não encadeie `echo` de confirmação; "
+        "confirme no chat após ler o exit code.\n"
         "{web_visual_policy}\n"
         "Canais de gateway suportados nesta build: apenas WhatsApp, Telegram, Discord e Slack.\n"
         "- Chame gateway_inspect para status ao vivo antes de orientar.\n"
@@ -743,12 +943,21 @@ def build_session_working_directory_guidance(
     lines = [
         "# Diretório de trabalho da sessão",
         f"Terminal e ferramentas de arquivo rodam em: `{session_path}`.",
-        "A barra de status da UI mostra a mesma pasta (nome + branch git).",
-        "Não invente caminhos a partir de AGENTS.md, nomes antigos de repo ou pais `/Users/...`.",
+        f"Nome da pasta do projeto: `{session_path.name}`.",
+        "A barra de status da UI (chip de pasta/branch) aponta para ESTA pasta — "
+        "não para o home do utilizador nem para outro checkout.",
+        "Se o chip mostrar um repo (ex. `ector-agent`) e alguém mencionar "
+        "`/Users/<nome>` sem subpasta de projeto, ignore: o cwd real é o path acima.",
+        "Não invente caminhos a partir de AGENTS.md, nomes antigos de repo, "
+        "histórico de outras sessões ou o diretório home (`/Users/...`, `/home/...`).",
         "Neste projeto, rode comandos direto (`git status`, `git diff`, "
         "`git commit`, …) sem prefixar `cd /algum/caminho &&`.",
-        "Use `workdir` ou `cd` explícito só quando for trabalhar de propósito em outro "
-        "diretório que exista de fato.",
+        "Não `cd`/`open` para repositórios irmãos (ex. `../outro-projeto`) "
+        "nem para o diretório pai — fique neste cwd salvo se o utilizador "
+        "pedir explicitamente outro caminho.",
+        "Use `workdir` ou `cd` explícito só para subpastas deste projeto "
+        "que existam de fato.",
+        "Antes de afirmar 'a sessão está em X', confira apenas o path deste bloco.",
     ]
     git_root = None
     try:
@@ -759,6 +968,17 @@ def build_session_working_directory_guidance(
         git_root = None
     if git_root and git_root != str(session_path):
         lines.append(f"Raiz do repositório Git: `{git_root}`.")
+
+    try:
+        from agent.monorepo_context import build_monorepo_topology_hint
+
+        monorepo_hint = build_monorepo_topology_hint(str(session_path))
+    except Exception:
+        monorepo_hint = ""
+    if monorepo_hint:
+        lines.append("")
+        lines.append(monorepo_hint)
+
     return "\n".join(lines)
 
 
@@ -901,6 +1121,8 @@ def _build_snapshot_entry(
     description: str,
 ) -> dict:
     """Build a serialisable metadata dict for one skill."""
+    from agent.skill_workspace import workspace_roots_from_frontmatter
+
     rel_path = skill_file.relative_to(skills_dir)
     parts = rel_path.parts
     if len(parts) >= 2:
@@ -921,6 +1143,7 @@ def _build_snapshot_entry(
         "description": description,
         "platforms": [str(p).strip() for p in platforms if str(p).strip()],
         "conditions": extract_skill_conditions(frontmatter),
+        "workspace_roots": workspace_roots_from_frontmatter(frontmatter),
     }
 
 
@@ -990,9 +1213,66 @@ def _skills_index_basic_tool_examples(available_tools: "set[str] | None") -> str
     return f"ferramentas básicas como {' ou '.join(examples)}"
 
 
+def _get_skills_max_index_entries() -> int:
+    """Return opt-in cap for skills in the system prompt index (0 = unlimited)."""
+    try:
+        from ector_cli.config import load_config
+
+        raw = (load_config() or {}).get("skills", {}).get("max_index_entries", 0)
+        cap = int(raw)
+        return max(0, cap)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _build_skills_index_lines(
+    skills_by_category: dict[str, list[tuple[str, str]]],
+    category_descriptions: dict[str, str],
+    *,
+    max_index_entries: int = 0,
+) -> tuple[list[str], int]:
+    """Build sorted index lines; return (lines, omitted_count)."""
+    flat_skills: list[tuple[str, str, str]] = []
+    for category in sorted(skills_by_category.keys()):
+        seen: set[str] = set()
+        for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
+            if name in seen:
+                continue
+            seen.add(name)
+            flat_skills.append((category, name, desc))
+
+    omitted = 0
+    if max_index_entries > 0 and len(flat_skills) > max_index_entries:
+        omitted = len(flat_skills) - max_index_entries
+        flat_skills = flat_skills[:max_index_entries]
+
+    index_lines: list[str] = []
+    current_category: str | None = None
+    for category, name, desc in flat_skills:
+        if category != current_category:
+            current_category = category
+            cat_desc = category_descriptions.get(category, "")
+            if cat_desc:
+                index_lines.append(f"  {category}: {cat_desc}")
+            else:
+                index_lines.append(f"  {category}:")
+        if desc:
+            index_lines.append(f"    - {name}: {desc}")
+        else:
+            index_lines.append(f"    - {name}")
+
+    if omitted > 0:
+        index_lines.append(
+            f"    - … e mais {omitted} skills — use skills_list() para ver todos"
+        )
+
+    return index_lines, omitted
+
+
 def build_skills_system_prompt(
     available_tools: "set[str] | None" = None,
     available_toolsets: "set[str] | None" = None,
+    session_cwd: Optional[str] = None,
 ) -> str:
     """Build a compact skill index for the system prompt.
 
@@ -1003,16 +1283,24 @@ def build_skills_system_prompt(
 
     Falls back to a full filesystem scan when both layers miss.
 
-    External skill directories (``skills.external_dirs`` in config.yaml) are
-    scanned alongside the local ``~/.ector/skills/`` directory.  External dirs
-    are read-only — they appear in the index but new skills are always created
-    in the local dir.  Local skills take precedence when names collide.
+    External skill directories (``skills.external_dirs`` in config.yaml) and the
+    repo ``builtin-skills/`` directory are scanned alongside the local
+    ``~/.ector/skills/`` directory.  External/builtin dirs are read-only — they
+    appear in the index but new skills are always created in the local dir.
+    Local skills take precedence when names collide.
     """
     skills_dir = get_skills_dir()
     external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
 
     if not skills_dir.exists() and not external_dirs:
         return ""
+
+    from agent.skill_workspace import (
+        normalize_session_workspace,
+        skill_snapshot_applies_to_workspace,
+    )
+
+    session_workspace = normalize_session_workspace(session_cwd)
 
     # ── Layer 1: in-process LRU cache ─────────────────────────────────
     # Include the resolved platform so per-platform disabled-skill lists
@@ -1031,6 +1319,7 @@ def build_skills_system_prompt(
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint,
         tuple(sorted(disabled)),
+        session_workspace or "",
         _combined_skills_manifest_key(skills_dir, external_dirs),
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
@@ -1064,6 +1353,8 @@ def build_skills_system_prompt(
                 available_toolsets,
             ):
                 continue
+            if not skill_snapshot_applies_to_workspace(entry, session_workspace):
+                continue
             skills_by_category.setdefault(category, []).append(
                 (frontmatter_name, entry.get("description", ""))
             )
@@ -1088,6 +1379,8 @@ def build_skills_system_prompt(
                 available_tools,
                 available_toolsets,
             ):
+                continue
+            if not skill_snapshot_applies_to_workspace(entry, session_workspace):
                 continue
             skills_by_category.setdefault(entry["category"], []).append(
                 (entry["frontmatter_name"], entry["description"])
@@ -1150,6 +1443,8 @@ def build_skills_system_prompt(
                     available_toolsets,
                 ):
                     continue
+                if not skill_snapshot_applies_to_workspace(entry, session_workspace):
+                    continue
                 seen_skill_keys.update(dedupe_keys)
                 skills_by_category.setdefault(entry["category"], []).append(
                     (frontmatter_name, entry["description"])
@@ -1174,43 +1469,29 @@ def build_skills_system_prompt(
     if not skills_by_category:
         result = ""
     else:
-        index_lines = []
-        for category in sorted(skills_by_category.keys()):
-            cat_desc = category_descriptions.get(category, "")
-            if cat_desc:
-                index_lines.append(f"  {category}: {cat_desc}")
-            else:
-                index_lines.append(f"  {category}:")
-            # Deduplicate and sort skills within each category
-            seen = set()
-            for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
-                if name in seen:
-                    continue
-                seen.add(name)
-                if desc:
-                    index_lines.append(f"    - {name}: {desc}")
-                else:
-                    index_lines.append(f"    - {name}")
+        max_index_entries = _get_skills_max_index_entries()
+        index_lines, _omitted = _build_skills_index_lines(
+            skills_by_category,
+            category_descriptions,
+            max_index_entries=max_index_entries,
+        )
 
         result = (
             "## Skills (obrigatório)\n"
-            "Antes de responder, percorra os skills abaixo. Se algum combinar ou for parcialmente "
-            "relevante à tarefa, você DEVE carregá-lo com skill_view(name) e seguir as instruções. "
-            "Na dúvida, carregue — é melhor ter contexto a mais do que perder passos críticos, "
-            "armadilhas ou fluxos já estabelecidos. "
-            "Skills trazem conhecimento especializado — endpoints, comandos por ferramenta e "
-            "fluxos comprovados melhores que abordagem genérica. Carregue o skill "
-            f"mesmo que ache que resolveria com {_skills_index_basic_tool_examples(available_tools)}. "
+            "Use skill_view(name) **somente** para skills listados em <available_skills> "
+            "deste workspace. Não invente nomes nem carregue skills de outro projeto.\n"
+            "Git (branch, commit, push, diff, status) e tarefas rotineiras de código "
+            "**não** exigem skill_view — use terminal/git direto.\n"
+            "Se skill_view indicar workspace incompatível (skipped), ignore e prossiga.\n"
+            "Quando um skill listado combinar com a tarefa, carregue-o antes de improvisar — "
+            "skills trazem fluxos, armadilhas e convenções do projeto. "
+            "Na dúvida entre dois skills listados, carregue o mais específico.\n"
             "Skills também codificam preferências, convenções e padrão de qualidade do usuário "
             "em revisão de código, planejamento e testes — use-os mesmo em tarefas que você "
             "já domina, porque o skill define como fazer *aqui*.\n"
-            "Quando o usuário pedir para configurar, instalar, habilitar, desabilitar, modificar "
-            "ou depurar o próprio Ector Agent — CLI, config, modelos, provedores, tools, "
-            "skills, voz, gateway, plugins ou qualquer recurso — use https://ector.cc/docs e "
-            "os comandos `ector` reais (`ector config edit`, `ector tools`, `ector setup`, "
-            "`ector doctor`). Se skills_list incluir um skill claramente sobre o Ector, "
-            "carregue-o; não assuma um slug fixo que não esteja na lista.\n"
             "Se um skill estiver errado, corrija com skill_manage(action='patch').\n"
+            "Se o usuário pedir para remover uma skill, use skill_manage(action='delete') "
+            "após confirmar.\n"
             "Após tarefas difíceis ou iterativas, ofereça salvar como skill. "
             "Se o skill carregado faltou passos, tinha comando errado ou precisou de armadilhas "
             "que você descobriu, atualize antes de encerrar.\n"
@@ -1219,7 +1500,7 @@ def build_skills_system_prompt(
             + "\n".join(index_lines) + "\n"
             "</available_skills>\n"
             "\n"
-            "Só siga sem carregar skill se genuinamente nenhum for relevante à tarefa."
+            "Só siga sem carregar skill se genuinamente nenhum skill **listado** for relevante."
         )
 
     # ── Store in LRU cache ────────────────────────────────────────────
@@ -1302,66 +1583,126 @@ def _load_ector_md(cwd_path: Path) -> str:
         return ""
 
 
-def _load_agents_md(cwd_path: Path) -> str:
-    """AGENTS.md — top-level only (no recursive walk)."""
-    for name in ["AGENTS.md", "agents.md"]:
-        candidate = cwd_path / name
-        if candidate.exists():
+def _format_context_file_section(
+    path: Path,
+    cwd_path: Path,
+) -> str:
+    """Read, sanitize, and format one context file for the system prompt."""
+    try:
+        content = _read_context_file(path)
+        if not content:
+            return ""
+        display = path.name
+        try:
+            display = str(path.relative_to(cwd_path))
+        except ValueError:
             try:
-                content = _read_context_file(candidate)
-                if content:
-                    content = _scan_context_content(content, name)
-                    result = f"## {name}\n\n{content}"
-                    return _truncate_content(result, "AGENTS.md")
-            except Exception as e:
-                logger.debug("Could not read %s: %s", candidate, e)
-    return ""
+                git_root = _find_git_root(cwd_path)
+                if git_root:
+                    display = str(path.relative_to(git_root))
+            except ValueError:
+                pass
+        content = _scan_context_content(content, display)
+        return f"## {display}\n\n{content}"
+    except Exception as e:
+        logger.debug("Could not read %s: %s", path, e)
+        return ""
+
+
+def _load_walked_context_files(
+    cwd_path: Path,
+    names: tuple[str, ...],
+    truncate_label: str,
+) -> str:
+    """Load nearest + (optional) root context files walking to the git root.
+
+    Monorepo-friendly: package-level file is listed first; a distinct file at
+    the farthest match (typically repo root) is included as well.
+    """
+    matches = _find_named_files_up_to_git_root(cwd_path, names)
+    if not matches:
+        return ""
+
+    to_load = [matches[0]]
+    if len(matches) > 1 and matches[-1] != matches[0]:
+        to_load.append(matches[-1])
+
+    parts: list[str] = []
+    for path in to_load:
+        section = _format_context_file_section(path, cwd_path)
+        if section:
+            parts.append(section)
+    if not parts:
+        return ""
+    return _truncate_content("\n\n".join(parts), truncate_label)
+
+
+def _load_agents_md(cwd_path: Path) -> str:
+    """AGENTS.md — walk to git root; include package + root when both exist."""
+    return _load_walked_context_files(
+        cwd_path, ("AGENTS.md", "agents.md"), "AGENTS.md"
+    )
 
 
 def _load_claude_md(cwd_path: Path) -> str:
-    """CLAUDE.md / claude.md — cwd only."""
-    for name in ["CLAUDE.md", "claude.md"]:
-        candidate = cwd_path / name
-        if candidate.exists():
-            try:
-                content = _read_context_file(candidate)
-                if content:
-                    content = _scan_context_content(content, name)
-                    result = f"## {name}\n\n{content}"
-                    return _truncate_content(result, "CLAUDE.md")
-            except Exception as e:
-                logger.debug("Could not read %s: %s", candidate, e)
-    return ""
+    """CLAUDE.md — walk to git root; include package + root when both exist."""
+    return _load_walked_context_files(
+        cwd_path, ("CLAUDE.md", "claude.md"), "CLAUDE.md"
+    )
+
+
+def _load_cursorrules_from_dir(directory: Path, cwd_path: Path) -> str:
+    """.cursorrules + .cursor/rules/*.mdc from a single directory."""
+    cursorrules_content = ""
+    cursorrules_file = directory / ".cursorrules"
+    if cursorrules_file.is_file():
+        section = _format_context_file_section(cursorrules_file, cwd_path)
+        if section:
+            cursorrules_content += section + "\n\n"
+
+    cursor_rules_dir = directory / ".cursor" / "rules"
+    if cursor_rules_dir.is_dir():
+        try:
+            mdc_files = sorted(cursor_rules_dir.glob("*.mdc"))
+        except OSError:
+            mdc_files = []
+        for mdc_file in mdc_files:
+            section = _format_context_file_section(mdc_file, cwd_path)
+            if section:
+                cursorrules_content += section + "\n\n"
+    return cursorrules_content
 
 
 def _load_cursorrules(cwd_path: Path) -> str:
-    """.cursorrules + .cursor/rules/*.mdc — cwd only."""
-    cursorrules_content = ""
-    cursorrules_file = cwd_path / ".cursorrules"
-    if cursorrules_file.exists():
-        try:
-            content = _read_context_file(cursorrules_file)
-            if content:
-                content = _scan_context_content(content, ".cursorrules")
-                cursorrules_content += f"## .cursorrules\n\n{content}\n\n"
-        except Exception as e:
-            logger.debug("Could not read .cursorrules: %s", e)
+    """.cursorrules + .cursor/rules — nearest dir, plus distinct git-root rules."""
+    stop_at = _find_git_root(cwd_path)
+    directories: list[Path] = []
+    for directory in [cwd_path, *cwd_path.parents]:
+        has_rules = (directory / ".cursorrules").is_file() or (
+            directory / ".cursor" / "rules"
+        ).is_dir()
+        if has_rules:
+            directories.append(directory)
+        if stop_at and directory == stop_at:
+            break
+        if directory.parent == directory:
+            break
 
-    cursor_rules_dir = cwd_path / ".cursor" / "rules"
-    if cursor_rules_dir.exists() and cursor_rules_dir.is_dir():
-        mdc_files = sorted(cursor_rules_dir.glob("*.mdc"))
-        for mdc_file in mdc_files:
-            try:
-                content = _read_context_file(mdc_file)
-                if content:
-                    content = _scan_context_content(content, f".cursor/rules/{mdc_file.name}")
-                    cursorrules_content += f"## .cursor/rules/{mdc_file.name}\n\n{content}\n\n"
-            except Exception as e:
-                logger.debug("Could not read %s: %s", mdc_file, e)
-
-    if not cursorrules_content:
+    if not directories:
         return ""
-    return _truncate_content(cursorrules_content, ".cursorrules")
+
+    to_load = [directories[0]]
+    if len(directories) > 1 and directories[-1] != directories[0]:
+        to_load.append(directories[-1])
+
+    parts: list[str] = []
+    for directory in to_load:
+        chunk = _load_cursorrules_from_dir(directory, cwd_path)
+        if chunk:
+            parts.append(chunk.strip())
+    if not parts:
+        return ""
+    return _truncate_content("\n\n".join(parts), ".cursorrules")
 
 
 def build_context_files_prompt(cwd: Optional[str] = None, skip_soul: bool = False) -> str:
@@ -1369,9 +1710,9 @@ def build_context_files_prompt(cwd: Optional[str] = None, skip_soul: bool = Fals
 
     Priority (first found wins — only ONE project context type is loaded):
       1. .ector.md / ECTOR.md  (walk to git root)
-      2. AGENTS.md / agents.md   (cwd only)
-      3. CLAUDE.md / claude.md   (cwd only)
-      4. .cursorrules / .cursor/rules/*.mdc  (cwd only)
+      2. AGENTS.md / agents.md   (walk to git root; nearest + root)
+      3. CLAUDE.md / claude.md   (walk to git root; nearest + root)
+      4. .cursorrules / .cursor/rules/*.mdc  (walk; nearest + root)
 
     SOUL.md from ECTOR_HOME is independent and always included when present.
     Each file read is capped at CONTEXT_FILE_MAX_READ_BYTES; injected text is

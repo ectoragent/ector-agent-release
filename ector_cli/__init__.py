@@ -2,7 +2,7 @@
 Ector CLI - Unified command-line interface for Ector Agent.
 
 Provides subcommands for:
-- ector chat          - Interactive chat (same as ./ector)
+- ector                 - Web dashboard (default)
 - ector gateway       - Run gateway in foreground
 - ector gateway start - Start gateway service
 - ector gateway stop  - Stop gateway service  
@@ -12,5 +12,5 @@ Provides subcommands for:
 """
 
 __version_name__ = "1.0"
-__version_code__ = 56
+__version_code__ = 86
 __version__ = __version_name__

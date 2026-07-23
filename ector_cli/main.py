@@ -3,8 +3,7 @@
 Ector CLI - Main entry point.
 
 Usage:
-    ector                     # Chat interativo — TUI Ink em TTY
-    ector chat                # Chat interativo — TUI Ink em TTY
+    ector                     # Abre o painel web local
     ector gateway             # Executa o gateway em primeiro plano
     ector gateway start       # Inicia o serviço do gateway
     ector gateway stop        # Para o serviço do gateway
@@ -238,7 +237,6 @@ from ector_constants import AI_GATEWAY_BASE_URL, OPENROUTER_BASE_URL, safe_getcw
 logger = logging.getLogger(__name__)
 
 from ector_cli.cli_routing import (
-    bare_ector_should_use_chat as _bare_ector_should_use_chat,
     command_requires_identity as _command_requires_identity,
     should_discover_plugins_and_hooks as _should_discover_plugins_and_hooks,
 )
@@ -246,14 +244,8 @@ from ector_cli.provider_check import has_any_provider_configured as _has_any_pro
 from ector_cli.session_resolve import (
     relative_time as _relative_time,
     session_browse_picker as _session_browse_picker,
-    resolve_last_session as _resolve_last_session,
-    resolve_session_by_name_or_id as _resolve_session_by_name_or_id,
 )
-from ector_cli.tui_launch import (
-    ensure_tui_node as _ensure_tui_node,
-    launch_tui as _launch_tui,
-    make_tui_argv as _make_tui_argv,
-)
+from ector_cli.node_build import ensure_node_runtime as _ensure_node_runtime
 from ector_cli.web_build import build_web_ui as _build_web_ui
 from ector_cli.provider_wizard import select_provider_and_model
 
@@ -375,41 +367,64 @@ def _env_truthy(name: str) -> bool:
     return v in ("1", "true", "yes", "on")
 
 
-def _chat_stdin_is_tty() -> bool:
+_DASHBOARD_DEFAULT_ATTRS: tuple[tuple[str, object], ...] = (
+    ("port", 9000),
+    ("host", "127.0.0.1"),
+    ("foreground", False),
+    ("no_open", False),
+    ("insecure", False),
+    ("no_auth", False),
+    ("up_online", False),
+    ("server_name", "_"),
+    ("domain", None),
+    ("listen_port", 9000),
+    ("tls", False),
+    ("email", None),
+    ("basic_auth", False),
+    ("basic_user", "ector"),
+    ("upstream_port", 9000),
+    ("public_host", None),
+    ("scheme", None),
+)
+
+
+def _ensure_dashboard_defaults(args) -> None:
+    for attr, default in _DASHBOARD_DEFAULT_ATTRS:
+        if not hasattr(args, attr):
+            setattr(args, attr, default)
+
+
+def _build_dashboard_open_url(origin: str, token: str, resume_id: str | None) -> str:
+    from urllib.parse import urlencode, urlparse, urlunparse
+
+    parsed = urlparse(origin)
+    rid = (resume_id or "").strip()
+    path = "/chat" if rid else "/"
+    params = [("token", token)]
+    if rid:
+        params.append(("resume", rid))
+    qs = urlencode(params)
+    return urlunparse((parsed.scheme, parsed.netloc, path, "", qs, ""))
+
+
+def _launch_default_dashboard(args) -> None:
+    _ensure_dashboard_defaults(args)
     try:
-        return sys.stdin.isatty()
-    except Exception:
-        return False
+        from ector_cli.identity_auth import _is_ssh_session
+    except ImportError:
+        _is_ssh_session = lambda: False  # noqa: E731
+    if _is_ssh_session() or not sys.stdin.isatty():
+        args.no_open = True
+    cmd_dashboard(args)
 
 
-def _interactive_chat_prefers_tui(args) -> bool:
-    """Ink TUI is the only chat surface; cli.py is legacy (in-process slash + narrow fallbacks)."""
-    if getattr(args, "oneshot", None):
-        return False
-    try:
-        if not sys.stdin.isatty():
-            return False
-    except Exception:
-        return False
-    return True
+def launch_dashboard_with_resume(session_id: str) -> None:
+    """Open the web dashboard focused on a session (``sessions browse``)."""
+    from types import SimpleNamespace
 
-
-def _warn_legacy_chat_flag(message: str) -> None:
-    print(message, file=sys.stderr)
-
-
-def _exit_oneshot_from_chat_args(args, prompt: str) -> None:
-    """Non-interactive chat: one-shot stdout only (replaces legacy cli.main -q)."""
-    from ector_cli.oneshot import run_oneshot
-
-    sys.exit(
-        run_oneshot(
-            prompt,
-            model=getattr(args, "model", None),
-            provider=getattr(args, "provider", None),
-            image=getattr(args, "image", None),
-        )
-    )
+    args = SimpleNamespace()
+    args.resume = session_id.strip()
+    _launch_default_dashboard(args)
 
 
 def _enforce_identity_auth(args) -> None:
@@ -461,148 +476,6 @@ def _schedule_cloud_skills_if_agent_command(args) -> None:
         raise
     except Exception:
         logger.debug("cloud skills auto-sync at CLI startup failed", exc_info=True)
-
-
-def cmd_chat(args):
-    """Run interactive chat CLI."""
-    oneshot = getattr(args, "oneshot", None)
-    if oneshot:
-        from ector_cli.oneshot import run_oneshot
-
-        sys.exit(
-            run_oneshot(
-                oneshot,
-                model=getattr(args, "model", None),
-                provider=getattr(args, "provider", None),
-                image=getattr(args, "image", None),
-            )
-        )
-
-    use_tui = _interactive_chat_prefers_tui(args)
-
-    # Resolve --continue into --resume with the latest session or by name
-    continue_val = getattr(args, "continue_last", None)
-    if continue_val and not getattr(args, "resume", None):
-        if isinstance(continue_val, str):
-            # -c "nome da sessão" — resolve por título ou ID
-            resolved = _resolve_session_by_name_or_id(continue_val)
-            if resolved:
-                args.resume = resolved
-            else:
-                print(f"Nenhuma sessão encontrada correspondente a '{continue_val}'.")
-                print("Use 'ector sessions list' para ver as sessões disponíveis.")
-                sys.exit(1)
-        else:
-            # -c sem argumento — continua a sessão mais recente
-            source = "tui" if use_tui else "cli"
-            last_id = _resolve_last_session(source=source)
-            if not last_id and source == "tui":
-                last_id = _resolve_last_session(source="cli")
-            if last_id:
-                args.resume = last_id
-            else:
-                kind = "TUI" if use_tui else "CLI"
-                print(f"Nenhuma sessão anterior do {kind} encontrada para continuar.")
-                sys.exit(1)
-
-    # Resolve --resume by title if it's not a direct session ID
-    resume_val = getattr(args, "resume", None)
-    if resume_val:
-        resolved = _resolve_session_by_name_or_id(resume_val)
-        if resolved:
-            args.resume = resolved
-
-    # First-run guard: check if any provider is configured before launching
-    if not _has_any_provider_configured():
-        print()
-        print(
-            "O Ector ainda não está configurado"
-        )
-
-        from ector_cli.setup import (
-            is_interactive_stdin,
-            print_noninteractive_setup_guidance,
-        )
-
-        if not is_interactive_stdin():
-            print_noninteractive_setup_guidance(
-                "Nenhum TTY interativo detectado para o prompt de configuração da primeira execução."
-            )
-            sys.exit(1)
-
-        try:
-            reply = input("Deseja executar a configuração agora? (S/n) ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            reply = "n"
-        if reply in ("", "s", "sim", "y", "yes"):
-            cmd_setup(args)
-            return
-        print()
-        print("Você pode executar 'ector setup' a qualquer momento para configurar.")
-        sys.exit(1)
-
-    # Start update check in background (runs while other init happens)
-    try:
-        from ector_cli.presentation import prefetch_update_check
-
-        prefetch_update_check()
-    except Exception:
-        pass
-
-    # --yolo: bypass all dangerous command approvals
-    if getattr(args, "yolo", False):
-        os.environ["ECTOR_YOLO_MODE"] = "1"
-
-    # --ignore-user-config: make load_cli_config() / load_config() skip the
-    # user's ~/.ector/config.yaml and return built-in defaults. Set BEFORE
-    # importing cli (which runs `CLI_CONFIG = load_cli_config()` at module
-    # import time). Credentials in .env are still loaded — this flag only
-    # ignores behavioral/config settings.
-    if getattr(args, "ignore_user_config", False):
-        os.environ["ECTOR_IGNORE_USER_CONFIG"] = "1"
-
-    # --ignore-rules: skip auto-injection of AGENTS.md/SOUL.md/.cursorrules
-    # (rules), memory entries, and any preloaded skills coming from user config.
-    # Maps to AIAgent(skip_context_files=True, skip_memory=True).
-    if getattr(args, "ignore_rules", False):
-        os.environ["ECTOR_IGNORE_RULES"] = "1"
-
-    # --source: tag session source for filtering (e.g. 'tool' for third-party integrations)
-    if getattr(args, "source", None):
-        os.environ["ECTOR_SESSION_SOURCE"] = args.source
-
-    query = getattr(args, "query", None)
-    image = getattr(args, "image", None)
-
-    if not use_tui:
-        if query or image:
-            if query and not image:
-                _warn_legacy_chat_flag(
-                    "Aviso: `ector chat -q` está obsoleto para uso não interativo; use `ector -z`."
-                )
-            _exit_oneshot_from_chat_args(args, query or "")
-            return
-        print(
-            "O chat interativo requer um terminal (TTY). "
-            "Use `ector -z \"pergunta\"` para one-shot ou redirecione com pipe.",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-
-    initial_prompt = (query or "").strip() or None
-    initial_image = None
-    if image:
-        initial_image = str(Path(image).expanduser())
-
-    _launch_tui(
-        PROJECT_ROOT,
-        resume_session_id=getattr(args, "resume", None),
-        model=getattr(args, "model", None),
-        provider=getattr(args, "provider", None),
-        initial_prompt=initial_prompt,
-        initial_image=initial_image,
-        worktree=bool(getattr(args, "worktree", False) or getattr(args, "w", False)),
-    )
 
 
 def cmd_gateway(args):
@@ -841,7 +714,7 @@ def cmd_whatsapp(args):
         # Same PATH bootstrap as the TUI: nvm/fnm/proto/brew or scripts/lib/node-bootstrap.sh
         # prepends the resolved node bin dir — without this, shutil.which often misses npm
         # when Ector was launched from a GUI or a minimal environment.
-        _ensure_tui_node(PROJECT_ROOT)
+        _ensure_node_runtime(PROJECT_ROOT)
 
         node_bin = shutil.which("node")
         pnpm_bin = shutil.which("pnpm")
@@ -1368,76 +1241,6 @@ def cmd_uninstall(args):
 
 
 
-def _coalesce_session_name_args(argv: list) -> list:
-    """Join unquoted multi-word session names after -c/--continue and -r/--resume.
-
-    When a user types ``ector -c Demo Agent Dev`` without quoting the
-    session name, argparse sees three separate tokens.  This function merges
-    them into a single argument so argparse receives
-    ``['-c', 'Demo Agent Dev']`` instead.
-
-    Tokens are collected after the flag until we hit another flag (``-*``)
-    or a known top-level subcommand.
-    """
-    _SUBCOMMANDS = {
-        "chat",
-        "model",
-        "gateway",
-        "setup",
-        "whatsapp",
-        "login",
-        "logout",
-        "auth",
-        "status",
-        "cron",
-        "doctor",
-        "config",
-        "pairing",
-        "skills",
-        "tools",
-        "mcp",
-        "sessions",
-        "stats",
-        "version",
-        "uninstall",
-        "profile",
-        "localhost",
-        "plugins",
-        "acp",
-        "webhook",
-        "memory",
-        "dump",
-        "debug",
-        "backup",
-        "import",
-        "logs",
-    }
-    _SESSION_FLAGS = {"-c", "--continue", "-r", "--resume"}
-
-    result = []
-    i = 0
-    while i < len(argv):
-        token = argv[i]
-        if token in _SESSION_FLAGS:
-            result.append(token)
-            i += 1
-            # Collect subsequent non-flag, non-subcommand tokens as one name
-            parts: list = []
-            while (
-                i < len(argv)
-                and not argv[i].startswith("-")
-                and argv[i] not in _SUBCOMMANDS
-            ):
-                parts.append(argv[i])
-                i += 1
-            if parts:
-                result.append(" ".join(parts))
-        else:
-            result.append(token)
-            i += 1
-    return result
-
-
 def cmd_profile(args):
     """Profile management — create, delete, list, switch, alias."""
     from ector_cli.profiles import (
@@ -1689,14 +1492,12 @@ def cmd_profile(args):
             sys.exit(1)
 
 
-def cmd_localhost(args):
-    """Start the web UI server (prints an auth URL by default)."""
+def cmd_dashboard(args):
+    """Start or stop the web UI server (prints an auth URL by default)."""
     from ector_cli.colors import Colors, color
 
     def _up_online_mode() -> bool:
-        return bool(getattr(args, "up_online", False)) or getattr(
-            args, "localhost_action", None
-        ) in {"nginx-setup"}
+        return bool(getattr(args, "up_online", False))
 
     def _infer_primary_ip() -> str | None:
         """Best-effort inference of the server's primary IPv4."""
@@ -1714,7 +1515,7 @@ def cmd_localhost(args):
         except Exception:
             return None
 
-    if getattr(args, "localhost_action", None) == "kill":
+    if getattr(args, "command", None) == "kill":
         from ector_constants import display_ector_home
         from ector_cli.web_server import (
             _probe_ector_dashboard_http,
@@ -1821,7 +1622,7 @@ def cmd_localhost(args):
         args.insecure = False
         args.port = upstream_port
         args.public_host = printable_host
-        args._localhost_public_base_url = public_base_url  # type: ignore[attr-defined]
+        args._dashboard_public_base_url = public_base_url  # type: ignore[attr-defined]
         args.no_open = True  # browser open is meaningless on a VPS
 
     # Default: loopback-only unless --insecure.
@@ -1972,12 +1773,17 @@ def cmd_localhost(args):
         from ector_cli.dashboard_auth import create_dashboard_access_token
 
         token = create_dashboard_access_token(ttl_seconds=15 * 60)
-        if _up_online_mode() and hasattr(args, "_localhost_public_base_url"):
-            base_url = getattr(args, "_localhost_public_base_url")
-            open_url = f"{base_url}/?token={token}"
+        if _up_online_mode() and hasattr(args, "_dashboard_public_base_url"):
+            base_url = getattr(args, "_dashboard_public_base_url")
+            open_url = _build_dashboard_open_url(
+                base_url, token, getattr(args, "resume", None)
+            )
         else:
             url_host = _public_host_for_url(str(args.host))
-            open_url = f"{_url_scheme()}://{url_host}:{args.port}/?token={token}"
+            origin = f"{_url_scheme()}://{url_host}:{args.port}"
+            open_url = _build_dashboard_open_url(
+                origin, token, getattr(args, "resume", None)
+            )
         print()
         print(color("┌─ Painel web", Colors.CYAN, Colors.BOLD))
         print(color("│", Colors.CYAN, Colors.BOLD) + "  " + color("🔗", Colors.GREEN, Colors.BOLD) + " " + color(open_url, Colors.WHITE, Colors.BOLD))
@@ -2066,10 +1872,8 @@ def _cli_process_title_for_args(args) -> str:
     cmd = getattr(args, "command", None)
     if cmd == "gateway":
         return "Ector Gateway"
-    if cmd == "localhost":
+    if cmd is None:
         return "Ector Web"
-    if cmd in (None, "chat"):
-        return "Ector"
     return "Ector"
 
 
@@ -2093,9 +1897,6 @@ def _main_inner():
     # =========================================================================
     # Parse and execute
     # =========================================================================
-    # Pre-process argv so unquoted multi-word session names after -c / -r
-    # are merged into a single token before argparse sees them.
-    # e.g. ``ector -c Demo Agent Dev`` → ``ector -c 'Demo Agent Dev'``
     # ── Container-aware routing ────────────────────────────────────────
     # When NixOS container mode is active, route ALL subcommands into
     # the managed container.  This MUST run before parse_args() so that
@@ -2110,18 +1911,13 @@ def _main_inner():
         # and raises OSError on failure (which propagates as a traceback).
         sys.exit(1)
 
-    _processed_argv = _coalesce_session_name_args(sys.argv[1:])
+    _processed_argv = sys.argv[1:]
 
     # ── Defensive subparser routing (bpo-9338 workaround) ───────────
     # On some Python versions (notably <3.11), argparse fails to route
-    # subcommand tokens when the parent parser has nargs='?' optional
-    # arguments (--continue).  The symptom: "unrecognized arguments: model"
-    # even though 'model' is a registered subcommand.
-    #
+    # subcommand tokens when the parent parser has optional arguments.
     # Fix: when argv contains a token matching a known subcommand, set
-    # subparsers.required=True to force deterministic routing.  If that
-    # fails (e.g. 'ector -c model' where 'model' is consumed as the
-    # session name for --continue), fall back to the default behaviour.
+    # subparsers.required=True to force deterministic routing.
     import io as _io
 
     _known_cmds = (
@@ -2145,8 +1941,6 @@ def _main_inner():
             # the same help text again (#10230).
             if exc.code == 0:
                 raise
-            # Subcommand name was consumed as a flag value (e.g. -c model).
-            # Fall back to optional subparsers so argparse handles it normally.
             subparsers.required = False
             args = parser.parse_args(_processed_argv)
     else:
@@ -2196,53 +1990,9 @@ def _main_inner():
                 exc_info=True,
             )
 
-    # Handle top-level --oneshot / -z: single-shot mode, stdout = final
-    # response only, nothing else. Bypasses cli.py entirely.
-    if getattr(args, "oneshot", None):
-        from ector_cli.oneshot import run_oneshot
-
-        sys.exit(run_oneshot(
-            args.oneshot,
-            model=getattr(args, "model", None),
-            provider=getattr(args, "provider", None),
-        ))
-
-    # Handle top-level --resume / --continue as shortcut to chat
-    if (args.resume or args.continue_last) and args.command is None:
-        args.command = "chat"
-        for attr, default in [
-            ("query", None),
-            ("model", None),
-            ("provider", None),
-            ("toolsets", None),
-            ("verbose", False),
-            ("worktree", False),
-        ]:
-            if not hasattr(args, attr):
-                setattr(args, attr, default)
-        cmd_chat(args)
-        return
-
-    # Default: terminal chat (TUI on TTY). Web UI is explicit via `ector localhost`.
+    # Default: web dashboard when no subcommand is given.
     if args.command is None:
-        # Keep the predicate for future-proofing (it currently always routes to chat).
-        if _bare_ector_should_use_chat(args):
-            for attr, default in [
-                ("query", None),
-                ("model", None),
-                ("provider", None),
-                ("toolsets", None),
-                ("verbose", False),
-                ("resume", None),
-                ("continue_last", None),
-                ("worktree", False),
-            ]:
-                if not hasattr(args, attr):
-                    setattr(args, attr, default)
-            cmd_chat(args)
-            return
-        # Defensive fallback — should not trigger under current routing rules.
-        parser.print_help()
+        _launch_default_dashboard(args)
         return
 
     # Execute the command

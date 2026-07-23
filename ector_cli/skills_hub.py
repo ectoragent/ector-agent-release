@@ -24,6 +24,15 @@ from rich.text import Text
 # Lazy imports to avoid circular dependencies and slow startup.
 # tools.skills_hub and tools.skills_guard are imported inside functions.
 from ector_constants import display_ector_home
+from ector_cli.list_format import (
+    LIST_PRIMARY,
+    ListColumn,
+    print_list_empty,
+    print_list_heading,
+    print_list_section,
+    print_list_summary,
+    render_list_page,
+)
 
 _console = Console()
 
@@ -486,19 +495,17 @@ def do_browse(page: int = 1, page_size: int = 20, source: str = "all",
     c.print()
 
     # Build table
-    from rich import box
+    from ector_cli.list_format import build_list_table
 
-    table = Table(
-        show_header=True,
-        header_style="bold",
-        box=box.ROUNDED,
-        expand=True,
-        padding=(0, 1),
+    table = build_list_table(
+        (
+            ListColumn("#", style="dim", width=4, justify="right"),
+            ListColumn("Skill", style=f"bold {LIST_PRIMARY}", no_wrap=True, ratio=2),
+            ListColumn("Descrição", overflow="fold", ratio=4),
+            ListColumn("Origem", style="dim", no_wrap=True, ratio=1),
+        ),
+        primary=LIST_PRIMARY,
     )
-    table.add_column("#", style="dim", width=4, justify="right")
-    table.add_column("Skill", style="bold cyan", no_wrap=True, ratio=2)
-    table.add_column("Descrição", overflow="fold", ratio=4)
-    table.add_column("Origem", style="dim", no_wrap=True, ratio=1)
 
     for i, r in enumerate(page_items, start=start + 1):
         badge = _skill_trust_badge(r.source, r.trust_level)
@@ -1038,6 +1045,86 @@ def do_create(
     return True
 
 
+_SKILL_LIST_SECTIONS: tuple[tuple[str, str, str], ...] = (
+    ("cloud", "Biblioteca Ector", "nuvem"),
+    ("hub", "Hub externo", "hub"),
+    ("local", "Locais", "locais"),
+)
+
+
+def _format_skill_category_label(category: str) -> str:
+    text = str(category or "").strip().replace("_", " ").replace("-", " ")
+    if not text or text == "—":
+        return "—"
+    return text[0].upper() + text[1:]
+
+
+def _read_skill_version(
+    hub_entry: Optional[Dict[str, Any]],
+    category: str,
+    name: str,
+) -> str:
+    from tools.skills_hub import SKILLS_DIR
+
+    candidates: list[Path] = []
+    if hub_entry:
+        install_path = str(hub_entry.get("install_path") or "").strip()
+        if install_path:
+            candidates.append(SKILLS_DIR / install_path / "SKILL.md")
+    if category and category != "—":
+        candidates.append(SKILLS_DIR / category / name / "SKILL.md")
+    candidates.append(SKILLS_DIR / name / "SKILL.md")
+
+    for skill_md in candidates:
+        if not skill_md.is_file():
+            continue
+        try:
+            content = skill_md.read_text(encoding="utf-8")[:2000]
+        except OSError:
+            continue
+        if not content.startswith("---"):
+            continue
+        end = content.find("---", 3)
+        if end == -1:
+            continue
+        try:
+            import yaml
+
+            frontmatter = yaml.safe_load(content[3:end]) or {}
+        except Exception:
+            continue
+        version = str(frontmatter.get("version") or "").strip()
+        if version:
+            return version
+    return "—"
+
+
+def _skill_list_origin_kind(hub_entry: Optional[Dict[str, Any]]) -> str:
+    if not hub_entry:
+        return "local"
+    from tools.skills_hub import is_cloud_managed_hub_entry
+
+    if is_cloud_managed_hub_entry(hub_entry):
+        return "cloud"
+    return "hub"
+
+
+def _format_skill_list_status(*, is_enabled: bool, update_pending: bool) -> str:
+    if not is_enabled:
+        return "[dim]○ Desativada[/]"
+    if update_pending:
+        return "[bold green]● Ativa[/] [yellow]↻ Atualização[/]"
+    return "[bold green]● Ativa[/]"
+
+
+_SKILL_LIST_COLUMNS = (
+    ListColumn("Skill", style=f"bold {LIST_PRIMARY}", min_width=22, ratio=3),
+    ListColumn("Versão", style="dim", no_wrap=True, min_width=6, ratio=1),
+    ListColumn("Categoria", style="dim", overflow="ellipsis", min_width=14, ratio=2),
+    ListColumn("Estado", no_wrap=True, min_width=18, ratio=2),
+)
+
+
 def do_list(source_filter: str = "all",
             enabled_only: bool = False,
             console: Optional[Console] = None) -> None:
@@ -1052,13 +1139,15 @@ def do_list(source_filter: str = "all",
     ``skills.disabled`` list because ``-p`` swaps ``ECTOR_HOME`` at process
     start.  No explicit profile flag needed here.
     """
-    from rich import box
-
-    from tools.skills_hub import HubLockFile, ensure_hub_dirs
+    from tools.skills_hub import (
+        HubLockFile,
+        collect_installed_skill_update_names,
+        ensure_hub_dirs,
+    )
     from tools.skills_tool import _find_all_skills
     from agent.skill_utils import get_disabled_skill_names
 
-    primary = "#2DD8FC"
+    primary = LIST_PRIMARY
     c = console or _console
 
     try:
@@ -1072,123 +1161,142 @@ def do_list(source_filter: str = "all",
     lock = HubLockFile()
     hub_installed = {e["name"]: e for e in lock.list_installed()}
 
-    # Pull ALL skills (including disabled ones) so we can annotate status.
+    update_pending: set[str] = set()
+    try:
+        update_pending = collect_installed_skill_update_names(hub_installed, lock=lock)
+    except Exception:
+        pass
+
     all_skills = _find_all_skills(skip_disabled=True)
     disabled_names = get_disabled_skill_names()
 
-    def _origin_order(st: str) -> int:
-        return {"hub": 0, "local": 1}.get(st, 9)
-
-    rows: list[tuple] = []
-    hub_count = 0
-    local_count = 0
-    enabled_count = 0
-    disabled_count = 0
+    grouped: dict[str, list[dict[str, Any]]] = {
+        "cloud": [],
+        "hub": [],
+        "local": [],
+    }
+    counts = {
+        "cloud": 0,
+        "hub": 0,
+        "local": 0,
+        "enabled": 0,
+        "disabled": 0,
+        "pending": 0,
+    }
 
     for skill in all_skills:
         name = skill["name"]
-        category = skill.get("category", "") or "—"
+        raw_category = str(skill.get("category", "") or "—")
+        category = _format_skill_category_label(raw_category)
         hub_entry = hub_installed.get(name)
+        origin_kind = _skill_list_origin_kind(hub_entry)
 
-        if hub_entry:
-            source_type = "hub"
+        if origin_kind == "local":
+            filter_key = "local"
         else:
-            source_type = "local"
+            filter_key = "hub"
 
-        if source_filter != "all" and source_filter != source_type:
+        if source_filter != "all" and source_filter != filter_key:
             continue
 
         is_enabled = name not in disabled_names
         if enabled_only and not is_enabled:
             continue
 
-        if source_type == "hub":
-            hub_count += 1
-        else:
-            local_count += 1
-
+        counts[origin_kind] += 1
         if is_enabled:
-            enabled_count += 1
-            status_cell = "[bold green]● Ativa[/]"
+            counts["enabled"] += 1
         else:
-            disabled_count += 1
-            status_cell = "[dim red]○ Desativada[/]"
+            counts["disabled"] += 1
 
-        origem_cell = (
-            "[bold #2DD8FC]Ector Hub[/]"
-            if source_type == "hub"
-            else "[dim]Local[/]"
+        pending = name in update_pending
+        if pending:
+            counts["pending"] += 1
+
+        grouped[origin_kind].append(
+            {
+                "name": name,
+                "version": _read_skill_version(hub_entry, raw_category, name),
+                "category": category,
+                "status": _format_skill_list_status(
+                    is_enabled=is_enabled,
+                    update_pending=pending,
+                ),
+                "sort_category": category.lower(),
+                "sort_name": name.lower(),
+            }
         )
 
-        rows.append(
-            (
-                _origin_order(source_type),
-                source_type,
-                (category or "").lower(),
-                name.lower(),
-                name,
-                category,
-                origem_cell,
-                status_cell,
-            )
-        )
+    for section_rows in grouped.values():
+        section_rows.sort(key=lambda row: (row["sort_category"], row["sort_name"]))
 
-    rows.sort(key=lambda r: (r[0], r[2], r[3]))
-
+    total_rows = sum(len(section_rows) for section_rows in grouped.values())
     title = "Habilidades instaladas"
     if enabled_only:
-        title += " (só ativas)"
+        title += " · só ativas"
 
-    if not rows:
-        c.print()
-        c.print(
-            Panel(
-                "[dim]Nenhuma encontrada.[/]",
-                border_style=primary,
-                padding=(0, 1),
-                title=f"[bold {primary}]Habilidades instaladas[/]",
-            )
-        )
-        c.print()
+    if total_rows == 0:
+        print_list_empty(c, title, "Nenhuma skill instalada.", primary=primary)
         return
 
-    table = Table(
-        title=f"[bold {primary}]{title}[/]",
-        box=box.ROUNDED,
-        show_header=True,
-        header_style=f"bold {primary}",
-        expand=True,
-        padding=(0, 1),
-        title_justify="left",
-        border_style="#A8A29E",
-        row_styles=["none", "dim"],
-    )
-    table.add_column("Skill", style=f"bold {primary}", no_wrap=True, ratio=2)
-    table.add_column("Categoria", style="dim", overflow="fold", ratio=3)
-    table.add_column("Origem", style="dim", no_wrap=True, ratio=1)
-    table.add_column("Estado", no_wrap=True, ratio=1)
-
-    prev_source: Optional[str] = None
-    for _o, src, _c, _n, name, category, origem, status_cell in rows:
-        end_section = prev_source is not None and src != prev_source
-        table.add_row(name, category, origem, status_cell, end_section=end_section)
-        prev_source = src
-
-    c.print(table)
-    summary = f"[dim]{hub_count} hub · {local_count} locais"
-    if enabled_only:
-        summary += f" — {enabled_count} listadas (ativas)"
-    else:
-        summary += f" — {enabled_count} ativas, {disabled_count} desativadas"
-    c.print(
-        Panel(
-            summary,
-            border_style="#A8A29E",
-            padding=(0, 1),
-            title=f"[bold {primary}]Resumo[/]",
+    sections: list[tuple[str, tuple[ListColumn, ...], list[tuple[str, ...]]]] = []
+    for section_key, section_title, _summary_key in _SKILL_LIST_SECTIONS:
+        if section_key == "cloud" and source_filter == "local":
+            continue
+        if section_key == "local" and source_filter == "hub":
+            continue
+        if section_key == "hub" and source_filter == "local":
+            continue
+        rows = grouped[section_key]
+        if not rows:
+            continue
+        sections.append(
+            (
+                section_title,
+                _SKILL_LIST_COLUMNS,
+                [(r["name"], r["version"], r["category"], r["status"]) for r in rows],
+            )
         )
-    )
-    c.print()
+
+    print_list_heading(c, title, primary=primary)
+    for section_title, columns, section_rows in sections:
+        print_list_section(
+            c,
+            title=section_title,
+            columns=columns,
+            rows=section_rows,
+            primary=primary,
+        )
+
+    summary_parts = [
+        f"{counts['cloud']} nuvem",
+        f"{counts['hub']} hub",
+        f"{counts['local']} locais",
+    ]
+    summary = f"[dim]{' · '.join(summary_parts)}"
+    if enabled_only:
+        summary += f" — {counts['enabled']} listadas[/]"
+    else:
+        summary += f" — {counts['enabled']} ativas, {counts['disabled']} desativadas[/]"
+    if counts["pending"]:
+        summary += (
+            f"\n[yellow]{counts['pending']} com atualização[/] "
+            "[dim]→[/] [bold]ector skills update[/]"
+        )
+
+    print_list_summary(c, summary, primary=primary)
+
+
+_SKILL_UPDATE_STATUS_LABELS: dict[str, str] = {
+    "update_available": "atualização disponível",
+    "up_to_date": "em dia",
+    "unavailable": "indisponível",
+    "cloud_library": "biblioteca na nuvem — use: ector skills sync",
+}
+
+
+def _format_skill_update_status(status: str) -> str:
+    return _SKILL_UPDATE_STATUS_LABELS.get(status, status)
 
 
 def do_check(name: Optional[str] = None, console: Optional[Console] = None) -> None:
@@ -1198,20 +1306,36 @@ def do_check(name: Optional[str] = None, console: Optional[Console] = None) -> N
     c = console or _console
     results = check_for_skill_updates(name=name)
     if not results:
-        c.print("[dim]Nenhuma habilidade instalada via hub para verificar.[/]\n")
+        print_list_empty(c, "Atualizações de skills", "Nenhuma habilidade instalada via hub.", primary=LIST_PRIMARY)
         return
 
-    table = Table(title="Atualizações de Habilidades")
-    table.add_column("Nome", style="bold cyan")
-    table.add_column("Fonte", style="dim")
-    table.add_column("Status", style="dim")
-
-    for entry in results:
-        table.add_row(entry.get("name", ""), entry.get("source", ""), entry.get("status", ""))
-
-    c.print(table)
+    rows = [
+        (
+            entry.get("name", ""),
+            entry.get("source", ""),
+            _format_skill_update_status(str(entry.get("status", ""))),
+        )
+        for entry in results
+    ]
+    columns = (
+        ListColumn("Nome", style=f"bold {LIST_PRIMARY}", ratio=2),
+        ListColumn("Fonte", style="dim", ratio=1),
+        ListColumn("Status", style="dim", ratio=2),
+    )
+    print_list_heading(c, "Atualizações de skills", primary=LIST_PRIMARY)
+    print_list_section(c, title="Instaladas", columns=columns, rows=rows, primary=LIST_PRIMARY)
     update_count = sum(1 for entry in results if entry.get("status") == "update_available")
-    c.print(f"[dim]{update_count} atualização(ões) disponível(is) em {len(results)} habilidade(s) verificada(s)[/]\n")
+    cloud_count = sum(1 for entry in results if entry.get("status") == "cloud_library")
+    c.print(
+        f"[dim]{update_count} atualização(ões) do hub em {len(results)} habilidade(s) verificada(s)[/]"
+    )
+    if cloud_count:
+        c.print(
+            f"[dim]{cloud_count} na biblioteca na nuvem — "
+            "[bold]ector skills sync[/] (após [bold]ector login[/])[/]\n"
+        )
+    else:
+        c.print()
 
 
 def do_update(
@@ -1220,25 +1344,88 @@ def do_update(
     *,
     check_only: bool = False,
 ) -> None:
-    """Check for and apply upstream updates to hub-installed skills."""
-    from tools.skills_hub import HubLockFile, check_for_skill_updates
+    """Apply hub upstream updates; cloud library skills use ``ector skills sync``."""
+    from tools.skills_hub import HubLockFile, check_for_skill_updates, is_cloud_managed_hub_entry
 
     c = console or _console
     lock = HubLockFile()
-    results = check_for_skill_updates(name=name)
-    updates = [entry for entry in results if entry.get("status") == "update_available"]
+    installed = lock.list_installed()
+    if name:
+        installed = [entry for entry in installed if entry.get("name") == name]
 
-    if check_only or not updates:
+    cloud_skills = [entry for entry in installed if is_cloud_managed_hub_entry(entry)]
+    results = check_for_skill_updates(name=name)
+    hub_updates = [entry for entry in results if entry.get("status") == "update_available"]
+
+    if check_only:
         do_check(name=name, console=c)
         return
 
-    for entry in updates:
-        installed = lock.get_installed(entry["name"])
-        category = _derive_category_from_install_path(installed.get("install_path", "")) if installed else ""
-        c.print(f"[bold]Atualizando:[/] {entry['name']}")
-        do_install(entry["identifier"], category=category, force=True, console=c)
+    if cloud_skills:
+        from tools.cloud_skills_sync import (
+            collect_cloud_skill_update_names,
+            sync_cloud_skills_library,
+        )
 
-    c.print(f"[bold green]Atualizada(s) {len(updates)} habilidade(s).[/]\n")
+        pending_before = collect_cloud_skill_update_names(
+            {entry["name"]: entry for entry in cloud_skills},
+        )
+        if pending_before:
+            c.print(
+                f"[dim]{len(pending_before)} skill(s) com atualização pendente na biblioteca.[/]"
+            )
+
+        c.print("[bold]Atualizando biblioteca na nuvem...[/]")
+        result = sync_cloud_skills_library(
+            quiet=False,
+            respect_rate_limit=False,
+            refresh_stale_links=True,
+        )
+        c.print()
+
+        if not hub_updates:
+            refreshed = int(result.get("library_refreshed") or 0)
+            downloaded = int(result.get("downloaded") or 0)
+            if refreshed or downloaded:
+                return
+            if pending_before and result.get("not_modified"):
+                c.print(
+                    "[yellow]Vínculos renovados, mas o conteúdo local já estava em dia.[/]\n"
+                )
+                return
+            if pending_before:
+                c.print(
+                    "[yellow]Não foi possível concluir a atualização. "
+                    "Confira [bold]ector login[/] e tente [bold]ector skills sync[/].[/]\n"
+                )
+            return
+
+    success_count = 0
+    for entry in hub_updates:
+        installed_entry = lock.get_installed(entry["name"])
+        category = (
+            _derive_category_from_install_path(installed_entry.get("install_path", ""))
+            if installed_entry
+            else ""
+        )
+        prev_hash = str((installed_entry or {}).get("content_hash") or "")
+        c.print(f"[bold]Atualizando (hub):[/] {entry['name']}")
+        do_install(
+            entry["identifier"],
+            category=category,
+            force=True,
+            skip_confirm=True,
+            console=c,
+        )
+        updated_entry = lock.get_installed(entry["name"]) or {}
+        new_hash = str(updated_entry.get("content_hash") or "")
+        if new_hash and new_hash != prev_hash:
+            success_count += 1
+
+    if success_count:
+        c.print(f"[bold green]Atualizada(s) {success_count} habilidade(s) do hub.[/]\n")
+    else:
+        c.print("[yellow]Nenhuma habilidade do hub foi atualizada.[/]\n")
 
 
 def do_audit(name: Optional[str] = None, console: Optional[Console] = None) -> None:
@@ -1324,17 +1511,40 @@ def do_tap(action: str, repo: str = "", console: Optional[Console] = None) -> No
 
     if action == "list":
         taps = mgr.list_taps()
+        c = console or _console
         if not taps:
-            c.print("[dim]Nenhum tap personalizado configurado. Usando apenas fontes padrão.[/]\n")
+            print_list_empty(
+                c,
+                "Taps de skills",
+                "Nenhum tap personalizado configurado.",
+                hint="[dim]Adicione com[/] [bold]ector skills tap add dono/repo[/]",
+                primary=LIST_PRIMARY,
+            )
             return
-        table = Table(title="Taps Configurados")
-        table.add_column("Repositório", style="bold cyan")
-        table.add_column("Caminho", style="dim")
-        for t in taps:
-            label = t.get("repo") or t.get("name") or t.get("path", "unknown")
-            table.add_row(label, t.get("path", "skills/"))
-        c.print(table)
-        c.print()
+        rows = [
+            (
+                str(t.get("repo") or t.get("name") or t.get("path", "unknown")),
+                str(t.get("path", "skills/")),
+            )
+            for t in taps
+        ]
+        render_list_page(
+            c,
+            title="Taps de skills",
+            sections=[
+                (
+                    "Repositórios",
+                    (
+                        ListColumn("Repositório", style=f"bold {LIST_PRIMARY}", ratio=2),
+                        ListColumn("Caminho", style="dim", ratio=1),
+                    ),
+                    rows,
+                )
+            ],
+            footer="[dim]Gerir:[/] [bold]ector skills tap add|remove <repo>[/]",
+            primary=LIST_PRIMARY,
+        )
+        return
 
     elif action == "add":
         if not repo:
@@ -1976,7 +2186,7 @@ def _skills_help_table(*, for_cli: bool) -> Table:
     row("inspect <id>", "Pré-visualizar antes de instalar")
 
     section("Manutenção")
-    row("update", "Verificar e aplicar atualizações", optional=" [nome]")
+    row("update", "Atualizar skills do hub GitHub; biblioteca na nuvem via sync", optional=" [nome]")
 
     section("Avançado")
     row("audit", "Revalidar segurança", optional=" [nome]")

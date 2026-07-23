@@ -1,4 +1,4 @@
-"""Detached runner for `ector localhost`.
+"""Detached runner for bare ``ector`` (dashboard daemon).
 
 This module exists so the CLI can spawn a background web UI process without
 blocking the initiating terminal.

@@ -46,8 +46,13 @@ __pycache__/
 wandb/
 testlogs
 
+.claude/
+
 # CLI config (may contain sensitive SSH paths)
 cli-config.yaml
+
+# Ector runtime state (local session DB, preferences, etc.)
+.ector/
 
 # Skills Hub state (em runtime: ~/.ector/skills/.hub/ — por garantia)
 skills/.hub/

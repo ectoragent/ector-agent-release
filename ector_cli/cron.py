@@ -41,20 +41,27 @@ def _cron_api(**kwargs):
 def cron_list(show_all: bool = False):
     """List all scheduled jobs."""
     from cron.jobs import list_jobs
+    from rich.console import Console
+
+    from ector_cli.list_format import LIST_PRIMARY, ListColumn, render_list_page
 
     jobs = list_jobs(include_disabled=show_all)
+    console = Console()
 
     if not jobs:
-        print(color("Nenhuma tarefa agendada.", Colors.DIM))
-        print(color("Crie uma com 'ector cron create ...' ou o comando /cron no chat.", Colors.DIM))
+        render_list_page(
+            console,
+            title="Tarefas agendadas",
+            sections=[],
+            empty_message="Nenhuma tarefa agendada.",
+            empty_hint="[dim]Crie com[/] [bold]ector cron create[/] [dim]ou[/] [bold]/cron[/] [dim]no chat.[/]",
+            primary=LIST_PRIMARY,
+        )
         return
 
-    print()
-    print(color("┌─────────────────────────────────────────────────────────────────────────┐", Colors.CYAN))
-    print(color("│                         Tarefas Agendadas                               │", Colors.CYAN))
-    print(color("└─────────────────────────────────────────────────────────────────────────┘", Colors.CYAN))
-    print()
-
+    rows = []
+    active_n = 0
+    paused_n = 0
     for job in jobs:
         job_id = job.get("id", "?")
         name = job.get("name", "(sem nome)")
@@ -62,56 +69,40 @@ def cron_list(show_all: bool = False):
         state = job.get("state", "agendada" if job.get("enabled", True) else "pausada")
         next_run = job.get("next_run_at", "?")
 
-        repeat_info = job.get("repeat", {})
-        repeat_times = repeat_info.get("times")
-        repeat_completed = repeat_info.get("completed", 0)
-        repeat_str = f"{repeat_completed}/{repeat_times}" if repeat_times else "∞"
-
-        deliver = job.get("deliver", ["local"])
-        if isinstance(deliver, str):
-            deliver = [deliver]
-        deliver_str = ", ".join(deliver)
-
-        skills = job.get("skills") or ([job["skill"]] if job.get("skill") else [])
         if state == "pausada":
-            status = color("[pausada]", Colors.YELLOW)
+            status = "[yellow]Pausada[/]"
+            paused_n += 1
         elif state == "concluída":
-            status = color("[concluída]", Colors.BLUE)
+            status = "[blue]Concluída[/]"
         elif job.get("enabled", True):
-            status = color("[ativa]", Colors.GREEN)
+            status = "[green]Ativa[/]"
+            active_n += 1
         else:
-            status = color("[desabilitada]", Colors.RED)
+            status = "[red]Desabilitada[/]"
+            paused_n += 1
 
-        print(f"  {color(job_id, Colors.YELLOW)} {status}")
-        print(f"    Nome:      {name}")
-        print(f"    Agenda:    {schedule}")
-        print(f"    Repetir:   {repeat_str}")
-        print(f"    Próx. exec:{next_run}")
-        print(f"    Entrega:   {deliver_str}")
-        if skills:
-            print(f"    Habilid.:  {', '.join(skills)}")
-        script = job.get("script")
-        if script:
-            print(f"    Script:    {script}")
-        workdir = job.get("workdir")
-        if workdir:
-            print(f"    Workdir:   {workdir}")
+        rows.append((str(job_id), name, str(schedule), status, str(next_run)))
 
-        # Execution history
-        last_status = job.get("last_status")
-        if last_status:
-            last_run = job.get("last_run_at", "?")
-            if last_status == "ok":
-                status_display = color("ok", Colors.GREEN)
-            else:
-                status_display = color(f"{last_status}: {job.get('last_error', '?')}", Colors.RED)
-            print(f"    Última exec: {last_run}  {status_display}")
-
-        delivery_err = job.get("last_delivery_error")
-        if delivery_err:
-            print(f"    {color('▲ Falha na entrega:', Colors.YELLOW)} {delivery_err}")
-
-        print()
+    render_list_page(
+        console,
+        title="Tarefas agendadas",
+        sections=[
+            (
+                "Jobs",
+                (
+                    ListColumn("ID", style="dim", no_wrap=True, min_width=8, ratio=1),
+                    ListColumn("Nome", style=f"bold {LIST_PRIMARY}", ratio=2),
+                    ListColumn("Agenda", style="dim", overflow="fold", ratio=2),
+                    ListColumn("Estado", no_wrap=True, min_width=12, ratio=1),
+                    ListColumn("Próxima exec.", style="dim", no_wrap=True, min_width=14, ratio=1),
+                ),
+                rows,
+            )
+        ],
+        summary=f"[dim]{active_n} ativa(s) · {paused_n} pausada(s)/desabilitada(s)[/]",
+        footer="[dim]Gerir:[/] [bold]ector cron edit|pause|resume|run|remove <id>[/]",
+        primary=LIST_PRIMARY,
+    )
 
     from ector_cli.gateway import find_gateway_pids
     if not find_gateway_pids():

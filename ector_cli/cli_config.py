@@ -90,7 +90,7 @@ def load_cli_config() -> Dict[str, Any]:
 
         "display": {
             "resume_display": "full",
-            "show_reasoning": False,
+            "show_reasoning": True,
             "streaming": True,
             "busy_input_mode": "interrupt",
         },

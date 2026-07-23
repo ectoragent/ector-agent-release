@@ -34,6 +34,7 @@ import json
 import logging
 import os
 import platform
+import re
 import shlex
 import signal
 import socket
@@ -1063,7 +1064,7 @@ def execute_code(
         # Env scrubbing and tool whitelist apply identically in both modes.
         _mode = _get_execution_mode()
         _child_python = _resolve_child_python(_mode)
-        _child_cwd = _resolve_child_cwd(_mode, tmpdir)
+        _child_cwd = _resolve_child_cwd(_mode, tmpdir, task_id)
         _script_path = os.path.join(tmpdir, "script.py")
 
         proc = subprocess.Popen(
@@ -1247,6 +1248,10 @@ def execute_code(
             # Include stderr in output so the LLM sees the traceback
             if stderr_text:
                 result["output"] = stdout_text + "\n--- stderr ---\n" + stderr_text
+                hint = _missing_module_hint(stderr_text)
+                if hint:
+                    result["output"] += f"\n\n{hint}"
+                    result["error"] = f"{result['error'].rstrip()}\n{hint}"
 
         return json.dumps(result, ensure_ascii=False)
 
@@ -1312,6 +1317,41 @@ def _kill_process_group(proc, escalate: bool = False):
                     proc.kill()
                 except Exception as e2:
                     logger.debug("Could not kill process: %s", e2, exc_info=True)
+
+
+def _missing_module_hint(stderr_text: str) -> str:
+    """Suggest an install command for common ModuleNotFoundError cases."""
+    match = re.search(
+        r"ModuleNotFoundError:\s*No module named ['\"]([^'\"]+)['\"]",
+        stderr_text or "",
+    )
+    if not match:
+        return ""
+    module = match.group(1).strip()
+    # Top-level package name (PIL → pillow).
+    top = module.split(".", 1)[0]
+    pip_name = {
+        "PIL": "pillow",
+        "cv2": "opencv-python-headless",
+        "sklearn": "scikit-learn",
+        "skimage": "scikit-image",
+        "yaml": "pyyaml",
+        "bs4": "beautifulsoup4",
+        "docx": "python-docx",
+        "fitz": "pymupdf",
+    }.get(top, top)
+    if top in {"PIL", "pillow"}:
+        return (
+            "Hint: Pillow is required for image scripts in execute_code. "
+            f"Install with: pip install {pip_name}  "
+            "(or: pip install 'ector-agent[documents]'). "
+            "Alternatively sample colors via terminal() + ImageMagick "
+            "(`magick identify -verbose …` / `convert … -format %c histogram:info:`)."
+        )
+    return (
+        f"Hint: Python module `{module}` is not installed in the execute_code "
+        f"interpreter. Install with: pip install {pip_name}"
+    )
 
 
 def _load_config() -> dict:
@@ -1422,17 +1462,24 @@ def _resolve_child_python(mode: str) -> str:
     return sys.executable
 
 
-def _resolve_child_cwd(mode: str, staging_dir: str) -> str:
+def _resolve_child_cwd(mode: str, staging_dir: str, task_id: Optional[str] = None) -> str:
     """Resolve the working directory for the execute_code subprocess.
 
     - ``strict``: the staging tmpdir (today's behavior).
-    - ``project``: the session's TERMINAL_CWD (same as the terminal tool), or
-      ``os.getcwd()`` if TERMINAL_CWD is unset or doesn't point at a real dir.
-      Falls back to the staging tmpdir as a last resort so we never invoke
+    - ``project``: the session cwd (same precedence as terminal / file tools),
+      falling back to ``os.getcwd()`` / staging tmpdir so we never invoke
       Popen with a nonexistent cwd.
     """
     if mode != "project":
         return staging_dir
+    try:
+        from agent.session_paths import resolve_session_cwd
+
+        candidate = resolve_session_cwd(task_id)
+        if candidate and os.path.isdir(candidate):
+            return candidate
+    except Exception:
+        pass
     raw = os.environ.get("TERMINAL_CWD", "").strip()
     if raw:
         expanded = os.path.expanduser(raw)

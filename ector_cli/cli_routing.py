@@ -14,7 +14,7 @@ OFFLINE_COMMANDS = frozenset({
     "config", "hooks", "profile",
     "auth", "sessions", "skills", "tools",
     "status", "pairing", "memory",
-    "backup", "reset",
+    "backup", "reset", "kill",
 })
 
 # For grouped subcommands, identity auth and plugin discovery apply only when
@@ -26,43 +26,20 @@ GROUPED_AGENT_SUBS: dict[str, tuple[str, frozenset[str]]] = {
 }
 
 # Top-level commands that always run the agent (or agent-adjacent runtime).
-AGENT_TOP_LEVEL_COMMANDS = frozenset({"chat", "acp", "rl", "localhost"})
+AGENT_TOP_LEVEL_COMMANDS = frozenset({"acp", "rl"})
 
 
 def command_requires_identity(args) -> bool:
     """Return True when the parsed args will eventually run the agent."""
     cmd = getattr(args, "command", None)
-    if getattr(args, "oneshot", None):
-        return True
     if cmd is None:
-        return bare_ector_should_use_chat(args)
+        return True
     if cmd in OFFLINE_COMMANDS:
         return False
     if cmd in GROUPED_AGENT_SUBS:
         sub_attr, agent_subs = GROUPED_AGENT_SUBS[cmd]
         sub = getattr(args, sub_attr, None)
         return sub in agent_subs
-    return True
-
-
-def bare_ector_should_use_chat(args) -> bool:
-    """Bare ``ector`` (no subcommand) routes to terminal chat."""
-    if getattr(args, "model", None):
-        return True
-    if getattr(args, "provider", None):
-        return True
-    if getattr(args, "skills", None):
-        return True
-    if getattr(args, "worktree", False):
-        return True
-    if getattr(args, "yolo", False):
-        return True
-    if getattr(args, "pass_session_id", False):
-        return True
-    if getattr(args, "ignore_user_config", False):
-        return True
-    if getattr(args, "ignore_rules", False):
-        return True
     return True
 
 

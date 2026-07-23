@@ -391,7 +391,7 @@ def get_tool_definitions(
 # because they need agent-level state (TodoStore, MemoryStore, etc.).
 # The registry still holds their schemas; dispatch just returns a stub error
 # so if something slips through, the LLM sees a sensible message.
-_AGENT_LOOP_TOOLS = {"todo", "memory", "session_search", "delegate_task"}
+_AGENT_LOOP_TOOLS = {"todo", "memory", "session_search", "delegate_task", "mark_chapter"}
 _READ_SEARCH_TOOLS = {"read_file", "search_files"}
 
 
@@ -520,6 +520,7 @@ def handle_function_call(
     user_task: Optional[str] = None,
     enabled_tools: Optional[List[str]] = None,
     skip_pre_tool_call_hook: bool = False,
+    platform: Optional[str] = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -578,6 +579,20 @@ def handle_function_call(
                 )
             except Exception:
                 pass
+
+        try:
+            from tools.agent_mode import get_plan_mode_block_message
+
+            plan_block = get_plan_mode_block_message(
+                session_id or "",
+                function_name,
+                function_args,
+                platform=platform,
+            )
+            if plan_block is not None:
+                return json.dumps({"error": plan_block}, ensure_ascii=False)
+        except Exception:
+            pass
 
         # Notify the read-loop tracker when a non-read/search tool runs,
         # so the *consecutive* counter resets (reads after other work are fine).

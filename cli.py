@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 """
-Legacy EctorCLI module — slash-command backend for the Ink TUI.
+Legacy EctorCLI module — slash-command backend for gateway paths.
 
-Interactive chat and one-shot queries use the ``ector`` command (Ink TUI or
-``ector -z``).  This module remains for ``EctorCLI.process_command()`` via
-``tui_gateway`` in-process slash runner and narrow ``python cli.py --list-tools`` listing.
+Interactive chat uses the web dashboard via ``ector``. This module remains for
+``EctorCLI.process_command()`` in-process slash runner and narrow
+``python cli.py --list-tools`` listing.
 
 Preferred usage:
-    ector                    # Ink TUI (TTY)
-    ector chat -q "pergunta" # TUI with initial message (TTY)
-    ector -z "pergunta"      # one-shot (scripts / pipes)
-    ector chat --image PATH -q "…"
+    ector                    # web dashboard
 """
 
 import logging
@@ -868,7 +865,7 @@ class EctorCLI:
         # bell_on_complete: play terminal bell (\a) when agent finishes a response
         self.bell_on_complete = CLI_CONFIG["display"].get("bell_on_complete", False)
         # show_reasoning: display model thinking/reasoning before the response
-        self.show_reasoning = CLI_CONFIG["display"].get("show_reasoning", False)
+        self.show_reasoning = CLI_CONFIG["display"].get("show_reasoning", True)
         self.show_cost = bool(CLI_CONFIG["display"].get("show_cost", False))
         # busy_input_mode: "interrupt" (Enter interrupts current run),
         # "queue" (Enter queues for next turn), or "steer" (Enter injects
@@ -3141,8 +3138,14 @@ class EctorCLI:
         image later with ``vision_analyze`` if needed.
         """
         import asyncio as _asyncio
+        from agent.document_stack.extract import extract_document
+        from agent.document_stack.local_image import understand_image_local
+        from agent.document_stack.markers import (
+            format_document_context_block,
+        )
         from agent.vision_prompts import (
             build_preanalysis_prompt,
+            ensure_image_persistence_marker,
             format_image_context_block,
             format_image_context_failed,
         )
@@ -3157,6 +3160,7 @@ class EctorCLI:
             size_kb = img_path.stat().st_size // 1024
             if announce:
                 _cprint(f"  {_DIM}👁️  analisando {img_path.name} ({size_kb}KB)...{_RST}")
+            vision_ok = False
             try:
                 result_json = _asyncio.run(
                     vision_analyze_tool(image_url=str(img_path), user_prompt=analysis_prompt)
@@ -3164,19 +3168,63 @@ class EctorCLI:
                 result = json.loads(result_json)
                 if result.get("success"):
                     description = result.get("analysis", "")
-                    enriched_parts.append(
-                        format_image_context_block(description, str(img_path))
-                    )
-                    if announce:
-                        _cprint(f"  {_DIM}✔ imagem analisada{_RST}")
-                else:
-                    enriched_parts.append(format_image_context_failed(str(img_path)))
-                    if announce:
-                        _cprint(f"  {_DIM}▲ falha na análise de visão — caminho incluído para nova tentativa{_RST}")
+                    if description:
+                        vision_ok = True
+                        enriched_parts.append(
+                            format_image_context_block(description, str(img_path))
+                        )
+                        if announce:
+                            _cprint(f"  {_DIM}✔ imagem analisada{_RST}")
             except Exception:
+                pass
+
+            if vision_ok:
+                continue
+
+            # Vision unavailable or failed (e.g. main model is text-only):
+            # fall back to local Tesseract (+ Florence-2 when installed).
+            if announce:
+                _cprint(f"  {_DIM}▲ visão indisponível — tentando OCR/VLM local...{_RST}")
+            try:
+                local = understand_image_local(str(img_path))
+            except Exception:
+                local = {"success": False}
+            if local.get("success") and (local.get("markdown") or "").strip():
+                block = format_document_context_block(
+                    local.get("markdown", ""),
+                    str(img_path),
+                    local.get("backend", "tesseract+florence"),
+                )
+                enriched_parts.append(
+                    ensure_image_persistence_marker(block, str(img_path))
+                )
+                if announce:
+                    _cprint(
+                        f"  {_DIM}✔ lido via local ({local.get('backend', 'ocr')}){_RST}"
+                    )
+                continue
+
+            try:
+                extracted = extract_document(str(img_path), force_ocr=True)
+            except Exception:
+                extracted = {"success": False}
+            if extracted.get("success"):
+                block = format_document_context_block(
+                    extracted.get("markdown", ""),
+                    str(img_path),
+                    extracted.get("backend", "ocr"),
+                )
+                enriched_parts.append(
+                    ensure_image_persistence_marker(block, str(img_path))
+                )
+                if announce:
+                    _cprint(
+                        f"  {_DIM}✔ lido via OCR local ({extracted.get('backend', 'ocr')}){_RST}"
+                    )
+            else:
                 enriched_parts.append(format_image_context_failed(str(img_path)))
                 if announce:
-                    _cprint(f"  {_DIM}▲ erro na análise de visão — caminho incluído para nova tentativa{_RST}")
+                    _cprint(f"  {_DIM}▲ falha na análise de visão e no OCR local — caminho incluído para nova tentativa{_RST}")
 
         # Combine: vision descriptions first, then the user's original text
         user_text = text if isinstance(text, str) and text else ""
@@ -4179,7 +4227,7 @@ class EctorCLI:
 
         The snapshot is a convenience export for sharing or off-line inspection;
         every message is already persisted incrementally to the SQLite session
-        DB, so the live session remains resumable via ``ector --resume <id>``
+        DB, so the live session remains resumable via ``ector sessions browse``
         regardless of whether the user ever runs ``/save``.
         """
         if not self.conversation_history:
@@ -4205,7 +4253,7 @@ class EctorCLI:
                 }, f, indent=2, ensure_ascii=False)
             print(f"v Snapshot da conversa salvo em: {path}")
             if self.session_id:
-                print(f"       Retome a sessão ativa com: ector --resume {self.session_id}")
+                print(f"       Retome a sessão ativa com: ector sessions browse")
         except Exception as e:
             print(f"(x_x) Falha ao salvar: {e}")
     
@@ -7216,10 +7264,10 @@ class EctorCLI:
         """
         Platform callback for the Wiser (``wiser``) tool. Called from the agent thread.
 
-        Sets up the interactive selection UI (or freetext prompt for open-ended
-        questions), then blocks until the user responds via the prompt_toolkit
-        key bindings.  If no response arrives within the configured timeout the
-        question is dismissed and the agent is told to decide on its own.
+        Always shows numbered choices plus free-text (“Outro”), then blocks until
+        the user responds via prompt_toolkit key bindings. If no response arrives
+        within the configured timeout the question is dismissed and the agent is
+        told to decide on its own.
         """
         import time as _time
 
@@ -7231,17 +7279,21 @@ class EctorCLI:
 
         timeout = get_wiser_timeout_seconds(CLI_CONFIG)
         response_queue = queue.Queue()
-        is_open_ended = not choices
+        opts = [str(c).strip() for c in (choices or []) if str(c).strip()]
+        if len(opts) < 2:
+            opts = ["Continuar com a melhor opção", "Parar por agora"]
+        else:
+            opts = opts[:4]
 
         self._wiser_state = {
             "question": question,
-            "choices": choices if not is_open_ended else [],
+            "choices": opts,
             "selected": 0,
             "response_queue": response_queue,
         }
         self._wiser_deadline = _time.monotonic() + timeout
-        # Open-ended questions skip straight to freetext input
-        self._wiser_freetext = is_open_ended
+        # Always start on choice list; free-text is the “Outro” path.
+        self._wiser_freetext = False
 
         # Trigger prompt_toolkit repaint from this (non-main) thread
         self._invalidate()
@@ -8171,9 +8223,8 @@ class EctorCLI:
             cc.print(f"  [dim]Mensagens:[/][#E6E6FA] {msg_count} ({user_msgs} usuário, {tool_calls} chamadas de ferramenta)[/]")
             cc.print()
             cc.print(f"[dim]Para retomar esta sessão:[/]")
-            cc.print(f"  [#00D1FF]ector --resume {self.session_id}[/]")
-            if session_title:
-                cc.print(f"  [#00D1FF]ector -c \"{session_title}\"[/]")
+            cc.print(f"  [#00D1FF]ector sessions browse[/]")
+            cc.print(f"  [dim]ou abra /chat no painel web[/]")
             cc.print()
 
         try:

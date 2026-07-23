@@ -59,6 +59,153 @@ def get_memory_dir() -> Path:
 ENTRY_DELIMITER = "\n§\n"
 SESSION_DELTA_MAX_CHARS = 2000
 
+# Entries that tell the agent to load a skill by name (skill_view / "Skill `…`").
+# When that skill is deleted, these entries keep steering the model toward a
+# 404 — scrub them from MEMORY.md / USER.md on delete and on session load.
+_SKILL_VIEW_NAME_RE = re.compile(
+    r"""skill_view\s*\(\s*name\s*=\s*['\"]([^'\"]+)['\"]""",
+    re.IGNORECASE,
+)
+_SKILL_LABEL_RE = re.compile(
+    r"""(?:^|[\s(])Skill\s+`([A-Za-z0-9][A-Za-z0-9._-]*)`""",
+    re.IGNORECASE,
+)
+
+
+def _skill_names_referenced_in_entry(entry: str) -> set[str]:
+    """Return skill names an entry explicitly recommends loading."""
+    names: set[str] = set()
+    for match in _SKILL_VIEW_NAME_RE.finditer(entry):
+        name = (match.group(1) or "").strip()
+        if name:
+            names.add(name)
+    for match in _SKILL_LABEL_RE.finditer(entry):
+        name = (match.group(1) or "").strip()
+        if name:
+            names.add(name)
+    return names
+
+
+def _entry_references_skill(entry: str, skill_name: str) -> bool:
+    target = (skill_name or "").strip().casefold()
+    if not target:
+        return False
+    return any(name.casefold() == target for name in _skill_names_referenced_in_entry(entry))
+
+
+def _known_skill_names() -> set[str]:
+    """Directory + frontmatter names currently present on disk (local/ext/builtin)."""
+    names: set[str] = set()
+    try:
+        from agent.skill_utils import get_all_skills_dirs, iter_skill_index_files, parse_frontmatter
+    except Exception:
+        return names
+
+    for skills_dir in get_all_skills_dirs():
+        if not skills_dir.exists():
+            continue
+        for skill_md in iter_skill_index_files(skills_dir, "SKILL.md"):
+            names.add(skill_md.parent.name)
+            try:
+                raw = skill_md.read_text(encoding="utf-8")
+                frontmatter, _ = parse_frontmatter(raw)
+                fm_name = frontmatter.get("name")
+                if isinstance(fm_name, str) and fm_name.strip():
+                    names.add(fm_name.strip())
+            except Exception:
+                continue
+    return names
+
+
+def _read_memory_entries_file(path: Path) -> list[str]:
+    if not path.exists():
+        return []
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return []
+    if not raw:
+        return []
+    return [e.strip() for e in raw.split(ENTRY_DELIMITER) if e.strip()]
+
+
+def _write_memory_entries_file(path: Path, entries: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not entries:
+        path.write_text("", encoding="utf-8")
+        return
+    path.write_text(ENTRY_DELIMITER.join(entries) + "\n", encoding="utf-8")
+
+
+def scrub_skill_name_from_memory(skill_name: str) -> dict[str, int]:
+    """Remove MEMORY.md / USER.md entries that recommend a deleted skill.
+
+    Called after skill_manage delete / cloud uninstall so the next session
+    does not keep instructing skill_view on a missing name.
+    """
+    name = (skill_name or "").strip()
+    if not name:
+        return {"memory": 0, "user": 0}
+
+    removed = {"memory": 0, "user": 0}
+    mem_dir = get_memory_dir()
+    for target, filename in (("memory", "MEMORY.md"), ("user", "USER.md")):
+        path = mem_dir / filename
+        entries = _read_memory_entries_file(path)
+        if not entries:
+            continue
+        kept = [e for e in entries if not _entry_references_skill(e, name)]
+        dropped = len(entries) - len(kept)
+        if dropped:
+            _write_memory_entries_file(path, kept)
+            removed[target] = dropped
+            logger.info(
+                "Removed %d %s memory entr%s referencing deleted skill '%s'",
+                dropped,
+                target,
+                "y" if dropped == 1 else "ies",
+                name,
+            )
+    return removed
+
+
+def scrub_stale_skill_references_from_memory() -> dict[str, int]:
+    """Drop memory entries that recommend skills no longer on disk.
+
+    Runs at session load so orphaned refs (manual rm, cloud prune, rename)
+    cannot keep steering skill_view toward 404s.
+    """
+    known = {n.casefold() for n in _known_skill_names()}
+    removed = {"memory": 0, "user": 0}
+    if not known:
+        # No skills indexed at all — don't wipe every Skill `…` mention;
+        # only clear when we can positively say a name is gone.
+        return removed
+
+    mem_dir = get_memory_dir()
+    for target, filename in (("memory", "MEMORY.md"), ("user", "USER.md")):
+        path = mem_dir / filename
+        entries = _read_memory_entries_file(path)
+        if not entries:
+            continue
+        kept: list[str] = []
+        dropped = 0
+        for entry in entries:
+            refs = _skill_names_referenced_in_entry(entry)
+            if refs and any(ref.casefold() not in known for ref in refs):
+                dropped += 1
+                continue
+            kept.append(entry)
+        if dropped:
+            _write_memory_entries_file(path, kept)
+            removed[target] = dropped
+            logger.info(
+                "Removed %d stale skill reference(s) from %s memory",
+                dropped,
+                target,
+            )
+    return removed
+
 
 # ---------------------------------------------------------------------------
 # Memory content scanning — lightweight check for injection/exfiltration
@@ -132,6 +279,13 @@ class MemoryStore:
         """Load entries from MEMORY.md and USER.md, capture system prompt snapshot."""
         mem_dir = get_memory_dir()
         mem_dir.mkdir(parents=True, exist_ok=True)
+
+        # Drop entries that still push skill_view for skills that were deleted
+        # (cloud prune, rename, manual rm) before freezing the prompt snapshot.
+        try:
+            scrub_stale_skill_references_from_memory()
+        except Exception:
+            logger.debug("stale skill memory scrub failed", exc_info=True)
 
         self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
         self.user_entries = self._read_file(mem_dir / "USER.md")

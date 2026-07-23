@@ -370,30 +370,14 @@ def list_profiles() -> List[ProfileInfo]:
 
 def print_profile_list(profiles: List[ProfileInfo], active: str) -> None:
     """Render ``ector profile list`` with a Rich table."""
-    from rich import box
     from rich.console import Console
-    from rich.table import Table
 
+    from ector_cli.list_format import LIST_PRIMARY, ListColumn, render_list_page
     from ector_cli.models import provider_label
 
     console = Console()
-
-    table = Table(
-        title="[bold]Perfis[/bold]",
-        caption=f"[dim]Ativo: {active}[/dim]",
-        box=box.ROUNDED,
-        show_header=True,
-        header_style="bold",
-        expand=True,
-        padding=(0, 1),
-        title_justify="left",
-        caption_justify="left",
-    )
-    table.add_column("Perfil", no_wrap=True, ratio=1, max_width=18)
-    table.add_column("Modelo", overflow="fold", ratio=3)
-    table.add_column("Gateway", no_wrap=True, min_width=16)
-    table.add_column("Alias", style="dim", no_wrap=True, ratio=1, max_width=16)
-
+    rows: list[tuple[str, ...]] = []
+    running = 0
     for p in profiles:
         is_active = p.name == active or (active == "default" and p.is_default)
         if is_active:
@@ -407,11 +391,11 @@ def print_profile_list(profiles: List[ProfileInfo], active: str) -> None:
         else:
             model_cell = model
 
-        gw_cell = (
-            "[green]em execução[/green]"
-            if p.gateway_running
-            else "[dim]parado[/dim]"
-        )
+        if p.gateway_running:
+            gw_cell = "[green]Em execução[/]"
+            running += 1
+        else:
+            gw_cell = "[dim]Parado[/]"
 
         if p.is_default:
             alias_cell = "—"
@@ -420,17 +404,31 @@ def print_profile_list(profiles: List[ProfileInfo], active: str) -> None:
         else:
             alias_cell = "—"
 
-        table.add_row(name_cell, model_cell, gw_cell, alias_cell)
+        rows.append((name_cell, model_cell, gw_cell, alias_cell))
 
-    console.print()
-    console.print(table)
-    console.print()
-    console.print(
-        "[dim]◆ = perfil ativo  ·  "
-        "ector profile use <nome>  ·  "
-        "ector -p <nome> chat[/dim]"
+    render_list_page(
+        console,
+        title="Perfis",
+        subtitle=f"ativo: {active}",
+        sections=[
+            (
+                "Disponíveis",
+                (
+                    ListColumn("Perfil", style=f"bold {LIST_PRIMARY}", min_width=16, ratio=1),
+                    ListColumn("Modelo", overflow="fold", ratio=3),
+                    ListColumn("Gateway", no_wrap=True, min_width=14, ratio=1),
+                    ListColumn("Alias", style="dim", no_wrap=True, ratio=1),
+                ),
+                rows,
+            )
+        ],
+        summary=f"[dim]{running} gateway em execução · {len(rows)} perfil(is)[/]",
+        footer=(
+            "[dim]◆ = ativo · [bold]ector profile use <nome>[/] · "
+            "[bold]ector -p <nome> chat[/][/dim]"
+        ),
+        primary=LIST_PRIMARY,
     )
-    console.print()
 
 
 def print_profile_status(

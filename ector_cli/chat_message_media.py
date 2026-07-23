@@ -6,11 +6,16 @@ import re
 from pathlib import Path
 from typing import Any
 
+from agent.document_stack.markers import ECTOR_DOCUMENT_MARKER_PREFIX
 from agent.vision_prompts import ECTOR_IMAGE_MARKER_PREFIX
 from ector_cli.chat_media_paths import rewrite_markdown_image_paths
 
 _IMAGE_MARKER_RE = re.compile(
     re.escape(ECTOR_IMAGE_MARKER_PREFIX) + r"([^>]+)-->",
+)
+
+_DOCUMENT_MARKER_RE = re.compile(
+    re.escape(ECTOR_DOCUMENT_MARKER_PREFIX) + r"([^>]+)-->",
 )
 
 # Internal vision context blocks prepended during enrichment (PT + EN legacy).
@@ -19,6 +24,62 @@ _INTERNAL_IMAGE_BLOCK_RE = re.compile(
     r"[\s\S]*?\]\s*",
     re.IGNORECASE,
 )
+
+# Internal document/OCR context blocks — see agent/document_stack/markers.py.
+# Distinct wording from _INTERNAL_IMAGE_BLOCK_RE (vision pre-analysis); this
+# one wraps whatever the OCR fallback extracted and must stay hidden too.
+_INTERNAL_DOCUMENT_BLOCK_RE = re.compile(
+    r"\[Internal context from attached document[\s\S]*?\]\s*",
+    re.IGNORECASE,
+)
+
+# Ephemeral RAG injection — never show in the user bubble.
+_RAG_CONTEXT_RE = re.compile(
+    r"<\s*rag-context\s*>[\s\S]*?</\s*rag-context\s*>\s*",
+    re.IGNORECASE,
+)
+
+# Gateway reply / attachment notes prepended to the user text.
+_REPLY_CONTEXT_RE = re.compile(
+    r"\[O usuário está respondendo[^\]]*\]\s*",
+    re.IGNORECASE,
+)
+_DOC_SENT_NOTE_RE = re.compile(
+    r"\[O usuário enviou um documento[^\]]*\]\s*",
+    re.IGNORECASE,
+)
+
+# Short agent-only notes (skill activate, MCP reload) — no nested ].
+_AGENT_IMPORTANT_SHORT_RE = re.compile(
+    r"\[(?:IMPORTANTE|IMPORTANT):\s*[^\]]*\]\s*",
+    re.IGNORECASE,
+)
+
+# Entire user turn is a synthetic process/MCP notify (may contain ] in stdout).
+_AGENT_IMPORTANT_SOLE_RE = re.compile(
+    r"^\s*\[(?:IMPORTANTE|IMPORTANT):\s*"
+    r"(?:O processo em segundo plano|Background process|"
+    r"Os servidores MCP foram|MCP servers have been)"
+    r"[\s\S]*\]\s*$",
+    re.IGNORECASE,
+)
+
+
+def display_user_message_content(content: str) -> str:
+    """User-visible text with internal agent/vision/OCR context removed."""
+    if not content:
+        return ""
+    if _AGENT_IMPORTANT_SOLE_RE.match(content):
+        return ""
+    text = _INTERNAL_IMAGE_BLOCK_RE.sub("", content)
+    text = _INTERNAL_DOCUMENT_BLOCK_RE.sub("", text)
+    text = _RAG_CONTEXT_RE.sub("", text)
+    text = _REPLY_CONTEXT_RE.sub("", text)
+    text = _DOC_SENT_NOTE_RE.sub("", text)
+    text = _AGENT_IMPORTANT_SHORT_RE.sub("", text)
+    text = _IMAGE_MARKER_RE.sub("", text)
+    text = _DOCUMENT_MARKER_RE.sub("", text)
+    return text.strip()
 
 
 def extract_stored_image_paths(content: str) -> list[str]:
@@ -34,15 +95,6 @@ def extract_stored_image_paths(content: str) -> list[str]:
         seen.add(raw)
         paths.append(raw)
     return paths
-
-
-def display_user_message_content(content: str) -> str:
-    """User-visible text with internal vision context and markers removed."""
-    if not content:
-        return ""
-    text = _INTERNAL_IMAGE_BLOCK_RE.sub("", content)
-    text = _IMAGE_MARKER_RE.sub("", text)
-    return text.strip()
 
 
 def chat_image_basename(image_path: str) -> str:

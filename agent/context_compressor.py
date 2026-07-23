@@ -36,6 +36,41 @@ from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
 
+
+def _compute_compression_threshold_tokens(
+    context_length: int,
+    threshold_percent: float,
+) -> int:
+    """Derive the compression trigger from context size and configured ratio.
+
+    For windows larger than MINIMUM_CONTEXT_LENGTH, never compress below the
+    64K floor (prevents premature compaction on 128K+ models at 50%).
+
+    For windows at or below MINIMUM_CONTEXT_LENGTH (e.g. exactly 64K), use the
+    percentage only and cap below the full window so compression fires before
+    overflow instead of at 100% capacity.
+    """
+    percent_tokens = int(context_length * threshold_percent)
+    if context_length > MINIMUM_CONTEXT_LENGTH:
+        return max(percent_tokens, MINIMUM_CONTEXT_LENGTH)
+    safety_ceiling = max(1, int(context_length * 0.90))
+    return min(percent_tokens, safety_ceiling)
+
+
+def _compute_prune_threshold_tokens(
+    context_length: int,
+    prune_threshold_percent: float,
+) -> int:
+    """Derive proactive tool-result prune trigger; 0 disables pruning."""
+    if prune_threshold_percent <= 0:
+        return 0
+    percent_tokens = int(context_length * prune_threshold_percent)
+    if context_length > MINIMUM_CONTEXT_LENGTH:
+        return percent_tokens
+    safety_ceiling = max(1, int(context_length * 0.85))
+    return min(percent_tokens, safety_ceiling)
+
+
 SUMMARY_PREFIX = (
     "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted "
     "into the summary below. This is a handoff from a previous context "
@@ -317,9 +352,11 @@ class ContextCompressor(ContextEngine):
         self.provider = provider
         self.api_mode = api_mode
         self.context_length = context_length
-        self.threshold_tokens = max(
-            int(context_length * self.threshold_percent),
-            MINIMUM_CONTEXT_LENGTH,
+        self.threshold_tokens = _compute_compression_threshold_tokens(
+            context_length, self.threshold_percent,
+        )
+        self.prune_threshold_tokens = _compute_prune_threshold_tokens(
+            context_length, self.prune_threshold_percent,
         )
         # Recalculate token budgets for the new context length so the
         # compressor stays calibrated after a model switch (e.g. 200K → 32K).
@@ -343,6 +380,7 @@ class ContextCompressor(ContextEngine):
         config_context_length: int | None = None,
         provider: str = "",
         api_mode: str = "",
+        prune_threshold_percent: float = 0.0,
     ):
         self.model = model
         self.base_url = base_url
@@ -350,6 +388,7 @@ class ContextCompressor(ContextEngine):
         self.provider = provider
         self.api_mode = api_mode
         self.threshold_percent = threshold_percent
+        self.prune_threshold_percent = max(0.0, float(prune_threshold_percent))
         self.protect_first_n = protect_first_n
         self.protect_last_n = protect_last_n
         self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
@@ -360,13 +399,11 @@ class ContextCompressor(ContextEngine):
             config_context_length=config_context_length,
             provider=provider,
         )
-        # Floor: never compress below MINIMUM_CONTEXT_LENGTH tokens even if
-        # the percentage would suggest a lower value.  This prevents premature
-        # compression on large-context models at 50% while keeping the % sane
-        # for models right at the minimum.
-        self.threshold_tokens = max(
-            int(self.context_length * threshold_percent),
-            MINIMUM_CONTEXT_LENGTH,
+        self.threshold_tokens = _compute_compression_threshold_tokens(
+            self.context_length, threshold_percent,
+        )
+        self.prune_threshold_tokens = _compute_prune_threshold_tokens(
+            self.context_length, self.prune_threshold_percent,
         )
         self.compression_count = 0
 
@@ -428,6 +465,41 @@ class ContextCompressor(ContextEngine):
                 )
             return False
         return True
+
+    def should_prune(self, prompt_tokens: int = None) -> bool:
+        """Check if cheap tool-result pruning should run (no LLM summarization).
+
+        Only fires when ``prune_threshold_tokens`` is configured (> 0) and
+        usage is between the prune threshold and the full compression threshold.
+        """
+        if self.prune_threshold_tokens <= 0:
+            return False
+        tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
+        if tokens < self.prune_threshold_tokens:
+            return False
+        if tokens >= self.threshold_tokens:
+            return False
+        return True
+
+    def prune_tool_results(
+        self, messages: List[Dict[str, Any]],
+    ) -> tuple[List[Dict[str, Any]], int]:
+        """Prune old tool outputs using the same tail protection as compression."""
+        pruned_messages, pruned_count = self._prune_old_tool_results(
+            messages,
+            protect_tail_count=self.protect_last_n,
+            protect_tail_tokens=self.tail_token_budget,
+        )
+        if pruned_count and not self.quiet_mode:
+            logger.info(
+                "Proactive prune: trimmed %d old tool result(s) "
+                "(tokens ~%d, prune_threshold=%d, compress_threshold=%d)",
+                pruned_count,
+                self.last_prompt_tokens,
+                self.prune_threshold_tokens,
+                self.threshold_tokens,
+            )
+        return pruned_messages, pruned_count
 
     # ------------------------------------------------------------------
     # Tool output pruning (cheap pre-pass, no LLM call)

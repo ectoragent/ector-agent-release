@@ -40,7 +40,6 @@ import stat
 import sys
 import threading
 import time
-import uuid
 import webbrowser
 from collections.abc import Mapping
 from contextlib import contextmanager
@@ -347,24 +346,14 @@ def _read_store() -> Optional[Dict[str, Any]]:
 
 
 def _write_store(data: Dict[str, Any]) -> Path:
+    from utils import atomic_text_write
+
     path = _identity_file_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     data["version"] = IDENTITY_STORE_VERSION
     data["updated_at"] = datetime.now(timezone.utc).isoformat()
     payload = json.dumps(data, indent=2, sort_keys=True) + "\n"
-    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
-    try:
-        with tmp.open("w", encoding="utf-8") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, path)
-    finally:
-        with contextlib.suppress(OSError):
-            if tmp.exists():
-                tmp.unlink()
-    with contextlib.suppress(OSError):
-        path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    atomic_text_write(path, payload, file_mode=stat.S_IRUSR | stat.S_IWUSR)
     return path
 
 
@@ -2389,7 +2378,12 @@ def enforce_agent_runtime_access(*, interactive: Optional[bool] = None) -> None:
                 file=_sys.stderr,
             )
             return
-        print(f"Falha na autenticação: {exc}", file=_sys.stderr)
+        from utils import format_enospc_write_hint, is_enospc_error
+
+        if is_enospc_error(exc):
+            print(format_enospc_write_hint(_identity_file_path()), file=_sys.stderr)
+        else:
+            print(f"Falha na autenticação: {exc}", file=_sys.stderr)
         print("Execute: ector login", file=_sys.stderr)
         _sys.exit(2)
 

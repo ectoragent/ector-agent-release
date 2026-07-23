@@ -120,32 +120,20 @@ def _print_pool_status_plain(provider_filter: str = "") -> bool:
 
 def _print_pool_status_rich(console, provider_filter: str = "") -> bool:
     """Rich pool table. Returns True if any credentials were shown."""
-    from rich import box
-    from rich.table import Table
+    from ector_cli.list_format import LIST_PRIMARY, ListColumn, print_list_heading, print_list_section, print_list_empty
 
     snapshot = _gather_pool_snapshot(provider_filter)
     if not snapshot:
-        console.print()
-        console.print(f"[bold {_AUTH_ACCENT}]Pool de credenciais[/bold {_AUTH_ACCENT}]")
-        console.print("[dim]Nenhuma credencial no pool.[/dim]")
-        console.print("[dim]Adicione com[/dim] [bold]ector auth add <provedor>[/bold]")
+        print_list_empty(
+            console,
+            "Pool de credenciais",
+            "Nenhuma credencial no pool.",
+            hint="[dim]Adicione com[/] [bold]ector auth add <provedor>[/]",
+            primary=LIST_PRIMARY,
+        )
         return False
 
-    table = Table(
-        box=box.SIMPLE_HEAD,
-        show_header=True,
-        header_style="bold",
-        expand=True,
-        padding=(0, 1),
-    )
-    table.add_column("Provedor", no_wrap=True, style="bold", ratio=1, max_width=18)
-    table.add_column("#", justify="right", no_wrap=True, min_width=2)
-    table.add_column("Rótulo", overflow="fold", ratio=2)
-    table.add_column("Tipo", no_wrap=True, min_width=9)
-    table.add_column("Origem", overflow="fold", ratio=2)
-    table.add_column("Estado", overflow="fold", ratio=2, min_width=10)
-
-    total = sum(len(group["entries"]) for group in snapshot)
+    rows = []
     for group in snapshot:
         provider = group["provider"]
         first_in_group = True
@@ -157,22 +145,35 @@ def _print_pool_status_rich(console, provider_filter: str = "") -> bool:
                 state = f"[yellow]{row['status'].strip()}[/yellow]"
             else:
                 state = "[dim]ok[/dim]"
-            table.add_row(
-                provider if first_in_group else "",
-                str(row["index"]),
-                entry.label,
-                _auth_type_label(entry.auth_type),
-                row["source"],
-                state,
+            rows.append(
+                (
+                    provider if first_in_group else "",
+                    str(row["index"]),
+                    entry.label,
+                    _auth_type_label(entry.auth_type),
+                    row["source"],
+                    state,
+                )
             )
             first_in_group = False
 
-    console.print()
-    console.print(
-        f"[bold {_AUTH_ACCENT}]Pool de credenciais[/bold {_AUTH_ACCENT}] "
-        f"[dim]({total} no total)[/dim]"
+    total = sum(len(group["entries"]) for group in snapshot)
+    print_list_heading(console, "Pool de credenciais", subtitle=f"{total} no total", primary=LIST_PRIMARY)
+    print_list_section(
+        console,
+        title="Credenciais",
+        columns=(
+            ListColumn("Provedor", style=f"bold {LIST_PRIMARY}", min_width=14, ratio=1),
+            ListColumn("#", justify="right", no_wrap=True, width=3),
+            ListColumn("Rótulo", overflow="fold", ratio=2),
+            ListColumn("Tipo", no_wrap=True, min_width=9, ratio=1),
+            ListColumn("Origem", overflow="fold", ratio=2),
+            ListColumn("Estado", overflow="fold", min_width=10, ratio=1),
+        ),
+        rows=rows,
+        primary=LIST_PRIMARY,
+        show_count=False,
     )
-    console.print(table)
     return True
 
 

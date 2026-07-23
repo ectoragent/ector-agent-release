@@ -291,6 +291,45 @@ def setup_verbose_logging() -> None:
     logging.getLogger("rex-deploy").setLevel(logging.INFO)
 
 
+class _QuietConsoleFilter(logging.Filter):
+    """Drop sub-ERROR records from *logger_names* on non-file handlers only.
+
+    Raising a logger's own level (``logger.setLevel(ERROR)``) blocks
+    propagation to *every* handler, including the root's file handlers
+    (agent.log/errors.log) — silently breaking the "files still capture
+    everything" guarantee. This filter suppresses the same noise on the
+    console only, leaving file logging intact.
+    """
+
+    def __init__(self, logger_names: Sequence[str]) -> None:
+        super().__init__()
+        self._prefixes = tuple(logger_names)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        name = record.name
+        if name in self._prefixes or any(
+            name.startswith(prefix + ".") for prefix in self._prefixes
+        ):
+            return record.levelno >= logging.ERROR
+        return True
+
+
+def suppress_console_noise(logger_names: Sequence[str]) -> None:
+    """Quiet-mode console noise reduction that preserves file logging.
+
+    Adds a filter to every root handler that is *not* a rotating file
+    handler (i.e. the console), dropping sub-ERROR records from
+    *logger_names*. Idempotent — safe to call once per AIAgent instance.
+    """
+    root = logging.getLogger()
+    for handler in root.handlers:
+        if isinstance(handler, RotatingFileHandler):
+            continue
+        if any(isinstance(f, _QuietConsoleFilter) for f in handler.filters):
+            continue
+        handler.addFilter(_QuietConsoleFilter(logger_names))
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------

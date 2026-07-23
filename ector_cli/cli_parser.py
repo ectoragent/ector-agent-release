@@ -94,15 +94,9 @@ def build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
     Exemplos:
-    ector                        Chat interativo no terminal (usa o diretório atual)
-    ector chat                   Chat interativo no terminal (TUI Ink)
-    ector -z "Olá"               Pergunta única (one-shot; resposta no stdout)
-    ector chat -z "Olá"          Idem, via subcomando chat
-    ector chat -q "Olá"          Envia a mensagem no TUI (TTY); sem TTY → `ector -z`
-    ector localhost              Inicia o painel web local (usa `terminal.cwd` do config.yaml)
-    ector -c                     Retoma a sessão mais recente
-    ector -c "meu projeto"       Retoma uma sessão pelo nome (mais recente na linhagem)
-    ector --resume <session_id>  Retoma uma sessão específica pelo ID
+    ector                        Abre o painel web local (chat em /chat)
+    ector --up-online            Painel atrás de Nginx (VPS)
+    ector kill                   Encerra o painel em execução
     ector setup                  Executa o assistente de configuração
     ector logout                 Limpa a autenticação armazenada
     ector auth add <provedor>    Adiciona uma credencial ao pool
@@ -116,8 +110,6 @@ def build_parser():
     ector config                 Visualiza a configuração
     ector config edit            Edita a config no $EDITOR
     ector gateway                Executa o gateway de mensagens
-    ector -s ector-agent-dev,github-auth
-    ector -w                     Inicia em um worktree git isolado
     ector gateway install        Instala o serviço de segundo plano do gateway
     ector sessions list          Lista sessões passadas
     ector sessions browse        Seletor de sessão interativo
@@ -136,268 +128,104 @@ def build_parser():
     parser.add_argument(
         "--version", "-V", action="store_true", help="Mostra a versão e sai"
     )
+    parser.add_argument("--port", type=int, default=9000, help="Porta do painel (padrão 9000)")
     parser.add_argument(
-        "-z",
-        "--oneshot",
-        metavar="PROMPT",
-        default=None,
-        help=(
-            "Modo one-shot: envia um único prompt e imprime APENAS o texto da "
-            "resposta final no stdout. Durante a execução, stderr mostra uma "
-            "linha com spinner e o preview da ferramenta activa. Sem banner "
-            "ou session_id. Ferramentas, memória, regras e AGENTS.md no CWD "
-            "são carregados normalmente; aprovações são ignoradas "
-            "automaticamente. Destinado a scripts / pipes."
-        ),
-    )
-    # --model / --provider are accepted at the top level so they can pair
-    # with -z without needing the `chat` subcommand.  If neither -z nor a
-    # subcommand consumes them, they fall through harmlessly as None.
-    # Mirrors `ector chat --model ... --provider ...` semantics.
-    parser.add_argument(
-        "-m",
-        "--model",
-        default=None,
-        help=(
-            "Sobrescrita de modelo para esta invocação (ex: anthropic/claude-sonnet-4.6). "
-            "Aplica-se a -z/--oneshot e ao chat no terminal (``ector chat`` / flags que forçam chat). "
-            "Também configurável via variável de ambiente ECTOR_INFERENCE_MODEL."
-        ),
+        "--host",
+        default="127.0.0.1",
+        help="Host de bind (padrão 127.0.0.1; URL amigável: ector.localhost)",
     )
     parser.add_argument(
-        "--provider",
+        "--public-host",
+        dest="public_host",
         default=None,
-        help=(
-            "Sobrescrita de provedor para esta invocação (ex: openrouter, anthropic). "
-            "Aplica-se a -z/--oneshot e ao chat no terminal (``ector chat`` / flags que forçam chat). "
-            "Também configurável via variável de ambiente ECTOR_INFERENCE_PROVIDER."
-        ),
+        help="Host público para compor a URL impressa (ex: IP da VPS ou domínio). Também aceita ECTOR_DASHBOARD_PUBLIC_HOST.",
     )
     parser.add_argument(
-        "--resume",
-        "-r",
-        metavar="SESSÃO",
-        default=None,
-        help="Retoma uma sessão anterior por ID ou título",
-    )
-    parser.add_argument(
-        "--continue",
-        "-c",
-        dest="continue_last",
-        nargs="?",
-        const=True,
-        default=None,
-        metavar="NOME_DA_SESSÃO",
-        help="Retoma uma sessão pelo nome, ou a mais recente se nenhum nome for fornecido",
-    )
-    parser.add_argument(
-        "--worktree",
-        "-w",
+        "--no-auth",
         action="store_true",
-        default=False,
-        help="Executa em um worktree git isolado (para agentes paralelos)",
+        help="Desativa a exigência de token/cookie para o painel (NÃO recomendado)",
     )
     parser.add_argument(
-        "--accept-hooks",
+        "--foreground",
         action="store_true",
-        default=False,
-        help=(
-            "Aprova automaticamente quaisquer shell hooks não vistos declarados no config.yaml "
-            "sem um prompt TTY. Equivalente a ECTOR_ACCEPT_HOOKS=1 ou "
-            "hooks_auto_accept: true no config.yaml. Use em CI / execuções "
-            "headless que não podem solicitar confirmação."
-        ),
+        help="Mantém o painel no foreground (bloqueia o terminal)",
     )
     parser.add_argument(
-        "--skills",
-        "-s",
+        "--open-firewall",
+        action="store_true",
+        help="(Linux) Tenta liberar automaticamente a porta no firewall do SO (ufw/firewalld) via sudo -n",
+    )
+    parser.add_argument(
+        "--no-open",
+        action="store_true",
+        help="Não abre o navegador automaticamente",
+    )
+    parser.add_argument(
+        "--insecure",
+        action="store_true",
+        help="Permite binding para IPs além de localhost (PERIGOSO: expõe chaves API na rede)",
+    )
+    parser.add_argument(
+        "--up-online",
+        action="store_true",
+        help="Configura Nginx + TLS/BasicAuth e inicia o painel atrás do proxy (recomendado para VPS)",
+    )
+    parser.add_argument(
+        "--server-name",
+        default="_",
+        help="Server name do Nginx (domínio ou '_'). Para IP-only, deixe '_' (padrão).",
+    )
+    parser.add_argument(
+        "--listen-port",
+        type=int,
+        default=9000,
+        help="Porta pública do Nginx (padrão: 9000).",
+    )
+    parser.add_argument(
+        "--tls",
+        action="store_true",
+        help="Habilita TLS via Certbot (requer domínio real em --server-name e --email).",
+    )
+    parser.add_argument(
+        "--email",
+        default=None,
+        help="E-mail para Certbot (obrigatório quando usar --tls).",
+    )
+    parser.add_argument(
+        "--basic-auth",
+        action="store_true",
+        help="Habilita Basic Auth no Nginx (senha via prompt).",
+    )
+    parser.add_argument(
+        "--basic-user",
+        default="ector",
+        help="Usuário do Basic Auth (padrão: ector).",
+    )
+    parser.add_argument(
+        "--allow-ip",
         action="append",
-        default=None,
-        help="Pré-carrega uma ou mais skills para a sessão (repita a flag ou separe por vírgula)",
+        default=[],
+        help="IP/CIDR permitido (pode repetir).",
     )
     parser.add_argument(
-        "--yolo",
-        action="store_true",
-        default=False,
-        help="Ignora todos os prompts de aprovação de comandos perigosos (use por sua conta e risco)",
-    )
-    parser.add_argument(
-        "--pass-session-id",
-        action="store_true",
-        default=False,
-        help="Inclui o ID da sessão no prompt de sistema do agente",
-    )
-    parser.add_argument(
-        "--ignore-user-config",
-        action="store_true",
-        default=False,
-        help="Ignora ~/.ector/config.yaml e usa os padrões integrados (credenciais em .env ainda são carregadas)",
-    )
-    parser.add_argument(
-        "--ignore-rules",
-        action="store_true",
-        default=False,
-        help="Pula a auto-injeção de AGENTS.md, SOUL.md, .cursorrules, memória e skills pré-carregadas",
+        "--upstream-port",
+        type=int,
+        default=9000,
+        help="Porta local do painel atrás do Nginx (padrão: 9000).",
     )
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
 
-    # =========================================================================
-    # chat command
-    # =========================================================================
-    chat_parser = subparsers.add_parser(
-        "chat",
-        help="Chat interativo com o agente",
-        description="Inicia uma sessão de chat interativo com o Ector Agent",
+    kill_parser = subparsers.add_parser(
+        "kill",
+        help="Finaliza o painel web (PID file, processos Ector, ou porta --port)",
     )
-    chat_parser.add_argument(
-        "-z",
-        "--oneshot",
-        metavar="PROMPT",
-        default=None,
-        help=(
-            "Modo one-shot: um único prompt; resposta no stdout e spinner com "
-            "preview em stderr (sem banner ou resumo de sessão). "
-            "Equivalente a ``ector -z PROMPT``."
-        ),
-    )
-    chat_parser.add_argument(
-        "-q",
-        "--query",
-        help=(
-            "Envia um prompt ao abrir o TUI (TTY). Sem TTY redireciona para one-shot "
-            "(equivalente a ``-z``). Para scripts use ``ector -z``."
-        ),
-    )
-    chat_parser.add_argument(
-        "--image", help="Caminho opcional para imagem local para anexar a uma consulta única"
-    )
-    chat_parser.add_argument(
-        "-m", "--model", help="Modelo a usar (ex: anthropic/claude-sonnet-4)"
-    )
-    chat_parser.add_argument(
-        "-t", "--toolsets", help="Conjuntos de ferramentas separados por vírgula para ativar"
-    )
-    chat_parser.add_argument(
-        "-s",
-        "--skills",
-        action="append",
-        default=argparse.SUPPRESS,
-        help="Pré-carrega uma ou mais skills para a sessão (repita a flag ou separe por vírgula)",
-    )
-    chat_parser.add_argument(
-        "--provider",
-        choices=[
-            "auto",
-            "openrouter",
-            "ector",
-            "openai-codex",
-            "copilot-acp",
-            "copilot",
-            "anthropic",
-            "gemini",
-            "xai",
-            "ollama-cloud",
-            "huggingface",
-            "zai",
-            "kimi-coding",
-            "kimi-coding-cn",
-            "stepfun",
-            "minimax",
-            "minimax-cn",
-            "kilocode",
-            "xiaomi",
-            "arcee",
-            "nvidia",
-        ],
-        default=None,
-        help="Provedor de inferência (padrão: auto)",
-    )
-    chat_parser.add_argument(
-        "-v", "--verbose", action="store_true", help="Saída detalhada"
-    )
-    chat_parser.add_argument(
-        "-Q",
-        "--quiet",
-        action="store_true",
-        help="Modo silencioso para uso programático: suprime o banner, o spinner e as prévias de ferramentas. Apenas a resposta final e as informações da sessão são exibidas.",
-    )
-    chat_parser.add_argument(
-        "--resume",
-        "-r",
-        metavar="SESSION_ID",
-        default=argparse.SUPPRESS,
-        help="Retoma uma sessão anterior pelo ID (exibido ao sair)",
-    )
-    chat_parser.add_argument(
-        "--continue",
-        "-c",
-        dest="continue_last",
-        nargs="?",
-        const=True,
-        default=argparse.SUPPRESS,
-        metavar="NOME_DA_SESSÃO",
-        help="Retoma uma sessão pelo nome, ou a mais recente se nenhum nome for fornecido",
-    )
-    chat_parser.add_argument(
-        "--worktree",
-        "-w",
-        action="store_true",
-        default=argparse.SUPPRESS,
-        help="Executa em um worktree git isolado (para agentes paralelos no mesmo repositório)",
-    )
-    chat_parser.add_argument(
-        "--accept-hooks",
-        action="store_true",
-        default=argparse.SUPPRESS,
-        help=(
-            "Aprova automaticamente quaisquer shell hooks não vistos declarados no config.yaml "
-            "sem um prompt TTY (veja também a variável de ambiente ECTOR_ACCEPT_HOOKS e "
-            "hooks_auto_accept: no config.yaml)."
-        ),
-    )
-    chat_parser.add_argument(
-        "--checkpoints",
-        action="store_true",
-        default=False,
-        help="Ativa checkpoints do sistema de arquivos antes de operações destrutivas (use /rollback para restaurar)",
-    )
-    chat_parser.add_argument(
-        "--max-turns",
+    kill_parser.add_argument(
+        "--port",
         type=int,
-        default=None,
-        metavar="N",
-        help="Máximo de iterações de chamada de ferramentas por turno de conversa (padrão: 90, ou agent.max_turns no config)",
+        default=9000,
+        help="Porta do painel a procurar/encerrar (padrão 9000)",
     )
-    chat_parser.add_argument(
-        "--yolo",
-        action="store_true",
-        default=argparse.SUPPRESS,
-        help="Ignora todos os prompts de aprovação de comandos perigosos (use por sua conta e risco)",
-    )
-    chat_parser.add_argument(
-        "--pass-session-id",
-        action="store_true",
-        default=argparse.SUPPRESS,
-        help="Inclui o ID da sessão no prompt de sistema do agente",
-    )
-    chat_parser.add_argument(
-        "--ignore-user-config",
-        action="store_true",
-        default=argparse.SUPPRESS,
-        help="Ignora ~/.ector/config.yaml e usa os padrões integrados (credenciais em .env ainda são carregadas). Útil para execuções de CI isoladas, reprodução e integrações de terceiros.",
-    )
-    chat_parser.add_argument(
-        "--ignore-rules",
-        action="store_true",
-        default=argparse.SUPPRESS,
-        help="Pula a auto-injeção de AGENTS.md, SOUL.md, .cursorrules, memória e skills pré-carregadas. Combine com --ignore-user-config para uma execução totalmente isolada.",
-    )
-    chat_parser.add_argument(
-        "--source",
-        default=None,
-        help="Tag de origem da sessão para filtragem (padrão: cli). Use 'tool' para integrações de terceiros que não devem aparecer nas listas de sessões do usuário.",
-    )
-    chat_parser.set_defaults(func=_m.cmd_chat)
+    kill_parser.set_defaults(func=_m.cmd_dashboard)
 
     # =========================================================================
     # provider command
@@ -2028,6 +1856,16 @@ def build_parser():
                     return
             sessions_dir = get_ector_home() / "sessions"
             if db.delete_session(resolved_session_id, sessions_dir=sessions_dir):
+                try:
+                    from tools.process_registry import process_registry
+
+                    killed = process_registry.kill_all_for_session_key(
+                        resolved_session_id
+                    )
+                    if killed:
+                        print(f"  ✔ {killed} processo(s) em segundo plano encerrado(s).")
+                except Exception:
+                    pass
                 print(f"Sessão '{resolved_session_id}' excluída.")
             else:
                 print(f"Sessão '{args.session_id}' não encontrada.")
@@ -2077,18 +1915,12 @@ def build_parser():
                 print("Cancelado.")
                 return
 
-            # Launch ector --resume <id> by replacing the current process
+            # Abre o painel web na sessão escolhida
             print(f"Retomando sessão: {selected_id}")
-            ector_bin = shutil.which("ector")
-            if ector_bin:
-                os.execvp(ector_bin, ["ector", "--resume", selected_id])
-            else:
-                # Fallback: re-invoke via python -m
-                os.execvp(
-                    sys.executable,
-                    [sys.executable, "-m", "ector_cli.main", "--resume", selected_id],
-                )
-            return  # won't reach here after execvp
+            from ector_cli.main import launch_dashboard_with_resume
+
+            launch_dashboard_with_resume(selected_id)
+            return
 
         elif action == "stats":
             total = db.session_count()
@@ -2302,119 +2134,6 @@ def build_parser():
     )
 
     profile_parser.set_defaults(func=_m.cmd_profile)
-
-    # =========================================================================
-    # localhost command (web UI on loopback)
-    # =========================================================================
-    localhost_online_opts = argparse.ArgumentParser(add_help=False)
-    localhost_online_opts.add_argument(
-        "--server-name",
-        default="_",
-        help="Server name do Nginx (domínio ou '_'). Para IP-only, deixe '_' (padrão).",
-    )
-    localhost_online_opts.add_argument(
-        "--listen-port",
-        type=int,
-        default=9000,
-        help="Porta pública do Nginx (padrão: 9000).",
-    )
-    localhost_online_opts.add_argument(
-        "--tls",
-        action="store_true",
-        help="Habilita TLS via Certbot (requer domínio real em --server-name e --email).",
-    )
-    localhost_online_opts.add_argument(
-        "--email",
-        default=None,
-        help="E-mail para Certbot (obrigatório quando usar --tls).",
-    )
-    localhost_online_opts.add_argument(
-        "--basic-auth",
-        action="store_true",
-        help="Habilita Basic Auth no Nginx (senha via prompt).",
-    )
-    localhost_online_opts.add_argument(
-        "--basic-user",
-        default="ector",
-        help="Usuário do Basic Auth (padrão: ector).",
-    )
-    localhost_online_opts.add_argument(
-        "--allow-ip",
-        action="append",
-        default=[],
-        help="IP/CIDR permitido (pode repetir).",
-    )
-    localhost_online_opts.add_argument(
-        "--upstream-port",
-        type=int,
-        default=9000,
-        help="Porta local do painel atrás do Nginx (padrão: 9000).",
-    )
-
-    localhost_parser = subparsers.add_parser(
-        "localhost",
-        parents=[localhost_online_opts],
-        help="Inicia o painel web local do Ector",
-        description="Inicia o painel web do Ector Agent para gerenciar configurações, chaves API e sessões",
-    )
-    localhost_parser.add_argument("--port", type=int, default=9000, help="Porta (padrão 9000)")
-    localhost_parser.add_argument("--host", default="127.0.0.1", help="Host de bind (padrão 127.0.0.1; URL amigável: ector.localhost)")
-    localhost_parser.add_argument(
-        "--public-host",
-        dest="public_host",
-        default=None,
-        help="Host público para compor a URL impressa (ex: IP da VPS ou domínio). Também aceita ECTOR_DASHBOARD_PUBLIC_HOST.",
-    )
-    localhost_parser.add_argument(
-        "--no-auth",
-        action="store_true",
-        help="Desativa a exigência de token/cookie para o painel (NÃO recomendado)",
-    )
-    localhost_parser.add_argument(
-        "--foreground",
-        action="store_true",
-        help="Mantém o painel no foreground (bloqueia o terminal) — modo antigo",
-    )
-    localhost_parser.add_argument(
-        "--open-firewall",
-        action="store_true",
-        help="(Linux) Tenta liberar automaticamente a porta no firewall do SO (ufw/firewalld) via sudo -n",
-    )
-    localhost_parser.add_argument("--no-open", action="store_true", help="Não abre o navegador automaticamente")
-    localhost_parser.add_argument(
-        "--insecure",
-        action="store_true",
-        help="Permite binding para IPs além de localhost (PERIGOSO: expõe chaves API na rede)",
-    )
-    localhost_parser.add_argument(
-        "--up-online",
-        action="store_true",
-        help="Configura Nginx + TLS/BasicAuth e inicia o painel atrás do proxy (recomendado para VPS)",
-    )
-
-    localhost_sub = localhost_parser.add_subparsers(dest="localhost_action")
-    localhost_sub.required = False
-
-    localhost_kill = localhost_sub.add_parser(
-        "kill",
-        help="Finaliza o painel (PID file, processos Ector, ou porta --port)",
-    )
-    localhost_kill.add_argument(
-        "--port",
-        type=int,
-        default=9000,
-        help="Porta do painel a procurar/encerrar (padrão 9000)",
-    )
-    localhost_kill.set_defaults(func=_m.cmd_localhost)
-
-    localhost_nginx = localhost_sub.add_parser(
-        "nginx-setup",
-        parents=[localhost_online_opts],
-        help="(legado) Igual a `ector localhost --up-online`",
-    )
-    localhost_nginx.set_defaults(func=_m.cmd_localhost, up_online=True)
-
-    localhost_parser.set_defaults(func=_m.cmd_localhost)
 
     # =========================================================================
     # logs command

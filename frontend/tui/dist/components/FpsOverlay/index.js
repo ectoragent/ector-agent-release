@@ -1,1 +1,0 @@
-export { FpsOverlay } from './FpsOverlay.js';

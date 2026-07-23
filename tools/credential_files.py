@@ -201,7 +201,7 @@ def get_credential_file_mounts() -> List[Dict[str, str]]:
 def get_skills_directory_mount(
     container_base: str = "/root/.ector",
 ) -> list[Dict[str, str]]:
-    """Return mount info for all skill directories (local + external).
+    """Return mount info for all skill directories (local + external + builtin).
 
     Skills may include ``scripts/``, ``templates/``, and ``references/``
     subdirectories that the agent needs to execute inside remote sandboxes.
@@ -214,8 +214,9 @@ def get_skills_directory_mount(
     directly with zero overhead.
 
     Returns a list of dicts with ``host_path`` and ``container_path`` keys.
-    The local skills dir mounts at ``<container_base>/skills``, external dirs
-    at ``<container_base>/external_skills/<index>``.
+    The local skills dir mounts at ``<container_base>/skills``, other dirs
+    (config ``external_dirs`` + ``builtin-skills``) at
+    ``<container_base>/external_skills/<index>``.
     """
     mounts = []
     ector_home = _resolve_ector_home()
@@ -227,10 +228,10 @@ def get_skills_directory_mount(
             "container_path": f"{container_base.rstrip('/')}/skills",
         })
 
-    # Mount external skill dirs
+    # Mount external + builtin skill dirs (everything after local)
     try:
-        from agent.skill_utils import get_external_skills_dirs
-        for idx, ext_dir in enumerate(get_external_skills_dirs()):
+        from agent.skill_utils import get_all_skills_dirs
+        for idx, ext_dir in enumerate(get_all_skills_dirs()[1:]):
             if ext_dir.is_dir():
                 host_path = _safe_skills_path(ext_dir)
                 mounts.append({
@@ -314,10 +315,10 @@ def iter_skills_files(
                 "container_path": f"{container_root}/{rel}",
             })
 
-    # Include external skill dirs
+    # Include external + builtin skill dirs (everything after local)
     try:
-        from agent.skill_utils import get_external_skills_dirs
-        for idx, ext_dir in enumerate(get_external_skills_dirs()):
+        from agent.skill_utils import get_all_skills_dirs
+        for idx, ext_dir in enumerate(get_all_skills_dirs()[1:]):
             if not ext_dir.is_dir():
                 continue
             container_root = f"{container_base.rstrip('/')}/external_skills/{idx}"

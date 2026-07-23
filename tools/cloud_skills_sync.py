@@ -407,6 +407,14 @@ def uninstall_cloud_managed_skill(slug: str) -> bool:
 
     if removed_any:
         _invalidate_skills_prompt_cache()
+        try:
+            from tools.memory_tool import scrub_skill_name_from_memory
+
+            scrub_skill_name_from_memory(slug)
+        except Exception:
+            logger.debug(
+                "cloud_skills_sync: memory scrub failed for %s", slug, exc_info=True
+            )
     return removed_any
 
 
@@ -465,6 +473,52 @@ def remove_skill_from_cloud_library(slug: str, *, quiet: bool = True) -> Dict[st
     return summary
 
 
+def purge_hub_and_cloud_installed_skills(*, quiet: bool = True) -> Dict[str, Any]:
+    """Remove all Hub/cloud-tracked skills from disk (and cloud library when logged in).
+
+    Preserves agent-created / manual local skills that have no hub lock and no
+    ``cloud_skills.json`` entry.
+    """
+    from tools.skills_hub import HubLockFile
+
+    slugs: set[str] = set()
+    previous = _read_json(CLOUD_STATE_FILE)
+    prev_skills = previous.get("skills") if isinstance(previous.get("skills"), dict) else {}
+    for slug in prev_skills.keys():
+        s = str(slug).strip()
+        if s:
+            slugs.add(s)
+
+    try:
+        for entry in HubLockFile().list_installed():
+            name = str(entry.get("name") or "").strip()
+            if name:
+                slugs.add(name)
+    except Exception:
+        logger.debug("purge: hub lock list failed", exc_info=True)
+
+    results: list[Dict[str, Any]] = []
+    for slug in sorted(slugs):
+        results.append(remove_skill_from_cloud_library(slug, quiet=quiet))
+
+    remaining = _read_json(CLOUD_STATE_FILE)
+    rem_skills = remaining.get("skills") if isinstance(remaining.get("skills"), dict) else {}
+    if not rem_skills:
+        with contextlib.suppress(OSError):
+            CLOUD_STATE_FILE.unlink()
+        with contextlib.suppress(OSError):
+            CLOUD_ETAG_FILE.unlink()
+
+    _invalidate_skills_prompt_cache()
+    removed = sum(1 for r in results if r.get("local_removed") or r.get("api_removed"))
+    return {
+        "ok": True,
+        "slugs": sorted(slugs),
+        "removed_count": removed,
+        "results": results,
+    }
+
+
 def _local_checksum_for_dir(install_dir: Path) -> Optional[str]:
     skill_md = install_dir / "SKILL.md"
     if not skill_md.is_file():
@@ -477,11 +531,211 @@ def _local_checksum_for_dir(install_dir: Path) -> Optional[str]:
         return None
 
 
+def _iso_timestamp_ms(value: Any) -> Optional[int]:
+    from datetime import datetime, timezone
+
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        if text.endswith("Z"):
+            text = f"{text[:-1]}+00:00"
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return int(parsed.timestamp() * 1000)
+    except ValueError:
+        return None
+
+
+def _hub_install_dir(entry: Dict[str, Any]) -> Optional[Path]:
+    rel = str(entry.get("install_path") or "").strip()
+    if not rel:
+        return None
+    install_dir = SKILLS_DIR / rel
+    return install_dir if install_dir.is_dir() else None
+
+
+def _cloud_skill_needs_local_sync(slug: str, remote_checksum: str, hub_entry: Dict[str, Any]) -> bool:
+    if not remote_checksum:
+        return False
+    install_dir = _hub_install_dir(hub_entry)
+    if install_dir is None:
+        return True
+    local_checksum = _local_checksum_for_dir(install_dir)
+    if not local_checksum:
+        return True
+    return local_checksum != remote_checksum
+
+
+def _iter_stale_cloud_library_slugs(
+    client: httpx.Client,
+    base: str,
+    headers: Dict[str, str],
+) -> list[str]:
+    """Slugs em que o catálogo foi atualizado após o vínculo na biblioteca do utilizador."""
+    try:
+        library_resp = client.get(f"{base}/agent/me/skills", headers=headers)
+    except httpx.HTTPError:
+        return []
+    if library_resp.status_code != 200:
+        return []
+
+    rows = library_resp.json()
+    if not isinstance(rows, list):
+        return []
+
+    stale: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        slug = str(row.get("slug") or "").strip()
+        if not slug:
+            continue
+        skill_ms = _iso_timestamp_ms(row.get("skillUpdatedAt"))
+        library_ms = _iso_timestamp_ms(row.get("libraryUpdatedAt"))
+        if skill_ms is not None and library_ms is not None and skill_ms > library_ms:
+            stale.append(slug)
+    return stale
+
+
+def _refresh_stale_cloud_library_links(
+    client: httpx.Client,
+    base: str,
+    headers: Dict[str, str],
+    *,
+    slugs: Optional[list[str]] = None,
+) -> int:
+    """Renova vínculos na API (equivalente a «Atualizar» no dashboard)."""
+    targets = slugs if slugs is not None else _iter_stale_cloud_library_slugs(client, base, headers)
+    refreshed = 0
+    for slug in targets:
+        try:
+            resp = client.post(
+                f"{base}/agent/me/skills/{slug}",
+                headers=headers,
+            )
+        except httpx.HTTPError:
+            logger.debug("refresh cloud library link failed for %s", slug, exc_info=True)
+            continue
+        if resp.status_code in (200, 201):
+            refreshed += 1
+    return refreshed
+
+
+def collect_cloud_skill_update_names(
+    hub_installed: Dict[str, Dict[str, Any]],
+) -> set[str]:
+    """Skills da biblioteca na nuvem com atualização no servidor ou no disco local."""
+    from tools.skills_hub import is_cloud_managed_hub_entry
+
+    cloud_entries = {
+        name: entry
+        for name, entry in hub_installed.items()
+        if is_cloud_managed_hub_entry(entry)
+    }
+    if not cloud_entries:
+        return set()
+
+    bearer = _authorization_header()
+    if bearer is None:
+        return set()
+
+    pending: set[str] = set()
+    base = _auth_base_url()
+    headers = {"Authorization": bearer}
+
+    try:
+        with httpx.Client(timeout=20.0, follow_redirects=True) as client:
+            stale_slugs = _iter_stale_cloud_library_slugs(client, base, headers)
+            pending.update(slug for slug in stale_slugs if slug in cloud_entries)
+
+            manifest_headers = dict(headers)
+            stored_etag = ""
+            if CLOUD_ETAG_FILE.exists():
+                stored_etag = CLOUD_ETAG_FILE.read_text(encoding="utf-8").strip()
+            if stored_etag:
+                manifest_headers["If-None-Match"] = stored_etag
+
+            manifest_resp = client.get(
+                f"{base}/agent/me/skills/manifest",
+                headers=manifest_headers,
+            )
+            if manifest_resp.status_code == 200:
+                manifest = manifest_resp.json()
+                entries = manifest.get("skills") if isinstance(manifest, dict) else None
+                if isinstance(entries, list):
+                    for entry in entries:
+                        if not isinstance(entry, dict):
+                            continue
+                        slug = str(entry.get("slug") or "").strip()
+                        if slug not in cloud_entries:
+                            continue
+                        remote_checksum = str(entry.get("checksumSha256") or "")
+                        if _cloud_skill_needs_local_sync(slug, remote_checksum, cloud_entries[slug]):
+                            pending.add(slug)
+            elif manifest_resp.status_code == 304:
+                state = _read_json(CLOUD_STATE_FILE)
+                skills_state = state.get("skills") if isinstance(state.get("skills"), dict) else {}
+                for slug, hub_entry in cloud_entries.items():
+                    if slug in pending:
+                        continue
+                    meta = skills_state.get(slug) if isinstance(skills_state.get(slug), dict) else {}
+                    remote_checksum = str(meta.get("checksumSha256") or "")
+                    if _cloud_skill_needs_local_sync(slug, remote_checksum, hub_entry):
+                        pending.add(slug)
+    except httpx.HTTPError as exc:
+        logger.debug("collect_cloud_skill_update_names failed: %s", exc)
+
+    return pending
+
+
+def _print_cloud_sync_summary(summary: Dict[str, Any], *, quiet: bool) -> None:
+    if quiet:
+        return
+    from rich.console import Console
+
+    c = Console()
+    skipped = summary.get("skipped")
+    if skipped == "not_logged_in":
+        c.print(
+            "[yellow]Sessão não encontrada.[/] "
+            "Execute [bold]ector login[/] e depois [bold]ector skills sync[/]."
+        )
+        return
+    if skipped in ("sync_in_progress", "rate_limited", "unauthorized"):
+        return
+    if summary.get("not_modified"):
+        refreshed = int(summary.get("library_refreshed") or 0)
+        if refreshed:
+            c.print(
+                f"[green]Biblioteca atualizada:[/] {refreshed} vínculo(s) renovado(s). "
+                "[dim]Manifest sem alteração de conteúdo.[/]"
+            )
+        else:
+            c.print("[dim]Biblioteca de skills na nuvem já está atualizada.[/]")
+        return
+    if not summary.get("ok", True):
+        return
+    parts: list[str] = []
+    refreshed = int(summary.get("library_refreshed") or 0)
+    if refreshed:
+        parts.append(f"{refreshed} vínculo(s) renovado(s)")
+    parts.append(
+        f"{summary.get('downloaded', 0)} baixada(s), "
+        f"{summary.get('unchanged', 0)} sem alteração, "
+        f"{summary.get('removed', 0)} removida(s)"
+    )
+    msg = f"[green]Sync concluído:[/] {', '.join(parts)}."
+    c.print(msg)
+
+
 def sync_cloud_skills_library(
     *,
     quiet: bool = True,
     prune_legacy: bool = True,
     respect_rate_limit: bool = True,
+    refresh_stale_links: bool = True,
 ) -> Dict[str, Any]:
     """Pull user library from API and update local skill folders."""
     bearer = _authorization_header()
@@ -490,6 +744,7 @@ def sync_cloud_skills_library(
         if prune_legacy:
             legacy = cleanup_legacy_local_skills(quiet=quiet)
             summary["legacy_cleaned"] = legacy.get("removed", 0)
+        _print_cloud_sync_summary(summary, quiet=quiet)
         return summary
 
     settings = _cloud_sync_settings()
@@ -509,6 +764,7 @@ def sync_cloud_skills_library(
         "unchanged": 0,
         "not_modified": False,
         "deferred_bundles": 0,
+        "library_refreshed": 0,
     }
 
     with _cross_process_sync_lock() as lock_acquired:
@@ -524,6 +780,18 @@ def sync_cloud_skills_library(
 
         try:
             with httpx.Client(timeout=60.0, follow_redirects=True) as client:
+                if refresh_stale_links:
+                    summary["library_refreshed"] = _refresh_stale_cloud_library_links(
+                        client,
+                        base,
+                        headers,
+                    )
+                    if int(summary["library_refreshed"]) > 0:
+                        with contextlib.suppress(OSError):
+                            CLOUD_ETAG_FILE.unlink()
+                        stored_etag = ""
+                        headers.pop("If-None-Match", None)
+
                 manifest_resp = client.get(f"{base}/agent/me/skills/manifest", headers=headers)
                 if manifest_resp.status_code in _RATE_LIMIT_HTTP_CODES:
                     _record_rate_limit(manifest_resp)
@@ -537,6 +805,7 @@ def sync_cloud_skills_library(
                             quiet=quiet,
                         )
                         summary["legacy_cleaned"] = legacy.get("removed", 0)
+                    _print_cloud_sync_summary(summary, quiet=quiet)
                     return summary
                 if manifest_resp.status_code == 401:
                     if not quiet:
@@ -705,22 +974,7 @@ def sync_cloud_skills_library(
             logger.debug("cloud_skills_sync failed: %s", exc, exc_info=True)
             return {"ok": False, "error": str(exc)}
 
-    if not quiet:
-        from rich.console import Console
-
-        c = Console()
-        if summary.get("not_modified"):
-            c.print("[dim]Biblioteca de skills na nuvem já está atualizada.[/]")
-        else:
-            msg = (
-                f"[green]Sync concluído:[/] {summary['downloaded']} baixada(s), "
-                f"{summary['unchanged']} sem alteração, {summary['removed']} removida(s)."
-            )
-            legacy_n = int(summary.get("legacy_cleaned") or 0)
-            if legacy_n:
-                msg += f" {legacy_n} skill(s) legada(s) removida(s) do disco."
-            c.print(msg)
-
+    _print_cloud_sync_summary(summary, quiet=quiet)
     return summary
 
 
@@ -850,11 +1104,9 @@ def _hub_lock_entry_for_skill(name: str) -> Optional[Dict[str, Any]]:
 
 
 def _is_cloud_managed_hub_entry(entry: Dict[str, Any]) -> bool:
-    source = str(entry.get("source") or "").strip().lower()
-    if source == "ector-cloud":
-        return True
-    meta = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
-    return bool(meta.get("cloud_managed"))
+    from tools.skills_hub import is_cloud_managed_hub_entry
+
+    return is_cloud_managed_hub_entry(entry)
 
 
 def _should_remove_legacy_skill(
@@ -945,6 +1197,16 @@ def cleanup_legacy_local_skills(
 
     if removed_names:
         _invalidate_skills_prompt_cache()
+        try:
+            from tools.memory_tool import scrub_skill_name_from_memory
+
+            for name in removed_names:
+                scrub_skill_name_from_memory(name)
+        except Exception:
+            logger.debug(
+                "cloud_skills_sync: memory scrub failed after legacy cleanup",
+                exc_info=True,
+            )
 
     summary = {
         "ok": True,
@@ -952,17 +1214,6 @@ def cleanup_legacy_local_skills(
         "removed_names": removed_names,
         "library_slugs": sorted(library),
     }
-    if not quiet:
-        from rich.console import Console
-
-        c = Console()
-        if removed_names:
-            c.print(
-                f"[green]Limpeza de skills legadas:[/] {len(removed_names)} removida(s) "
-                f"(biblioteca na nuvem: {len(library)} skill(s))."
-            )
-        else:
-            c.print("[dim]Nenhuma skill legada para remover.[/]")
     return summary
 
 

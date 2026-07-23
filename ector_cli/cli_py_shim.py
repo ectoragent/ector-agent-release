@@ -18,6 +18,50 @@ _LEGACY_LIST_ONLY = frozenset(
     }
 )
 
+_LEGACY_CHAT_FLAGS = frozenset(
+    {
+        "-q",
+        "--query",
+        "-query",
+        "--quiet",
+        "-quiet",
+        "-Q",
+        "--image",
+        "-image",
+        "--resume",
+        "-resume",
+        "-r",
+        "-w",
+        "--worktree",
+        "-worktree",
+        "-m",
+        "--model",
+        "-model",
+        "--provider",
+        "-provider",
+        "--toolsets",
+        "-toolsets",
+        "-t",
+        "--skills",
+        "-skills",
+        "-s",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--yolo",
+        "--pass-session-id",
+    }
+)
+
+
+def _warn_legacy_chat_flag(flag: str, detail: str = "") -> None:
+    msg = (
+        f"Aviso: `{flag}` via `python cli.py` não é mais suportado; "
+        "use o painel web (`ector`)."
+    )
+    if detail:
+        msg = f"{msg} {detail}"
+    print(msg, file=sys.stderr)
+
 
 def _translate_cli_py_argv(argv: list[str]) -> list[str] | None:
     """Return new argv for ``ector``, or None to use legacy list-only handlers."""
@@ -30,7 +74,6 @@ def _translate_cli_py_argv(argv: list[str]) -> list[str] | None:
     out: list[str] = ["ector"]
     i = 0
     n = len(argv)
-    chat_mode = False
 
     while i < n:
         arg = argv[i]
@@ -41,82 +84,20 @@ def _translate_cli_py_argv(argv: list[str]) -> list[str] | None:
             out.extend(["gateway", "run"])
             i += 1
             continue
-        if arg in ("-q", "--query", "-query"):
-            if not chat_mode:
-                out.append("chat")
-                chat_mode = True
-            out.extend(["-q", argv[i + 1]] if i + 1 < n else ["-q"])
-            i += 2 if i + 1 < n else 1
-            continue
-        if arg in ("--image", "-image"):
-            if not chat_mode:
-                out.append("chat")
-                chat_mode = True
-            out.extend(["--image", argv[i + 1]] if i + 1 < n else ["--image"])
-            i += 2 if i + 1 < n else 1
-            continue
-        if arg in ("--quiet", "-quiet", "-Q"):
-            if not chat_mode:
-                out.append("chat")
-                chat_mode = True
-            out.append("-Q")
-            i += 1
-            continue
-        if arg in ("--resume", "-resume", "-r"):
-            out.extend(["--resume", argv[i + 1]] if i + 1 < n else ["--resume"])
-            i += 2 if i + 1 < n else 1
-            continue
-        if arg in ("-w", "--worktree", "-worktree"):
-            if not chat_mode:
-                out.append("chat")
-                chat_mode = True
-            out.append("-w")
-            if i + 1 < n and not argv[i + 1].startswith("-"):
-                print(
-                    "Aviso: worktree via `python cli.py -w` ainda não é suportado no TUI; "
-                    "o isolamento git pode não aplicar-se.",
-                    file=sys.stderr,
-                )
-            i += 1
-            continue
-        if arg in ("-m", "--model", "-model"):
-            out.extend(["-m", argv[i + 1]] if i + 1 < n else ["-m"])
-            i += 2 if i + 1 < n else 1
-            continue
-        if arg in ("--provider", "-provider"):
-            out.extend(["--provider", argv[i + 1]] if i + 1 < n else ["--provider"])
-            i += 2 if i + 1 < n else 1
-            continue
-        if arg in ("--toolsets", "-toolsets", "-t"):
-            if not chat_mode:
-                out.append("chat")
-                chat_mode = True
-            out.extend(["-t", argv[i + 1]] if i + 1 < n else ["-t"])
-            i += 2 if i + 1 < n else 1
-            continue
-        if arg in ("--skills", "-skills", "-s"):
-            if not chat_mode:
-                out.append("chat")
-                chat_mode = True
-            out.extend(["-s", argv[i + 1]] if i + 1 < n else ["-s"])
-            i += 2 if i + 1 < n else 1
-            continue
-        if arg in ("--ignore-user-config", "--ignore-rules", "--yolo", "--pass-session-id"):
-            out.append(arg)
-            i += 1
+        if arg in _LEGACY_CHAT_FLAGS:
+            _warn_legacy_chat_flag(arg)
+            if arg in ("-q", "--query", "-query", "--image", "-image", "-m", "--model", "-model",
+                       "--provider", "-provider", "--toolsets", "-toolsets", "-t",
+                       "--skills", "-skills", "-s", "--resume", "-resume", "-r"):
+                i += 2 if i + 1 < n else 1
+            else:
+                i += 1
             continue
         if arg.startswith("-"):
-            if not chat_mode:
-                out.append("chat")
-                chat_mode = True
             out.append(arg)
             i += 1
             continue
-        # Positional: treat as one-shot prompt
-        if not chat_mode:
-            out.append("chat")
-            chat_mode = True
-        out.extend(["-q", arg])
+        _warn_legacy_chat_flag("prompt posicional")
         i += 1
 
     return out
@@ -159,7 +140,7 @@ def run_cli_py_entry(argv: list[str] | None = None) -> None:
 
     print(
         "Aviso: `python cli.py` está obsoleto. Use o comando `ector` "
-        "(ex.: `ector`, `ector chat`, `ector -z \"pergunta\"`).",
+        "(abre o painel web).",
         file=sys.stderr,
     )
 

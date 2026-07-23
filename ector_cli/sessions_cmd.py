@@ -108,9 +108,7 @@ def print_sessions_list(
     db_path: Optional[Path] = None,
 ) -> None:
     """Render ``ector sessions list`` with a Rich table."""
-    from rich import box
     from rich.console import Console
-    from rich.table import Table
 
     console = Console()
     dhh = display_ector_home()
@@ -119,72 +117,76 @@ def print_sessions_list(
         store_hint = str(db_path).replace(str(Path.home()), "~", 1)
 
     if not sessions:
-        console.print()
-        console.print(f"[bold {_ECTOR_ACCENT}]Histórico de sessões[/bold {_ECTOR_ACCENT}]")
+        from ector_cli.list_format import LIST_PRIMARY, render_list_page
+
+        empty_hint = (
+            f"[dim]{store_hint}[/]\n"
+            "[dim]Inicie com [bold]ector[/bold].[/]\n"
+            "[dim]Retomar:[/] [bold]ector sessions browse[/bold][/dim]"
+        )
         if source:
-            console.print(f"[dim]Nenhuma sessão com origem[/dim] [bold]{source}[/bold][dim].[/dim]")
+            msg = f"Nenhuma sessão com origem [bold]{source}[/bold]."
         else:
-            console.print("[dim]Nenhuma sessão encontrada.[/dim]")
-        console.print(f"[dim]{store_hint}[/dim]")
-        console.print()
-        console.print(
-            "[dim]Inicie uma conversa com [bold]ector chat[/bold] ou "
-            "[bold]ector localhost[/bold] para criar a primeira sessão.[/dim]"
+            msg = "Nenhuma sessão encontrada."
+        render_list_page(
+            console,
+            title="Histórico de sessões",
+            sections=[],
+            empty_message=msg,
+            empty_hint=empty_hint,
+            primary=LIST_PRIMARY,
         )
-        console.print(
-            "[dim]Retomar: [bold]ector --resume <id>[/bold]  ·  "
-            "Explorar: [bold]ector sessions browse[/bold][/dim]"
-        )
-        console.print()
         return
 
     ordered = _sort_sessions(sessions)
     pinned_count = sum(1 for s in ordered if _is_pinned(s))
     at_limit = bool(limit and len(ordered) >= limit)
 
-    table = Table(
-        title=_format_title(
-            len(ordered),
-            pinned_count=pinned_count,
-            source=source,
-            limit=limit,
-            at_limit=at_limit,
-        ),
-        caption=f"[dim]{store_hint}[/dim]",
-        box=box.HORIZONTALS,
-        show_header=True,
-        show_lines=True,
-        header_style="bold",
-        border_style="dim",
-        expand=True,
-        padding=(0, 1),
-        title_justify="left",
-        caption_justify="left",
-    )
-    table.add_column("Sessão", no_wrap=True, overflow="ellipsis", ratio=4)
-    table.add_column("Origem", no_wrap=True, min_width=9, style="dim")
-    table.add_column("Atividade", no_wrap=True, min_width=11)
-    table.add_column("Msgs", justify="right", no_wrap=True, width=5, style="dim")
-    table.add_column("ID", style="dim cyan", no_wrap=True, ratio=2)
+    from ector_cli.list_format import LIST_PRIMARY, ListColumn, render_list_page
 
+    rows = []
     for session in ordered:
         label = _session_summary(session)
         if _is_pinned(session):
-            label = f"[{_ECTOR_ACCENT}]◆[/] {label}"
-        table.add_row(
-            label,
-            _source_label(session.get("source", "")),
-            relative_time(session.get("last_active")),
-            str(session.get("message_count") or "—"),
-            session.get("id", ""),
+            label = f"[{LIST_PRIMARY}]◆[/] {label}"
+        rows.append(
+            (
+                label,
+                _source_label(session.get("source", "")),
+                relative_time(session.get("last_active")),
+                str(session.get("message_count") or "—"),
+                session.get("id", ""),
+            )
         )
 
-    console.print()
-    console.print(table)
-    console.print(
-        "[dim]Retomar: [bold]ector --resume <id>[/bold]  ·  "
-        "[bold]ector sessions browse[/bold]  ·  "
-        "[bold]ector sessions rename <id> <título>[/bold]  ·  "
-        "[bold]ector sessions export -[/bold][/dim]"
+    subtitle = _format_title(
+        len(ordered),
+        pinned_count=pinned_count,
+        source=source,
+        limit=limit,
+        at_limit=at_limit,
     )
-    console.print()
+    render_list_page(
+        console,
+        title="Histórico de sessões",
+        subtitle=subtitle.replace("[bold]", "").replace("[/bold]", ""),
+        sections=[
+            (
+                "Sessões",
+                (
+                    ListColumn("Sessão", style=f"bold {LIST_PRIMARY}", overflow="ellipsis", ratio=4),
+                    ListColumn("Origem", style="dim", no_wrap=True, min_width=9, ratio=1),
+                    ListColumn("Atividade", no_wrap=True, min_width=11, ratio=1),
+                    ListColumn("Msgs", justify="right", width=5, style="dim"),
+                    ListColumn("ID", style="dim cyan", no_wrap=True, ratio=2),
+                ),
+                rows,
+            )
+        ],
+        summary=f"[dim]{store_hint}[/]",
+        footer=(
+            "[dim]Retomar:[/] [bold]ector sessions browse[/] · "
+            "[bold]ector sessions rename <id> <título>[/][/dim]"
+        ),
+        primary=LIST_PRIMARY,
+    )

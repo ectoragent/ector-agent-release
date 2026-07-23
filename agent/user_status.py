@@ -4,8 +4,8 @@
 def reasoning_status(elapsed_seconds: int | None = None) -> str:
     """While waiting for the model to respond."""
     if not elapsed_seconds or elapsed_seconds <= 0:
-        return "Raciocinando…"
-    return f"Raciocinando… ({int(elapsed_seconds)}s)"
+        return "Trabalhando…"
+    return f"Trabalhando… ({int(elapsed_seconds)}s)"
 
 
 def stale_response_status(seconds: int, *, streaming: bool) -> str:
@@ -13,6 +13,26 @@ def stale_response_status(seconds: int, *, streaming: bool) -> str:
     if streaming:
         return f"▲ Demorou mais que o esperado ({int(seconds)}s)… reconectando"
     return f"▲ Demorou mais que o esperado ({int(seconds)}s)… tentando de novo"
+
+
+def internet_unavailable_status() -> str:
+    return "▲ Sem conexão com a internet — verifique a rede e tente de novo."
+
+
+def web_request_timeout_status(seconds: int, *, crawl: bool = False) -> str:
+    """Web tool HTTP/SDK call exceeded the configured timeout."""
+    op = "rastreio do site" if crawl else "consulta na web"
+    return (
+        f"▲ A {op} excedeu o tempo limite ({int(seconds)}s) — "
+        "verifique sua conexão e as chaves da API, ou tente de novo."
+    )
+
+
+def provider_unreachable_status() -> str:
+    return (
+        "▲ Não foi possível alcançar o provedor do modelo — "
+        "verifique sua conexão."
+    )
 
 
 def unstable_connection_status(attempt: int, max_attempts: int) -> str:
@@ -34,11 +54,11 @@ def tool_stream_reconnect_status(attempt: int, max_attempts: int) -> str:
 
 
 def reconnected_resuming_status() -> str:
-    return "🔄 Reconectado — retomando…"
+    return "Reconectado — retomando…"
 
 
 def fallback_model_status(model: str) -> str:
-    return f"🔄 Alternando para modelo reserva ({model})…"
+    return f"Alternando para modelo reserva ({model})…"
 
 
 def rate_limit_fallback_status() -> str:
@@ -77,13 +97,13 @@ def retries_exhausted_fallback_status(max_retries: int) -> str:
 
 def rate_limit_pause_status(wait_seconds: float, attempt: int, max_retries: int) -> str:
     return (
-        f"⏱️ Pausa rápida (limite de uso) — retomando em {wait_seconds:.1f}s "
+        f"Pausa rápida (limite de uso) — retomando em {wait_seconds:.1f}s "
         f"({attempt}/{max_retries})…"
     )
 
 
 def retry_pause_status(wait_seconds: float, attempt: int, max_retries: int) -> str:
-    return f"⏳ Nova tentativa em {wait_seconds:.1f}s ({attempt}/{max_retries})…"
+    return f"Nova tentativa em {wait_seconds:.1f}s ({attempt}/{max_retries})…"
 
 
 def interrupt_during_reasoning_message(elapsed_seconds: float) -> str:

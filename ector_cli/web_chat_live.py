@@ -175,9 +175,37 @@ def tool_start(
     _mutate(session_id, _apply)
 
 
+def _patch_tool_in_segments(
+    state: dict[str, Any],
+    row: dict[str, Any],
+    *,
+    status: str | None = None,
+) -> None:
+    segments: list[dict[str, Any]] = state.setdefault("segments", [])
+    for segment in segments:
+        if segment.get("kind") != "tools":
+            continue
+        for seg_tool in segment.get("tool_calls") or []:
+            if (
+                seg_tool.get("id") == row.get("id")
+                or seg_tool.get("server_id") == row.get("server_id")
+            ):
+                if status is not None:
+                    seg_tool["status"] = status
+                if row.get("result") is not None:
+                    seg_tool["result"] = row.get("result")
+                if row.get("cwd"):
+                    seg_tool["cwd"] = row.get("cwd")
+                if row.get("live_label"):
+                    seg_tool["live_label"] = row.get("live_label")
+                if row.get("live_technical"):
+                    seg_tool["live_technical"] = row.get("live_technical")
+
+
 def tool_progress(
     session_id: str,
     *,
+    tool_id: str = "",
     tool_name: str,
     preview: str = "",
     technical: str = "",
@@ -186,21 +214,71 @@ def tool_progress(
     label = str(preview or technical or "").strip()
     if not label:
         return
+    tc_id = str(tool_id or "").strip()
 
     def _apply(state: dict[str, Any]) -> None:
+        index: dict[str, int] = state.setdefault("_tool_index", {})
         tools: list[dict[str, Any]] = state.setdefault("tool_calls", [])
-        for row in reversed(tools):
-            if row.get("status") == "running" and (
-                not name or str(row.get("name") or "") == name
-            ):
-                if preview:
-                    row["live_label"] = str(preview)[:240]
-                if technical:
-                    row["live_technical"] = str(technical)[:240]
-                state["status_text"] = label[:240]
-                break
+        pos: int | None = None
+        if tc_id and tc_id in index:
+            pos = index[tc_id]
+        if pos is None:
+            for idx in range(len(tools) - 1, -1, -1):
+                row = tools[idx]
+                if row.get("status") == "running" and (
+                    not name or str(row.get("name") or "") == name
+                ):
+                    pos = idx
+                    break
+        if pos is None:
+            return
+        row = tools[pos]
+        if preview:
+            row["live_label"] = str(preview)[:240]
+        if technical:
+            row["live_technical"] = str(technical)[:240]
+        _patch_tool_in_segments(state, row)
+        state["status_text"] = label[:240]
 
     _mutate(session_id, _apply)
+
+
+def _detect_background_spawn(
+    tool_name: str,
+    result_str: str | None,
+    args_str: str | None = None,
+) -> dict[str, str] | None:
+    name = str(tool_name or "").strip().lower()
+    if name not in ("terminal", "shell"):
+        return None
+    if not result_str:
+        return None
+    try:
+        data = json.loads(result_str)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    proc_id = str(data.get("session_id") or "").strip()
+    output = str(data.get("output") or "")
+    if not proc_id.startswith("proc_"):
+        return None
+    if "Background process started" not in output:
+        return None
+    description = ""
+    if args_str:
+        try:
+            args = json.loads(args_str) if isinstance(args_str, str) else args_str
+            if isinstance(args, dict):
+                description = str(args.get("description") or "").strip()
+        except Exception:
+            pass
+    live_label = (
+        f"{description} — executando em segundo plano…"
+        if description
+        else "Executando em segundo plano…"
+    )
+    return {"proc_session_id": proc_id, "live_label": live_label}
 
 
 def tool_complete(
@@ -210,12 +288,14 @@ def tool_complete(
     name: str,
     result: str | None = None,
     cwd: str | None = None,
+    args: str | None = None,
 ) -> None:
     tc_id = str(tool_id or "").strip()
     tool_name = str(name or "tool").strip() or "tool"
     result_str = str(result) if result is not None else None
     failed = infer_tool_failed(tool_name, result_str)
-    status = "error" if failed else "complete"
+    bg = _detect_background_spawn(tool_name, result_str, args)
+    status = "error" if failed else ("running" if bg else "complete")
 
     def _apply(state: dict[str, Any]) -> None:
         index: dict[str, int] = state.setdefault("_tool_index", {})
@@ -234,25 +314,48 @@ def tool_complete(
             row["result"] = result_str
         if cwd:
             row["cwd"] = cwd
-        segments: list[dict[str, Any]] = state.setdefault("segments", [])
-        for segment in segments:
-            if segment.get("kind") != "tools":
+        if bg:
+            row["background_proc_id"] = bg["proc_session_id"]
+            row["live_label"] = bg["live_label"]
+        _patch_tool_in_segments(state, row, status=status)
+        state["status_text"] = (
+            bg["live_label"] if bg else "Preparando próximo passo…"
+        )
+
+    _mutate(session_id, _apply)
+
+
+def mark_background_killed(session_id: str, proc_id: str) -> None:
+    """Resolve a background tool call in the live view after an out-of-band kill.
+
+    The REST kill endpoint (POST /api/chat/background-processes/kill) stops the
+    OS process via process_registry, but that's independent of this in-memory
+    live-turn state. Without this, tool_complete()'s earlier ``status =
+    "running"`` for that background spawn stays "running" for as long as the
+    turn is still busy — every subsequent /api/chat/turn poll would keep
+    reporting it as running, undoing the frontend's optimistic "stopped" mark
+    and making the card look like it revives/restarts on its own.
+    """
+    pid = str(proc_id or "").strip()
+    if not pid:
+        return
+    killed_result = json.dumps(
+        {
+            "status": "killed",
+            "exit_code": -15,
+            "output": "Processo interrompido pelo utilizador.",
+        }
+    )
+
+    def _apply(state: dict[str, Any]) -> None:
+        tools: list[dict[str, Any]] = state.setdefault("tool_calls", [])
+        for row in tools:
+            if row.get("background_proc_id") != pid:
                 continue
-            for seg_tool in segment.get("tool_calls") or []:
-                if (
-                    seg_tool.get("id") == row.get("id")
-                    or seg_tool.get("server_id") == row.get("server_id")
-                ):
-                    seg_tool.update(
-                        {
-                            "status": status,
-                            "result": row.get("result"),
-                            "cwd": row.get("cwd"),
-                            "live_label": row.get("live_label"),
-                            "live_technical": row.get("live_technical"),
-                        }
-                    )
-        state["status_text"] = "Preparando próximo passo…"
+            row["status"] = "error"
+            row["result"] = killed_result
+            row["background_proc_id"] = None
+            _patch_tool_in_segments(state, row, status="error")
 
     _mutate(session_id, _apply)
 
@@ -284,6 +387,7 @@ def live_for_api(session_id: str) -> dict[str, Any] | None:
                 "result": row.get("result"),
                 "status": row.get("status") or "running",
                 "cwd": row.get("cwd"),
+                "background_proc_id": row.get("background_proc_id"),
             }
         )
     return {

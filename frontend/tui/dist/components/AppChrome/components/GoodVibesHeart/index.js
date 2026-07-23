@@ -1,1 +1,0 @@
-export { GoodVibesHeart } from './GoodVibesHeart.js';

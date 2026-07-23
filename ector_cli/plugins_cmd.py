@@ -782,51 +782,71 @@ def _discover_all_plugins() -> list:
 
 def cmd_list() -> None:
     """List all plugins (bundled + user) with enabled/disabled state."""
-    from rich import box
     from rich.console import Console
-    from rich.table import Table
+
+    from ector_cli.list_format import (
+        LIST_PRIMARY,
+        ListColumn,
+        render_list_page,
+    )
 
     console = Console()
     entries = sorted(_discover_all_plugins(), key=lambda row: row[0].lower())
     if not entries:
-        console.print("[dim]Nenhum plugin instalado.[/dim]")
-        console.print("[dim]Instale com:[/dim] ector plugins install proprietário/repo")
+        render_list_page(
+            console,
+            title="Plugins",
+            sections=[],
+            empty_message="Nenhum plugin instalado.",
+            empty_hint="[dim]Instale com[/] [bold]ector plugins install proprietário/repo[/]",
+            primary=LIST_PRIMARY,
+        )
         return
 
     enabled = _get_enabled_set()
     disabled = _get_disabled_set()
 
-    table = Table(
-        title="[bold]Plugins[/bold] — empacotados e em ~/.ector/plugins",
-        box=box.ROUNDED,
-        show_header=True,
-        header_style="bold",
-        expand=True,
-        padding=(0, 1),
-        title_justify="left",
-    )
-    table.add_column("Nome", style="bold", no_wrap=True, ratio=1, max_width=22)
-    table.add_column("Estado", no_wrap=True, ratio=1, min_width=14)
-    table.add_column("Versão", style="dim", no_wrap=True, justify="right", ratio=1, max_width=10)
-    table.add_column("Descrição", overflow="fold", ratio=4)
-    table.add_column("Fonte", style="dim", no_wrap=True, ratio=1, max_width=14, justify="right")
-
+    rows: list[tuple[str, ...]] = []
+    enabled_n = 0
+    disabled_n = 0
     for name, version, description, source, _dir in entries:
         if name in disabled:
-            status = "[red]desabilitado[/red]"
+            status = "[red]Desabilitado[/]"
+            disabled_n += 1
         elif name in enabled:
-            status = "[green]habilitado[/green]"
+            status = "[green]Habilitado[/]"
+            enabled_n += 1
         else:
-            status = "[dim]não habilitado[/dim]"
-        desc_cell = description or "—"
-        table.add_row(name, status, str(version) or "—", desc_cell, source)
+            status = "[dim]Não habilitado[/]"
+        rows.append((name, status, str(version) or "—", description or "—", source))
 
-    console.print()
-    console.print(table)
-    console.print()
-    console.print("[dim][b]Modo interativo (ligar/desligar):[/b][/dim] ector plugins")
-    console.print("[dim][b]Linha de comandos:[/b][/dim]        ector plugins enable <nome>   ·   ector plugins disable <nome>")
-    console.print("[dim]Por defeito os plugins estão desligados; só os indicados em [b]plugins.enabled[/b] no config são carregados.[/dim]")
+    render_list_page(
+        console,
+        title="Plugins",
+        subtitle="empacotados e em ~/.ector/plugins",
+        sections=[
+            (
+                "Instalados",
+                (
+                    ListColumn("Nome", style=f"bold {LIST_PRIMARY}", min_width=18, ratio=2),
+                    ListColumn("Estado", no_wrap=True, min_width=14, ratio=1),
+                    ListColumn("Versão", style="dim", no_wrap=True, justify="right", ratio=1),
+                    ListColumn("Descrição", overflow="fold", ratio=3),
+                    ListColumn("Fonte", style="dim", no_wrap=True, justify="right", ratio=1),
+                ),
+                rows,
+            )
+        ],
+        summary=(
+            f"[dim]{enabled_n} habilitado(s) · {disabled_n} desabilitado(s) · "
+            f"{len(rows) - enabled_n - disabled_n} inativo(s)[/]"
+        ),
+        footer=(
+            "[dim]Interativo:[/] [bold]ector plugins[/]  ·  "
+            "[bold]ector plugins enable|disable <nome>[/]"
+        ),
+        primary=LIST_PRIMARY,
+    )
 
 
 # ---------------------------------------------------------------------------

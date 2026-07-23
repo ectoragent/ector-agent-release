@@ -35,6 +35,8 @@ dependencies = [
   "edge-tts>=7.2.7,<8",
   # Skills Hub (GitHub App JWT auth — optional, only needed for bot identity)
   "PyJWT[crypto]>=2.12.0,<3",  # CVE-2026-32597
+  # Image attach / OCR preprocess / execute_code color sampling
+  "pillow>=10,<12",
 ]
 
 [project.optional-dependencies]
@@ -64,6 +66,14 @@ documents = [
   "rapidocr-onnxruntime>=1.4.0,<2",
 ]
 documents-heavy = ["marker-pdf>=1.0.0,<2"]
+# Local Florence-2 VLM for image understanding (optional; heavy torch stack).
+documents-vision = [
+  "torch>=2.1.0,<3",
+  "transformers>=4.41.0,<5",
+  "pillow>=10,<12",
+  "einops>=0.7.0,<1",
+  "timm>=0.9.0,<2",
+]
 pty = [
   "ptyprocess>=0.7.0,<1; sys_platform != 'win32'",
   "pywinpty>=2.0.0,<3; sys_platform == 'win32'",
@@ -142,10 +152,10 @@ ector-acp = "acp_adapter.entry:main"
 py-modules = ["run_agent", "model_tools", "toolsets", "batch_runner", "trajectory_compressor", "toolset_distributions", "cli", "ector_constants", "ector_state", "ector_time", "ector_logging", "ector_process", "rl_cli", "utils"]
 
 [tool.setuptools.package-data]
-ector_cli = ["web_dist/**/*", "bundled_tui/**/*"]
+ector_cli = ["web_dist/**/*"]
 
 [tool.setuptools.packages.find]
-include = ["agent", "agent.*", "tools", "tools.*", "ector_cli", "gateway", "gateway.*", "tui_gateway", "tui_gateway.*", "cron", "acp_adapter", "plugins", "plugins.*"]
+include = ["agent", "agent.*", "tools", "tools.*", "ector_cli", "gateway", "gateway.*", "cron", "acp_adapter", "plugins", "plugins.*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

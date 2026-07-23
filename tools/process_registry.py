@@ -79,6 +79,18 @@ CHECKPOINT_PATH = get_ector_home() / "processes.json"
 MAX_OUTPUT_CHARS = 200_000      # 200KB rolling output buffer
 FINISHED_TTL_SECONDS = 1800     # Keep finished processes for 30 minutes
 MAX_PROCESSES = 64              # Max concurrent tracked processes (LRU pruning)
+# process(action="wait") may block longer than a foreground terminal command —
+# builds/tests often exceed TERMINAL_TIMEOUT (default 180s).
+PROCESS_WAIT_MAX_TIMEOUT = 1800
+
+# Idle-preview reaper — kills background processes (dev servers) that were
+# shown in the dashboard's live-preview panel at least once, then went
+# unwatched (panel closed / user left the chat / tab hidden) for this long.
+# Never touches processes that were never previewed (background test runs,
+# builds, etc.) — those keep the existing lifecycle (explicit kill or the
+# chat session being deleted). See touch_preview() / reap_idle_previews().
+PREVIEW_IDLE_KILL_SECONDS = int(os.getenv("ECTOR_PREVIEW_IDLE_KILL_SECONDS", str(20 * 60)))
+PREVIEW_REAPER_INTERVAL_SECONDS = 60
 
 # Watch pattern rate limiting — PER SESSION.
 # Hard rule: at most ONE watch-match notification every WATCH_MIN_INTERVAL_SECONDS.
@@ -119,6 +131,11 @@ class ProcessSession:
     env_ref: Any = None                         # Reference to the environment object
     cwd: Optional[str] = None                   # Working directory
     started_at: float = 0.0                     # time.time() of spawn
+    # Last time the dashboard's live-preview panel actively watched this
+    # process (touch_preview()). 0.0 = never previewed -- the idle reaper
+    # ignores such sessions entirely (they may be intentional background
+    # jobs like test runs, not dev servers).
+    last_preview_seen_at: float = 0.0
     exited: bool = False                        # Whether the process has finished
     exit_code: Optional[int] = None             # Exit code (None if still running)
     output_buffer: str = ""                     # Rolling output (last MAX_OUTPUT_CHARS)
@@ -199,6 +216,14 @@ class ProcessRegistry:
         self._global_watch_window_hits: int = 0
         self._global_watch_tripped_until: float = 0.0
         self._global_watch_suppressed_during_trip: int = 0
+
+        # Idle-preview reaper — see PREVIEW_IDLE_KILL_SECONDS.
+        reaper = threading.Thread(
+            target=self._idle_preview_reaper_loop,
+            daemon=True,
+            name="proc-idle-preview-reaper",
+        )
+        reaper.start()
 
     @staticmethod
     def _clean_shell_noise(text: str) -> str:
@@ -808,6 +833,8 @@ class ProcessRegistry:
                 "command": session.command,
                 "exit_code": session.exit_code,
                 "output": output_tail,
+                "session_key": session.session_key or "",
+                "task_id": session.task_id or "",
             })
 
     # ----- Query Methods -----
@@ -886,7 +913,8 @@ class ProcessRegistry:
 
         Args:
             session_id: The process to wait for.
-            timeout: Max seconds to block. Falls back to TERMINAL_TIMEOUT config.
+            timeout: Max seconds to block. Falls back to TERMINAL_TIMEOUT config,
+                capped at PROCESS_WAIT_MAX_TIMEOUT (builds/tests need longer waits).
 
         Returns:
             dict with status ("exited", "timeout", "interrupted", "not_found")
@@ -899,7 +927,13 @@ class ProcessRegistry:
             default_timeout = int(os.getenv("TERMINAL_TIMEOUT", "180"))
         except (ValueError, TypeError):
             default_timeout = 180
-        max_timeout = default_timeout
+        try:
+            max_timeout = int(
+                os.getenv("PROCESS_WAIT_MAX_TIMEOUT", str(PROCESS_WAIT_MAX_TIMEOUT))
+            )
+        except (ValueError, TypeError):
+            max_timeout = PROCESS_WAIT_MAX_TIMEOUT
+        max_timeout = max(default_timeout, max_timeout)
         requested_timeout = timeout
         timeout_note = None
 
@@ -910,7 +944,7 @@ class ProcessRegistry:
                 f"to configured limit of {max_timeout}s"
             )
         else:
-            effective_timeout = requested_timeout or max_timeout
+            effective_timeout = requested_timeout or default_timeout
 
         session = self.get(session_id)
         if session is None:
@@ -943,14 +977,32 @@ class ProcessRegistry:
 
             time.sleep(1)
 
+        session = self._refresh_detached_session(session)
+        if session is not None and not session.exited:
+            # Agent often ends the turn after a wait timeout; ensure we still
+            # get a completion notification when the process finally exits.
+            session.notify_on_complete = True
+
         result = {
             "status": "timeout",
-            "output": strip_ansi(session.output_buffer[-1000:]),
+            "still_running": True,
+            "session_id": session_id,
+            "output": strip_ansi(session.output_buffer[-1000:]) if session else "",
+            "notify_on_complete": True,
+            "instruction": (
+                "Process is STILL RUNNING. Do NOT end your turn and do NOT tell "
+                "the user you will check later. Immediately call "
+                f'process(action="wait", session_id="{session_id}", timeout={effective_timeout}) '
+                "again (or process action=poll to read new output, then wait). "
+                "notify_on_complete was enabled — you will also be notified when it exits."
+            ),
         }
         if timeout_note:
             result["timeout_note"] = timeout_note
         else:
-            result["timeout_note"] = f"Waited {effective_timeout}s, process still running"
+            result["timeout_note"] = (
+                f"Waited {effective_timeout}s, process still running"
+            )
         return result
 
     def kill_process(self, session_id: str) -> dict:
@@ -1093,6 +1145,42 @@ class ProcessRegistry:
             result.append(entry)
         return result
 
+    def list_for_session_key(self, session_key: str) -> list:
+        """List running and recently-finished processes for a gateway/web session key."""
+        key = (session_key or "").strip()
+        if not key:
+            return []
+
+        with self._lock:
+            all_sessions = list(self._running.values()) + list(self._finished.values())
+
+        all_sessions = [self._refresh_detached_session(s) for s in all_sessions]
+        all_sessions = [s for s in all_sessions if s.session_key == key or s.task_id == key]
+
+        from tools.ansi_strip import strip_ansi
+
+        result = []
+        for s in all_sessions:
+            entry = {
+                "session_id": s.id,
+                "command": s.command[:200],
+                "cwd": s.cwd,
+                "pid": s.pid,
+                "started_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(s.started_at)),
+                "uptime_seconds": int(time.time() - s.started_at),
+                "status": "exited" if s.exited else "running",
+                # Enough tail for the web chat live card without shipping the full buffer.
+                "output_preview": (
+                    strip_ansi(s.output_buffer[-2000:]) if s.output_buffer else ""
+                ),
+            }
+            if s.exited:
+                entry["exit_code"] = s.exit_code
+            if s.detached:
+                entry["detached"] = True
+            result.append(entry)
+        return result
+
     # ----- Session/Task Queries (for gateway integration) -----
 
     def has_active_processes(self, task_id: str) -> bool:
@@ -1137,6 +1225,84 @@ class ProcessRegistry:
             if result.get("status") in ("killed", "already_exited"):
                 killed += 1
         return killed
+
+    def kill_all_for_session_key(self, session_key: str) -> int:
+        """Kill all running processes owned by a gateway/web session key."""
+        key = (session_key or "").strip()
+        if not key:
+            return 0
+        with self._lock:
+            targets = [
+                s for s in self._running.values()
+                if (s.session_key == key or s.task_id == key) and not s.exited
+            ]
+
+        killed = 0
+        for session in targets:
+            result = self.kill_process(session.id)
+            if result.get("status") in ("killed", "already_exited"):
+                killed += 1
+        return killed
+
+    # ----- Idle-preview reaper -----
+
+    def touch_preview(self, session_id: str) -> bool:
+        """Mark a running process as actively watched by the live-preview panel.
+
+        Called from the dashboard's preview-probe endpoint while the panel is
+        open and the browser tab is visible. Resets the idle clock used by
+        reap_idle_previews() -- a process the user is actively looking at is
+        never killed for inactivity.
+        """
+        sid = (session_id or "").strip()
+        if not sid:
+            return False
+        with self._lock:
+            session = self._running.get(sid)
+            if session is None or session.exited:
+                return False
+            session.last_preview_seen_at = time.time()
+        return True
+
+    def reap_idle_previews(
+        self, idle_seconds: float = PREVIEW_IDLE_KILL_SECONDS
+    ) -> List[str]:
+        """Kill running processes that were previewed at least once, then went
+        unwatched (panel closed / chat abandoned / tab gone) for idle_seconds.
+
+        Never touches a session with last_preview_seen_at == 0.0 -- those were
+        never shown in the live-preview panel and may be intentional
+        background jobs (test runs, builds) that outlive the chat on purpose.
+        """
+        now = time.time()
+        with self._lock:
+            targets = [
+                s
+                for s in self._running.values()
+                if not s.exited
+                and s.last_preview_seen_at > 0.0
+                and (now - s.last_preview_seen_at) > idle_seconds
+            ]
+
+        killed_ids: List[str] = []
+        for session in targets:
+            result = self.kill_process(session.id)
+            if result.get("status") in ("killed", "already_exited"):
+                killed_ids.append(session.id)
+                logger.info(
+                    "Killed idle preview process %s (unwatched for >%ds): %s",
+                    session.id, int(idle_seconds), session.command[:80],
+                )
+        return killed_ids
+
+    def _idle_preview_reaper_loop(self) -> None:
+        """Background thread: periodically reap unwatched preview processes."""
+        while True:
+            time.sleep(PREVIEW_REAPER_INTERVAL_SECONDS)
+            try:
+                self.reap_idle_previews()
+            except Exception:
+                logger.debug("Idle preview reaper tick failed", exc_info=True)
 
     # ----- Cleanup / Pruning -----
 

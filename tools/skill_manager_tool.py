@@ -385,7 +385,12 @@ def _atomic_write_text(file_path: Path, content: str, encoding: str = "utf-8") -
 # Core actions
 # =============================================================================
 
-def _create_skill(name: str, content: str, category: str = None) -> Dict[str, Any]:
+def _create_skill(
+    name: str,
+    content: str,
+    category: str = None,
+    task_id: str = None,
+) -> Dict[str, Any]:
     """Create a new user skill with SKILL.md content."""
     # Validate name
     err = _validate_name(name)
@@ -404,6 +409,13 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
     err = _validate_content_size(content)
     if err:
         return {"success": False, "error": err}
+
+    from agent.skill_workspace import inject_workspace_metadata, resolve_workspace_root
+
+    if task_id:
+        workspace_root = resolve_workspace_root(task_id)
+        if workspace_root:
+            content = inject_workspace_metadata(content, workspace_root)
 
     # Check for name collisions across all directories
     existing = _find_skill(name)
@@ -598,6 +610,13 @@ def _delete_skill(name: str) -> Dict[str, Any]:
     if parent != SKILLS_DIR and parent.exists() and not any(parent.iterdir()):
         parent.rmdir()
 
+    try:
+        from tools.memory_tool import scrub_skill_name_from_memory
+
+        scrub_skill_name_from_memory(name)
+    except Exception:
+        logger.debug("Could not scrub memory refs for deleted skill %s", name, exc_info=True)
+
     return {
         "success": True,
         "message": f"🗑️ Eu removi a habilidade de '{name}'. Se eu precisar dela novamente no futuro, é só me pedir para criar!",
@@ -719,6 +738,7 @@ def skill_manage(
     old_string: str = None,
     new_string: str = None,
     replace_all: bool = False,
+    task_id: str = None,
 ) -> str:
     """
     Manage user-created skills. Dispatches to the appropriate action handler.
@@ -728,7 +748,7 @@ def skill_manage(
     if action == "create":
         if not content:
             return tool_error("content is required for 'create'. Provide the full SKILL.md text (frontmatter + body).", success=False)
-        result = _create_skill(name, content, category)
+        result = _create_skill(name, content, category, task_id=task_id)
 
     elif action == "edit":
         if not content:
@@ -796,9 +816,14 @@ SKILL_MANAGE_SCHEMA = {
         "missing steps or pitfalls found during use. "
         "If you used a skill and hit issues not covered by it, patch it immediately.\n\n"
         "After difficult/iterative tasks, offer to save as a skill. "
-        "Skip for simple one-offs. Confirm with user before creating/deleting.\n\n"
+        "Skip for simple one-offs. Confirm with user before creating/deleting.\n"
+        "When the user asks to remove/delete a skill, use action='delete' "
+        "(local user skills only).\n\n"
         "Good skills: trigger conditions, numbered steps with exact commands, "
-        "pitfalls section, verification steps. Use skill_view() to see format examples."
+        "pitfalls section, verification steps. Use skill_view() to see format examples.\n\n"
+        "Workspace: never hardcode absolute paths to a specific repo. Reference the "
+        "current session workspace/cwd only. New skills are auto-tagged to the active "
+        "git root via metadata.ector.workspace_roots."
     ),
     "parameters": {
         "type": "object",
@@ -885,6 +910,8 @@ registry.register(
         file_content=args.get("file_content"),
         old_string=args.get("old_string"),
         new_string=args.get("new_string"),
-        replace_all=args.get("replace_all", False)),
+        replace_all=args.get("replace_all", False),
+        task_id=kw.get("task_id"),
+    ),
     emoji="📝",
 )

@@ -2491,7 +2491,7 @@ def run_setup_wizard(args):
 
 
 def _resolve_ector_chat_argv() -> Optional[list[str]]:
-    """Resolve argv for launching ``ector chat`` in a fresh process."""
+    """Resolve argv for launching ``ector`` (dashboard) in a fresh process."""
     ector_bin = shutil.which("ector")
     if ector_bin:
         return [ector_bin, "chat"]
@@ -2508,12 +2508,12 @@ def _resolve_ector_chat_argv() -> Optional[list[str]]:
 def _offer_launch_chat():
     """Prompt the user to jump straight into chat after setup."""
     print()
-    if not prompt_yes_no("Iniciar ector chat agora?", True):
+    if not prompt_yes_no("Iniciar ector agora?", True):
         return
 
     chat_argv = _resolve_ector_chat_argv()
     if not chat_argv:
-        print_info("Não foi possível reiniciar o Ector automaticamente. Execute 'ector chat' manualmente.")
+        print_info("Não foi possível reiniciar o Ector automaticamente. Execute 'ector' manualmente.")
         return
 
     os.execvp(chat_argv[0], chat_argv)

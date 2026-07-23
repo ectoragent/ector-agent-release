@@ -213,7 +213,7 @@ def _build_skill_message(
 
 
 def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
-    """Scan ~/.ector/skills/ and return a mapping of /command -> skill info.
+    """Scan local + external + builtin skill dirs, return a mapping of /command -> skill info.
 
     Returns:
         Dict mapping "/skill-name" to {name, description, skill_md_path, skill_dir}.
@@ -223,8 +223,8 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
     try:
         from agent.skill_utils import (
             EXCLUDED_SKILL_DIRS,
+            get_all_skills_dirs,
             get_disabled_skill_names,
-            get_external_skills_dirs,
             iter_skill_index_files,
             parse_frontmatter,
             skill_matches_platform,
@@ -235,11 +235,11 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
         disabled = get_disabled_skill_names()
         seen_names: set = set()
 
-        # Scan local dir first, then external dirs
+        # Scan local dir first, then external + builtin (local takes precedence)
         dirs_to_scan = []
         if skills_dir.exists():
             dirs_to_scan.append(skills_dir)
-        dirs_to_scan.extend(get_external_skills_dirs())
+        dirs_to_scan.extend(get_all_skills_dirs()[1:])
 
         for scan_dir in dirs_to_scan:
             for skill_md in iter_skill_index_files(scan_dir, "SKILL.md"):

@@ -1,4 +1,4 @@
-"""Local file/image attachment helpers (shared by TUI gateway, oneshot, cli legacy)."""
+"""Local file/image attachment helpers (shared by web chat and cli legacy)."""
 
 from __future__ import annotations
 
@@ -546,10 +546,11 @@ def collect_query_images(
 
 
 def enrich_with_attached_images(user_text: str, image_paths: list[str]) -> str:
-    """Pre-analyze attached images via vision with local OCR fallback."""
+    """Pre-analyze attached images via vision with local OCR/VLM fallback."""
     import asyncio
 
     from agent.document_stack.extract import extract_document
+    from agent.document_stack.local_image import understand_image_local
     from agent.document_stack.markers import (
         format_document_context_block,
         format_document_context_failed,
@@ -569,9 +570,15 @@ def enrich_with_attached_images(user_text: str, image_paths: list[str]) -> str:
         documents_cfg = load_config().get("documents", {})
         mode = str(documents_cfg.get("preanalysis", "vision_then_ocr")).strip().lower()
         dark_mode_boost = bool(documents_cfg.get("dark_mode_boost", True))
+        local_vlm = str(documents_cfg.get("local_vlm", "auto")).strip().lower()
+        florence_model = str(
+            documents_cfg.get("florence_model", "microsoft/Florence-2-base")
+        )
     except Exception:
         mode = "vision_then_ocr"
         dark_mode_boost = True
+        local_vlm = "auto"
+        florence_model = "microsoft/Florence-2-base"
 
     prompt = build_preanalysis_prompt(user_text)
 
@@ -605,6 +612,21 @@ def enrich_with_attached_images(user_text: str, image_paths: list[str]) -> str:
         if vision_ok:
             continue
         if mode == "vision_only":
+            continue
+
+        local = understand_image_local(
+            str(p),
+            local_vlm=local_vlm,
+            florence_model=florence_model,
+        )
+        if local.get("success") and (local.get("markdown") or "").strip():
+            _append_part(
+                format_document_context_block(
+                    local.get("markdown", ""),
+                    str(p),
+                    local.get("backend", "tesseract+florence"),
+                )
+            )
             continue
 
         extracted = extract_document(

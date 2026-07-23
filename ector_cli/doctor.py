@@ -48,6 +48,7 @@ _PROVIDER_ENV_HINTS = (
     "GLM_API_KEY",
     "ZAI_API_KEY",
     "Z_AI_API_KEY",
+    "ZHIPU_API_KEY",
     "KIMI_API_KEY",
     "KIMI_CN_API_KEY",
     "MINIMAX_API_KEY",
@@ -424,6 +425,11 @@ def run_doctor(args):
             check_ok("Motores OCR detectados", f"({', '.join(ocr_engines)})")
         else:
             check_warn("Motores OCR não detectados", "(Docling pode depender de instalação adicional)")
+
+        if engines.get("florence"):
+            check_ok("Florence-2 (VLM local)", "(documents-vision)")
+        else:
+            check_info("Florence-2 não instalado — opcional: pip install 'ector-agent[documents-vision]'")
 
         for hint in doc_report.get("install_hints", [])[:2]:
             check_info(hint)
@@ -1176,7 +1182,7 @@ def run_doctor(args):
     # Tuple: (name, env_vars, default_url, base_env, supports_models_endpoint)
     # If supports_models_endpoint is False, we skip the health check and just show "configured"
     _apikey_providers = [
-        ("Z.AI / GLM",      ("GLM_API_KEY", "ZAI_API_KEY", "Z_AI_API_KEY"), "https://api.z.ai/api/paas/v4/models", "GLM_BASE_URL", True),
+        ("Z.AI / GLM",      ("GLM_API_KEY", "ZAI_API_KEY", "Z_AI_API_KEY", "ZHIPU_API_KEY"), "https://api.z.ai/api/paas/v4/models", "GLM_BASE_URL", True),
         ("Kimi / Moonshot",  ("KIMI_API_KEY",),                              "https://api.moonshot.ai/v1/models",   "KIMI_BASE_URL", True),
         ("StepFun Step Plan",   ("STEPFUN_API_KEY",),                           "https://api.stepfun.ai/step_plan/v1/models", "STEPFUN_BASE_URL", True),
         ("Kimi / Moonshot (China)", ("KIMI_CN_API_KEY",),                    "https://api.moonshot.cn/v1/models",   None, True),

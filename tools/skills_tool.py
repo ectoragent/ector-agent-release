@@ -80,7 +80,7 @@ from tools.registry import registry, tool_error
 logger = logging.getLogger(__name__)
 
 
-# All skills live in ~/.ector/skills/ (Hub, cloud library, optional-skills, or user-created).
+# Skills: local ~/.ector/skills/ + external_dirs + repo builtin-skills/.
 # This is the single source of truth -- agent edits, hub installs, and bundled
 # skills all coexist here without polluting the git repo.
 ECTOR_HOME = get_ector_home()
@@ -447,11 +447,11 @@ def _get_category_from_path(skill_path: Path) -> Optional[str]:
     Also works for external skill dirs configured via skills.external_dirs.
     """
     # Try the module-level SKILLS_DIR first (respects monkeypatching in tests),
-    # then fall back to external dirs from config.
+    # then fall back to external dirs + builtin-skills.
     dirs_to_check = [SKILLS_DIR]
     try:
-        from agent.skill_utils import get_external_skills_dirs
-        dirs_to_check.extend(get_external_skills_dirs())
+        from agent.skill_utils import get_all_skills_dirs
+        dirs_to_check.extend(get_all_skills_dirs()[1:])
     except Exception:
         pass
     for skills_dir in dirs_to_check:
@@ -543,7 +543,7 @@ def _is_skill_disabled(name: str, platform: str = None) -> bool:
 
 
 def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
-    """Recursively find all skills in ~/.ector/skills/ and external dirs.
+    """Recursively find all skills in local, external, and builtin dirs.
 
     Args:
         skip_disabled: If True, return ALL skills regardless of disabled
@@ -553,7 +553,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     Returns:
         List of skill metadata dicts (name, description, category).
     """
-    from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
+    from agent.skill_utils import get_all_skills_dirs, iter_skill_index_files
 
     skills = []
     seen_names: set = set()
@@ -561,11 +561,11 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     # Load disabled set once (not per-skill)
     disabled = set() if skip_disabled else _get_disabled_skill_names()
 
-    # Scan local dir first, then external dirs (local takes precedence)
+    # Scan local dir first, then external + builtin (local takes precedence)
     dirs_to_scan = []
     if SKILLS_DIR.exists():
         dirs_to_scan.append(SKILLS_DIR)
-    dirs_to_scan.extend(get_external_skills_dirs())
+    dirs_to_scan.extend(get_all_skills_dirs()[1:])
 
     for scan_dir in dirs_to_scan:
         for skill_md in iter_skill_index_files(scan_dir, "SKILL.md"):
@@ -667,6 +667,37 @@ def _load_category_description(category_dir: Path) -> Optional[str]:
         return None
 
 
+def _filter_skills_for_workspace(
+    skills: List[Dict[str, Any]],
+    task_id: Optional[str],
+) -> List[Dict[str, Any]]:
+    if not skills:
+        return skills
+    from agent.skill_utils import parse_frontmatter
+    from agent.skill_workspace import skill_applies_to_workspace
+    from tools.skill_manager_tool import _find_skill
+
+    filtered: List[Dict[str, Any]] = []
+    for skill in skills:
+        name = str(skill.get("name") or "").strip()
+        if not name:
+            continue
+        found = _find_skill(name)
+        if not found:
+            filtered.append(skill)
+            continue
+        skill_md = found["path"] / "SKILL.md"
+        try:
+            raw = skill_md.read_text(encoding="utf-8")
+            frontmatter, body = parse_frontmatter(raw)
+        except Exception:
+            filtered.append(skill)
+            continue
+        if skill_applies_to_workspace(frontmatter, body, task_id):
+            filtered.append(skill)
+    return filtered
+
+
 def skills_list(category: str = None, task_id: str = None) -> str:
     """
     List all available skills (progressive disclosure tier 1 - minimal metadata).
@@ -696,6 +727,7 @@ def skills_list(category: str = None, task_id: str = None) -> str:
 
         # Find all skills
         all_skills = _find_all_skills()
+        all_skills = _filter_skills_for_workspace(all_skills, task_id)
 
         if not all_skills:
             return json.dumps(
@@ -927,13 +959,13 @@ def skill_view(
             # Plugin itself not found — fall through to flat-tree scan
             # which will return a normal "not found" with suggestions.
 
-        from agent.skill_utils import get_external_skills_dirs
+        from agent.skill_utils import get_all_skills_dirs
 
         # Build list of all skill directories to search
         all_dirs = []
         if SKILLS_DIR.exists():
             all_dirs.append(SKILLS_DIR)
-        all_dirs.extend(get_external_skills_dirs())
+        all_dirs.extend(get_all_skills_dirs()[1:])
 
         if not all_dirs:
             return json.dumps(
@@ -1007,7 +1039,7 @@ def skill_view(
             )
 
         # Security: warn if skill is loaded from outside trusted directories
-        # (local skills dir + configured external_dirs are all trusted)
+        # (local + external_dirs + builtin-skills are trusted)
         _outside_skills_dir = True
         _trusted_dirs = [SKILLS_DIR.resolve()]
         try:
@@ -1061,6 +1093,38 @@ def skill_view(
                         f"Skill '{resolved_name}' is disabled. "
                         "Enable it with `ector skills` or inspect the files directly on disk."
                     ),
+                },
+                ensure_ascii=False,
+            )
+
+        parsed_body = ""
+        try:
+            _, parsed_body = _parse_frontmatter(content)
+        except Exception:
+            parsed_body = ""
+
+        from agent.skill_workspace import (
+            parse_skill_workspace_roots,
+            resolve_workspace_root,
+            skill_applies_to_workspace,
+        )
+
+        if not skill_applies_to_workspace(parsed_frontmatter, parsed_body, task_id):
+            return json.dumps(
+                {
+                    "success": True,
+                    "skipped": True,
+                    "workspace_mismatch": True,
+                    "message": (
+                        "Skill não disponível neste workspace/projeto. "
+                        "Ignore e use ferramentas padrão (terminal, git, read_file, …) "
+                        "no diretório de trabalho da sessão."
+                    ),
+                    "declared_workspace_roots": parse_skill_workspace_roots(
+                        parsed_frontmatter
+                    )
+                    or [],
+                    "current_workspace_root": resolve_workspace_root(task_id),
                 },
                 ensure_ascii=False,
             )

@@ -207,27 +207,53 @@ def _cmd_subscribe(args):
 
 
 def _cmd_list(args):
+    from rich.console import Console
+
+    from ector_cli.list_format import LIST_PRIMARY, ListColumn, render_list_page
+
     subs = _load_subscriptions()
+    console = Console()
+
     if not subs:
-        print("  No dynamic webhook subscriptions.")
-        print("  Create one with: ector webhook subscribe <name>")
+        render_list_page(
+            console,
+            title="Webhooks dinâmicos",
+            sections=[],
+            empty_message="Nenhuma inscrição dinâmica.",
+            empty_hint="[dim]Crie com[/] [bold]ector webhook subscribe <nome>[/]",
+            primary=LIST_PRIMARY,
+        )
         return
 
     base_url = _get_webhook_base_url()
-    print(f"\n  {len(subs)} webhook subscription(s):\n")
+    rows = []
     for name, route in subs.items():
-        events = ", ".join(route.get("events", [])) or "(all)"
+        events = ", ".join(route.get("events", [])) or "(todos)"
         deliver = route.get("deliver", "log")
         if route.get("deliver_only"):
-            deliver = f"{deliver} (direct — no agent)"
-        desc = route.get("description", "")
-        print(f"  ◆ {name}")
-        if desc:
-            print(f"    {desc}")
-        print(f"    URL:     {base_url}/webhooks/{name}")
-        print(f"    Events:  {events}")
-        print(f"    Deliver: {deliver}")
-        print()
+            deliver = f"{deliver} (direto)"
+        desc = route.get("description", "") or "—"
+        rows.append((name, desc, f"{base_url}/webhooks/{name}", events, deliver))
+
+    render_list_page(
+        console,
+        title="Webhooks dinâmicos",
+        sections=[
+            (
+                "Inscrições",
+                (
+                    ListColumn("Nome", style=f"bold {LIST_PRIMARY}", min_width=14, ratio=1),
+                    ListColumn("Descrição", overflow="fold", ratio=2),
+                    ListColumn("URL", style="dim", overflow="fold", ratio=3),
+                    ListColumn("Eventos", overflow="fold", ratio=2),
+                    ListColumn("Entrega", style="dim", no_wrap=True, ratio=1),
+                ),
+                rows,
+            )
+        ],
+        summary=f"[dim]{len(rows)} inscrição(ões)[/]",
+        primary=LIST_PRIMARY,
+    )
 
 
 def _cmd_remove(args):

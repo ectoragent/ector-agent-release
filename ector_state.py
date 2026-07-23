@@ -29,6 +29,14 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
+
+def get_default_db_path() -> Path:
+    """Resolve ``state.db`` under the current ``ECTOR_HOME`` (not import-time)."""
+    return get_ector_home() / "state.db"
+
+
+# Import-time snapshot — prefer :func:`get_default_db_path` when ECTOR_HOME
+# may change after import (tests, profiles). SessionDB ignores this constant.
 DEFAULT_DB_PATH = get_ector_home() / "state.db"
 
 SCHEMA_VERSION = 11
@@ -95,10 +103,19 @@ CREATE TABLE IF NOT EXISTS state_meta (
     value TEXT
 );
 
+CREATE TABLE IF NOT EXISTS chapters (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    title TEXT NOT NULL,
+    summary TEXT,
+    created_at REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_chapters_session ON chapters(session_id, created_at);
 """
 
 FTS_SQL = """
@@ -147,7 +164,10 @@ class SessionDB:
     _CHECKPOINT_EVERY_N_WRITES = 50
 
     def __init__(self, db_path: Path = None):
-        self.db_path = db_path or DEFAULT_DB_PATH
+        # Resolve at construction time so tests/profiles that set ECTOR_HOME
+        # after importing this module still get an isolated state.db
+        # (DEFAULT_DB_PATH is fixed at import and must not be reused).
+        self.db_path = Path(db_path) if db_path is not None else get_default_db_path()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
         self._lock = threading.Lock()
@@ -591,6 +611,7 @@ class SessionDB:
         source: str = "unknown",
         model: str = None,
         user_id: str = None,
+        parent_session_id: str = None,
     ) -> None:
         """Ensure a session row exists, creating it with minimal metadata if absent.
 
@@ -598,21 +619,31 @@ class SessionDB:
         create_session() call (e.g. transient SQLite lock at agent startup).
         INSERT OR IGNORE is safe to call even when the row already exists.
         When *user_id* is set, backfills an existing untagged row.
+        When *parent_session_id* is set, stores it on insert and backfills an
+        existing row that still has a NULL parent (delegate/subagent children).
         """
         uid = (user_id or "").strip() or None
+        parent = (parent_session_id or "").strip() or None
 
         def _do(conn):
             conn.execute(
                 """INSERT OR IGNORE INTO sessions
-                   (id, source, model, user_id, started_at)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (session_id, source, model, uid, time.time()),
+                   (id, source, model, user_id, parent_session_id, started_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (session_id, source, model, uid, parent, time.time()),
             )
             if uid:
                 conn.execute(
                     """UPDATE sessions SET user_id = ?
                        WHERE id = ? AND (user_id IS NULL OR user_id = '')""",
                     (uid, session_id),
+                )
+            if parent:
+                conn.execute(
+                    """UPDATE sessions SET parent_session_id = ?
+                       WHERE id = ?
+                       AND (parent_session_id IS NULL OR parent_session_id = '')""",
+                    (parent, session_id),
                 )
 
         self._execute_write(_do)
@@ -1122,12 +1153,19 @@ class SessionDB:
         reasoning_details: Any = None,
         codex_reasoning_items: Any = None,
         codex_message_items: Any = None,
+        timestamp: float = None,
     ) -> int:
         """
         Append a message to a session. Returns the message row ID.
 
         Also increments the session's message_count (and tool_call_count
         if role is 'tool' or tool_calls is present).
+
+        ``timestamp`` defaults to ``time.time()`` at call time. Pass an
+        explicit value when the message actually happened earlier than the
+        call (e.g. a user message only flushed to DB at turn exit) — callers
+        that batch-flush a whole turn at once would otherwise stamp every
+        message with ~the same time, making elapsed-time displays useless.
         """
         # Serialize structured fields to JSON before entering the write txn
         reasoning_details_json = (
@@ -1163,7 +1201,7 @@ class SessionDB:
                     tool_call_id,
                     tool_calls_json,
                     tool_name,
-                    time.time(),
+                    timestamp if timestamp is not None else time.time(),
                     token_count,
                     finish_reason,
                     reasoning,
@@ -1210,6 +1248,42 @@ class SessionDB:
                     msg["tool_calls"] = []
             result.append(msg)
         return result
+
+    def add_chapter(
+        self,
+        session_id: str,
+        title: str,
+        summary: str = None,
+        timestamp: float = None,
+    ) -> int:
+        """Record a chapter marker for a session. Returns the row ID.
+
+        Chapters are anchored by ``timestamp`` (not a message index) so they
+        stay meaningful even if a later context compression rewrites the
+        in-memory message list — the dashboard places the divider before the
+        first message whose own timestamp is >= the chapter's.
+        """
+        ts = timestamp if timestamp is not None else time.time()
+
+        def _do(conn):
+            cursor = conn.execute(
+                "INSERT INTO chapters (session_id, title, summary, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (session_id, title, summary, ts),
+            )
+            return cursor.lastrowid
+
+        return self._execute_write(_do)
+
+    def get_chapters(self, session_id: str) -> List[Dict[str, Any]]:
+        """Load all chapter markers for a session, ordered by creation time."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT * FROM chapters WHERE session_id = ? ORDER BY created_at, id",
+                (session_id,),
+            )
+            rows = cursor.fetchall()
+        return [dict(row) for row in rows]
 
     def resolve_resume_session_id(self, session_id: str) -> str:
         """Redirect a resume target to the descendant session that holds the messages.

@@ -1,1 +1,0 @@
-export const NO_PROVIDER_RE = /\bNo (?:LLM|inference) provider configured\b/i;

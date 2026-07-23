@@ -73,7 +73,8 @@ _PRIORITY_ROOT_NAMES = (
 
 
 def short_display_path(cwd: str, max_len: int = 40) -> str:
-    """Compact path for UI labels (parity with web_server._short_display_cwd)."""
+    """Home-relative path for UI labels (parity with web_server._short_display_cwd)."""
+    del max_len
     try:
         home = os.path.expanduser("~")
     except Exception:
@@ -81,9 +82,7 @@ def short_display_path(cwd: str, max_len: int = 40) -> str:
     p = cwd
     if home and p.startswith(home):
         p = "~" + p[len(home) :]
-    if len(p) <= max_len:
-        return p
-    return "\u2026" + p[-(max_len - 1) :]
+    return p
 
 
 def resolve_browse_path(raw: str) -> str:
@@ -140,6 +139,8 @@ def _iter_subdirs(directory: Path, *, hide_hidden: bool = False) -> list[Path]:
                 if not entry.is_dir(follow_symlinks=False):
                     continue
                 if hide_hidden and _is_hidden_dir_name(entry.name):
+                    continue
+                if entry.name in _SKIP_DIR_NAMES:
                     continue
                 if not os.access(entry.path, os.R_OK):
                     continue
@@ -365,3 +366,37 @@ def browse_directory(
         "parent": _parent_path(resolved),
         "entries": entries,
     }
+
+
+def create_directory(
+    parent: str,
+    name: str,
+    *,
+    label_fn: Callable[[str], str] = short_display_path,
+) -> dict[str, Any]:
+    """Create a subdirectory under *parent* and return its browse entry."""
+    cleaned = (name or "").strip()
+    if not cleaned:
+        raise ValueError("nome de pasta obrigatório")
+    if cleaned in {".", ".."} or "/" in cleaned or "\\" in cleaned:
+        raise ValueError("nome de pasta inválido")
+    if cleaned != Path(cleaned).name:
+        raise ValueError("nome de pasta inválido")
+
+    parent_resolved = resolve_browse_path(parent or "~")
+    if not os.access(parent_resolved, os.W_OK):
+        raise ValueError("sem permissão de escrita")
+
+    target = Path(parent_resolved) / cleaned
+    if target.exists():
+        raise ValueError("já existe uma pasta com esse nome")
+
+    try:
+        target.mkdir(parents=False, exist_ok=False)
+    except OSError as exc:
+        raise ValueError(f"não foi possível criar a pasta: {exc}") from exc
+
+    if not target.is_dir():
+        raise ValueError("não foi possível criar a pasta")
+
+    return _entry_payload(target.resolve(), label_fn=label_fn)

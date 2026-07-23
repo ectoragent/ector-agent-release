@@ -1,1 +1,0 @@
-export { AUDIO_DIRECTIVE_RE, INLINE_RE, Md, MEDIA_LINE_RE, stripInlineMarkup } from './Markdown.js';

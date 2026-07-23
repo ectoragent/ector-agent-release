@@ -1,2 +1,0 @@
-export const todoGlyph = status => status === 'completed' ? '[x]' : status === 'cancelled' ? '[-]' : status === 'in_progress' ? '[>]' : '[ ]';
-export const todoTone = status => status === 'in_progress' ? 'active' : status === 'pending' ? 'body' : 'dim';

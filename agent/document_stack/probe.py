@@ -52,6 +52,11 @@ def probe_document_stack() -> Dict[str, Any]:
     has_rapidocr = _has_module("rapidocr_onnxruntime")
     has_tesseract = bool(shutil.which("tesseract"))
     has_ocrmac = _has_module("ocrmac")
+    has_florence = (
+        _has_module("torch")
+        and _has_module("transformers")
+        and _has_module("PIL")
+    )
     has_cuda, has_mps = _try_torch_capabilities()
 
     backends: List[str] = []
@@ -61,6 +66,8 @@ def probe_document_stack() -> Dict[str, Any]:
         backends.append("docling")
     if has_marker:
         backends.append("marker")
+    if has_florence:
+        backends.append("florence-2")
 
     recommended_tier = "none"
     if has_docling:
@@ -76,6 +83,8 @@ def probe_document_stack() -> Dict[str, Any]:
         install_hints.append("pip install 'ector-agent[documents]'")
     if not has_marker and can_install_heavy:
         install_hints.append("pip install 'ector-agent[documents-heavy]'")
+    if not has_florence and not is_termux():
+        install_hints.append("pip install 'ector-agent[documents-vision]'  # Florence-2 local VLM")
     if is_termux():
         install_hints.append("Termux detected: use documents-lite only")
 
@@ -108,6 +117,7 @@ def probe_document_stack() -> Dict[str, Any]:
             "ocrmac": has_ocrmac,
             "pillow": has_pillow,
             "pymupdf4llm": has_pymupdf4llm,
+            "florence": has_florence,
         },
         "runtime": {"cuda": has_cuda, "mps": has_mps},
         "details": "\n".join(details),

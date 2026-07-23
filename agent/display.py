@@ -387,17 +387,21 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
         return _describe_skill_manage_preview(args)
 
     if tool_name == "process":
-        action = args.get("action", "")
-        sid = args.get("session_id", "")
+        action = str(args.get("action", "") or "").strip().lower()
+        sid = str(args.get("session_id", "") or "").strip()
         data = args.get("data", "")
         timeout_val = args.get("timeout")
+        if action == "wait":
+            if timeout_val:
+                return polish_activity_label(f"aguardando processo ({int(timeout_val)}s)")
+            return polish_activity_label("aguardando processo")
+        if action == "poll":
+            return polish_activity_label("verificando processo")
         parts = [action]
         if sid:
             parts.append(sid[:16])
         if data:
-            parts.append(f'"{_oneline(data[:20])}"')
-        if timeout_val and action == "wait":
-            parts.append(f"{timeout_val}s")
+            parts.append(f'"{_oneline(str(data)[:20])}"')
         return " ".join(parts) if parts else None
 
     if tool_name == "todo":

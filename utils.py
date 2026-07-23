@@ -1,10 +1,13 @@
 """Shared utility functions for Ector Agent."""
 
+import contextlib
+import errno
 import json
 import logging
 import os
 import stat
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Union
 from urllib.parse import urlparse
@@ -56,6 +59,123 @@ def _restore_file_mode(path: Path, mode: "int | None") -> None:
         os.chmod(path, mode)
     except OSError:
         pass
+
+
+def is_enospc_error(exc: BaseException) -> bool:
+    """True when *exc* indicates the filesystem is out of space."""
+    if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+        return True
+    message = str(exc).lower()
+    return "no space left on device" in message
+
+
+def format_enospc_write_hint(path: Union[str, Path]) -> str:
+    """User-facing guidance when persistence fails due to disk pressure."""
+    try:
+        from ector_constants import display_ector_home
+
+        home = display_ector_home()
+    except Exception:
+        home = "~/.ector"
+    target = Path(path)
+    return (
+        f"Sem espaço em disco para salvar {target.name} em {home}/. "
+        "Libere espaço no disco (verifique com `df -h`) e execute "
+        "`ector login` novamente. O Ector remove arquivos temporários "
+        "antigos automaticamente nas próximas tentativas de gravação."
+    )
+
+
+def prune_stale_tmp_files(
+    directory: Union[str, Path],
+    *,
+    patterns: tuple[str, ...] = (
+        "identity.json.tmp.*",
+        ".identity_*.tmp",
+        "*.tmp",
+    ),
+    max_age_seconds: float = 3600.0,
+) -> int:
+    """Delete stale temp files under *directory* to reclaim space."""
+    root = Path(directory)
+    if not root.is_dir():
+        return 0
+    cutoff = time.time() - max(0.0, max_age_seconds)
+    removed = 0
+    for pattern in patterns:
+        for candidate in root.glob(pattern):
+            try:
+                if not candidate.is_file():
+                    continue
+                if candidate.stat().st_mtime >= cutoff:
+                    continue
+                candidate.unlink()
+                removed += 1
+            except OSError:
+                continue
+    return removed
+
+
+def atomic_text_write(
+    path: Union[str, Path],
+    text: str,
+    *,
+    file_mode: "int | None" = 0o600,
+) -> None:
+    """Write UTF-8 text atomically with ENOSPC recovery."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    original_mode = _preserve_file_mode(path)
+
+    def _attempt_atomic() -> None:
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(path.parent),
+            prefix=f".{path.stem}_",
+            suffix=".tmp",
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, path)
+            _restore_file_mode(path, original_mode)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path)
+            raise
+
+    def _attempt_inplace() -> None:
+        with path.open("w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if file_mode is not None:
+            with contextlib.suppress(OSError):
+                os.chmod(path, original_mode if original_mode is not None else file_mode)
+
+    try:
+        _attempt_atomic()
+    except OSError as exc:
+        if not is_enospc_error(exc):
+            raise
+        prune_stale_tmp_files(path.parent)
+        try:
+            _attempt_atomic()
+        except OSError as retry_exc:
+            if not is_enospc_error(retry_exc):
+                raise
+            if path.exists():
+                _attempt_inplace()
+            else:
+                raise OSError(
+                    errno.ENOSPC,
+                    format_enospc_write_hint(path),
+                ) from retry_exc
+
+    if file_mode is not None and original_mode is None:
+        with contextlib.suppress(OSError):
+            os.chmod(path, file_mode)
 
 
 def atomic_json_write(

@@ -45,6 +45,7 @@ from urllib.parse import urlparse, parse_qs, urlunparse
 from openai import OpenAI
 
 from agent.credential_pool import load_pool
+from agent.models_dev import get_model_info
 from ector_constants import OPENROUTER_BASE_URL
 from utils import base_url_host_matches, base_url_hostname, normalize_proxy_env_vars
 
@@ -1984,6 +1985,9 @@ def get_async_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Di
 
 _VISION_AUTO_PROVIDER_ORDER = (
     "openrouter",
+    "openai-codex",
+    "anthropic",
+    "custom",
 )
 
 
@@ -2011,9 +2015,9 @@ def _strict_vision_backend_available(provider: str) -> bool:
 def get_available_vision_backends() -> List[str]:
     """Return the currently available vision backends in auto-selection order.
 
-    Order: active provider → OpenRouter → stop.  This is the single
-    source of truth for setup, tool gating, and runtime auto-routing of
-    vision tasks.
+    Order: active provider → OpenRouter → Codex → Anthropic → custom/local → stop.
+    This is the single source of truth for setup, tool gating, and runtime
+    auto-routing of vision tasks.
     """
     available: List[str] = []
     # 1. Active provider — if the user configured a provider, try it first.
@@ -2026,7 +2030,7 @@ def get_available_vision_backends() -> List[str]:
             client, _ = resolve_provider_client(main_provider, _read_main_model())
             if client is not None:
                 available.append(main_provider)
-    # 2. OpenRouter — skip if already covered by main provider.
+    # 2. Documented auto-chain fallbacks (skip already covered).
     for p in _VISION_AUTO_PROVIDER_ORDER:
         if p not in available and _strict_vision_backend_available(p):
             available.append(p)
@@ -2077,7 +2081,10 @@ def resolve_vision_provider_client(
 
     if requested == "auto":
         # Vision auto-detection order:
-        #   1. User's main provider + main model (including aggregators).
+        #   1. User's main provider + main model (including aggregators),
+        #      but only when the model is confirmed (or unknown) to support
+        #      vision — otherwise a text-only main model (e.g. deepseek-v4-flash)
+        #      silently "resolves" a client that then rejects every image.
         #      _PROVIDER_VISION_MODELS provides per-provider vision model
         #      overrides when the provider has a dedicated multimodal model
         #      that differs from the chat model (e.g. xiaomi → mimo-v2-omni,
@@ -2088,16 +2095,35 @@ def resolve_vision_provider_client(
         main_model = _read_main_model()
         if main_provider and main_provider not in ("auto", ""):
             vision_model = _PROVIDER_VISION_MODELS.get(main_provider, main_model)
-            rpc_client, rpc_model = resolve_provider_client(
-                main_provider, vision_model,
-                api_mode=resolved_api_mode)
-            if rpc_client is not None:
+            model_confirmed_vision = main_provider in _PROVIDER_VISION_MODELS
+            if not model_confirmed_vision:
+                try:
+                    info = get_model_info(main_provider, vision_model)
+                    # Unknown to models.dev (custom/self-hosted models): keep
+                    # the historical "assume it can" behavior rather than
+                    # blocking setups the registry doesn't catalog.
+                    model_confirmed_vision = (
+                        info.supports_vision() if info is not None else True
+                    )
+                except Exception:
+                    model_confirmed_vision = True
+            if model_confirmed_vision:
+                rpc_client, rpc_model = resolve_provider_client(
+                    main_provider, vision_model,
+                    api_mode=resolved_api_mode)
+                if rpc_client is not None:
+                    logger.info(
+                        "Vision auto-detect: using main provider %s (%s)",
+                        main_provider, rpc_model or vision_model,
+                    )
+                    return _finalize(
+                        main_provider, rpc_client, rpc_model or vision_model)
+            else:
                 logger.info(
-                    "Vision auto-detect: using main provider %s (%s)",
-                    main_provider, rpc_model or vision_model,
+                    "Vision auto-detect: main provider %s model %s does not "
+                    "support vision (models.dev) — trying fallback backends",
+                    main_provider, vision_model,
                 )
-                return _finalize(
-                    main_provider, rpc_client, rpc_model or vision_model)
 
         # Fall back through aggregators (uses their dedicated vision model,
         # not the user's main model) when main provider has no client.

@@ -82,7 +82,11 @@ ECTOR_OVERLAYS: Dict[str, EctorOverlay] = {
     ),
     "zai": EctorOverlay(
         transport="openai_chat",
-        extra_env_vars=("GLM_API_KEY", "ZAI_API_KEY", "Z_AI_API_KEY"),
+        # ZHIPU_API_KEY is the var name z.ai's own docs / models.dev use —
+        # recognized alongside Ector's existing GLM_API_KEY/ZAI_API_KEY/
+        # Z_AI_API_KEY names so users following the official docs aren't
+        # left with an "unconfigured" provider.
+        extra_env_vars=("GLM_API_KEY", "ZAI_API_KEY", "Z_AI_API_KEY", "ZHIPU_API_KEY"),
         base_url_env_var="GLM_BASE_URL",
     ),
     "kimi-for-coding": EctorOverlay(

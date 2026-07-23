@@ -101,9 +101,9 @@ def ensure_bridge_deps(*, force: bool = False) -> tuple[bool, str]:
             return True, ""
 
         try:
-            from ector_cli.tui_launch import ensure_tui_node
+            from ector_cli.node_build import ensure_node_runtime
 
-            ensure_tui_node(PROJECT_ROOT)
+            ensure_node_runtime(PROJECT_ROOT)
         except Exception as exc:
             return False, f"Node.js não disponível: {exc}"
 

@@ -237,7 +237,7 @@ else
 fi
 
 # ============================================================================
-# Node.js + TUI (OpenTUI / Bun)
+# Node.js (web build / WhatsApp bridge)
 # ============================================================================
 if ! is_termux; then
     NB_HELPER="$SCRIPT_DIR/scripts/lib/node-bootstrap.sh"
@@ -261,11 +261,6 @@ if ! is_termux; then
         # shellcheck source=scripts/lib/install-runtime-check.sh
         source "$_RUNTIME_CHECK"
         verify_ector_install_core "$SCRIPT_DIR" || exit 1
-        ECTOR_HOME="${ECTOR_HOME:-$HOME/.ector}"
-        export PATH="$ECTOR_HOME/bun/bin:$ECTOR_HOME/node/bin:${PATH:-}"
-        install_ector_bun "$SCRIPT_DIR" || true
-        install_ector_tui_deps "$SCRIPT_DIR" || true
-        build_ector_tui "$SCRIPT_DIR" || true
         warn_missing_ui_prebuild "$SCRIPT_DIR" || true
     fi
 fi

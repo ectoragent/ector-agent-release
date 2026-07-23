@@ -98,6 +98,9 @@ _BILLING_PATTERNS = [
     "exceeded your current quota",
     "account is deactivated",
     "plan does not include",
+    # Anthropic Claude Code / OAuth via third-party apps (HTTP 400)
+    "third-party apps",
+    "draw from your extra usage",
 ]
 
 # Patterns that indicate rate limiting (transient, will resolve)

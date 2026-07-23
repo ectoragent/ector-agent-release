@@ -737,7 +737,10 @@ def _write_claude_code_credentials(
 
 def _resolve_claude_code_token_from_credentials(creds: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """Resolve a token from Claude Code credential files, refreshing if needed."""
-    creds = creds or read_claude_code_credentials()
+    if creds is None:
+        if _anthropic_source_suppressed("claude_code"):
+            return None
+        creds = read_claude_code_credentials()
     if creds and is_claude_code_token_valid(creds):
         logger.debug("Using Claude Code credentials (auto-detected)")
         return creds["accessToken"]
@@ -772,45 +775,69 @@ def _prefer_refreshable_claude_code_token(env_token: str, creds: Optional[Dict[s
     return None
 
 
+def _anthropic_source_suppressed(source: str) -> bool:
+    """Return True when the user disconnected/suppressed a credential source."""
+    try:
+        from ector_cli.auth import is_source_suppressed
+
+        return is_source_suppressed("anthropic", source)
+    except ImportError:
+        return False
+
+
 def resolve_anthropic_token() -> Optional[str]:
     """Resolve an Anthropic token from all available sources.
 
     Priority:
       1. ANTHROPIC_TOKEN env var (OAuth/setup token saved by Ector)
       2. CLAUDE_CODE_OAUTH_TOKEN env var
-      3. Claude Code credentials (~/.claude.json or ~/.claude/.credentials.json)
+      3. Ector-managed OAuth (~/.ector/.anthropic_oauth.json)
+      4. Claude Code credentials (~/.claude.json or ~/.claude/.credentials.json)
          — with automatic refresh if expired and a refresh token is available
-      4. ANTHROPIC_API_KEY env var (regular API key, or legacy fallback)
+      5. ANTHROPIC_API_KEY env var (regular API key, or legacy fallback)
+
+    Suppressed sources (``ector auth remove`` / dashboard disconnect) are skipped.
 
     Returns the token string or None.
     """
-    creds = read_claude_code_credentials()
+    creds = (
+        None
+        if _anthropic_source_suppressed("claude_code")
+        else read_claude_code_credentials()
+    )
 
     # 1. Ector-managed OAuth/setup token env var
     token = os.getenv("ANTHROPIC_TOKEN", "").strip()
-    if token:
-        preferred = _prefer_refreshable_claude_code_token(token, creds)
-        if preferred:
-            return preferred
+    if token and not _anthropic_source_suppressed("env:ANTHROPIC_TOKEN"):
+        if creds:
+            preferred = _prefer_refreshable_claude_code_token(token, creds)
+            if preferred:
+                return preferred
         return token
 
     # 2. CLAUDE_CODE_OAUTH_TOKEN (used by Claude Code for setup-tokens)
     cc_token = os.getenv("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
-    if cc_token:
-        preferred = _prefer_refreshable_claude_code_token(cc_token, creds)
-        if preferred:
-            return preferred
+    if cc_token and not _anthropic_source_suppressed("env:CLAUDE_CODE_OAUTH_TOKEN"):
+        if creds:
+            preferred = _prefer_refreshable_claude_code_token(cc_token, creds)
+            if preferred:
+                return preferred
         return cc_token
 
-    # 3. Claude Code credential file
+    # 3. Ector-managed PKCE OAuth file
+    if not _anthropic_source_suppressed("ector_pkce"):
+        ector_creds = read_ector_oauth_credentials()
+        if ector_creds and ector_creds.get("accessToken"):
+            return str(ector_creds["accessToken"])
+
+    # 4. Claude Code credential file
     resolved_claude_token = _resolve_claude_code_token_from_credentials(creds)
     if resolved_claude_token:
         return resolved_claude_token
 
-    # 4. Regular API key, or a legacy OAuth token saved in ANTHROPIC_API_KEY.
-    # This remains as a compatibility fallback for pre-migration Ector configs.
+    # 5. Regular API key, or a legacy OAuth token saved in ANTHROPIC_API_KEY.
     api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
-    if api_key:
+    if api_key and not _anthropic_source_suppressed("env:ANTHROPIC_API_KEY"):
         return api_key
 
     return None

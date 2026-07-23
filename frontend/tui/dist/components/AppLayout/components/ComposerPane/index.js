@@ -1,1 +1,0 @@
-export { ComposerPane } from './ComposerPane.js';

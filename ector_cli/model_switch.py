@@ -1138,18 +1138,14 @@ def list_authenticated_providers(
         # configured.
         if not has_creds and ector_slug == "anthropic":
             try:
-                from agent.anthropic_adapter import (
-                    read_claude_code_credentials,
-                    read_ector_oauth_credentials,
-                )
-                ector_creds = read_ector_oauth_credentials()
-                cc_creds = read_claude_code_credentials()
-                if (ector_creds and ector_creds.get("accessToken")) or \
-                   (cc_creds and cc_creds.get("accessToken")):
+                if _anthropic_oauth_available_for_picker():
                     has_creds = True
             except Exception as exc:
                 logger.debug("Anthropic external creds check failed: %s", exc)
         if not has_creds:
+            continue
+
+        if ector_slug == "anthropic" and not _anthropic_usable_for_picker():
             continue
 
         if ector_slug in {"copilot", "copilot-acp"}:
@@ -1217,6 +1213,9 @@ def list_authenticated_providers(
                 pass
 
         if not _cp_has_creds:
+            continue
+
+        if _cp.slug == "anthropic" and not _anthropic_usable_for_picker():
             continue
 
         _cp_model_ids = curated.get(_cp.slug, [])
@@ -1475,6 +1474,80 @@ def _custom_provider_display_name(raw_name: str) -> str:
     return display_name or (raw_name or "").strip()
 
 
+def _auth_store_configured_provider_slugs() -> set[str]:
+    """Provider slugs the user set up via the wizard (auth.json ``providers``)."""
+    slugs: set[str] = set()
+    try:
+        from ector_cli.auth import _load_auth_store
+
+        store = _load_auth_store()
+        section = store.get("providers")
+        if isinstance(section, dict):
+            for slug in section:
+                s = str(slug).strip().lower()
+                if s:
+                    slugs.add(s)
+    except Exception:
+        pass
+    return slugs
+
+
+def pin_provider_model_in_config(
+    cfg: dict,
+    provider_id: str,
+    model_id: str,
+) -> None:
+    """Persist a provider+model under ``providers:`` so the picker keeps it after switches."""
+    pid = str(provider_id or "").strip()
+    mid = str(model_id or "").strip()
+    if not pid or not mid:
+        return
+
+    providers = cfg.get("providers")
+    if not isinstance(providers, dict):
+        providers = {}
+        cfg["providers"] = providers
+
+    entry = providers.get(pid)
+    if not isinstance(entry, dict):
+        entry = {}
+        providers[pid] = entry
+
+    models = entry.get("models")
+    if not isinstance(models, dict):
+        models = {}
+        entry["models"] = models
+    if mid not in models:
+        models[mid] = {}
+
+    if not str(entry.get("default_model") or entry.get("model") or "").strip():
+        entry["default_model"] = mid
+
+
+def track_configured_provider(cfg: dict, provider_id: str) -> None:
+    """Append provider slug to ``model.configured_providers`` (picker history)."""
+    pid = str(provider_id or "").strip().lower()
+    if not pid or pid in ("", "auto"):
+        return
+
+    from ector_cli.models import normalize_provider
+
+    pid = normalize_provider(pid)
+    model_section = cfg.get("model")
+    if not isinstance(model_section, dict):
+        model_section = {}
+        cfg["model"] = model_section
+
+    history = model_section.get("configured_providers")
+    if not isinstance(history, list):
+        history = []
+
+    known = {str(item).strip().lower() for item in history if str(item).strip()}
+    if pid not in known:
+        history.append(pid)
+    model_section["configured_providers"] = history
+
+
 def _collect_configured_provider_slugs(
     cfg: dict | None,
     *,
@@ -1497,6 +1570,12 @@ def _collect_configured_provider_slugs(
         provider = str(model_section.get("provider") or "").strip().lower()
         if provider and provider not in ("", "auto"):
             slugs.add(normalize_provider(provider))
+        history = model_section.get("configured_providers")
+        if isinstance(history, list):
+            for item in history:
+                s = str(item or "").strip().lower()
+                if s:
+                    slugs.add(normalize_provider(s))
 
     user_providers = cfg.get("providers") or {}
     if isinstance(user_providers, dict):
@@ -1517,9 +1596,78 @@ def _collect_configured_provider_slugs(
             if display_name:
                 slugs.add(custom_provider_slug(display_name).lower())
 
+    slugs |= _auth_store_configured_provider_slugs()
+
     if current_provider:
         slugs.add(str(current_provider).strip().lower())
 
+    return slugs
+
+
+def _anthropic_oauth_available_for_picker() -> bool:
+    """True when Anthropic has usable OAuth credentials for the web picker."""
+    try:
+        from agent.anthropic_adapter import (
+            _anthropic_source_suppressed,
+            read_claude_code_credentials,
+            read_ector_oauth_credentials,
+        )
+
+        if not _anthropic_source_suppressed("ector_pkce"):
+            ector_creds = read_ector_oauth_credentials()
+            if ector_creds and ector_creds.get("accessToken"):
+                return True
+        if not _anthropic_source_suppressed("claude_code"):
+            cc_creds = read_claude_code_credentials()
+            if cc_creds and cc_creds.get("accessToken"):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _anthropic_usable_for_picker() -> bool:
+    """True when Anthropic has live credentials the web picker may offer."""
+    if _anthropic_oauth_available_for_picker():
+        return True
+    try:
+        from agent.anthropic_adapter import _anthropic_source_suppressed
+
+        if not _anthropic_source_suppressed("env:ANTHROPIC_API_KEY"):
+            if os.environ.get("ANTHROPIC_API_KEY", "").strip():
+                return True
+        from agent.credential_pool import load_pool
+
+        return load_pool("anthropic").has_credentials()
+    except Exception:
+        return False
+
+
+def _oauth_authenticated_picker_slugs() -> set[str]:
+    """Providers with active OAuth / external CLI credentials (web picker)."""
+    slugs: set[str] = set()
+    try:
+        from ector_cli import auth as hauth
+
+        oauth_checks = (
+            ("google-gemini-cli", hauth.get_gemini_oauth_auth_status),
+            ("qwen-oauth", hauth.get_qwen_auth_status),
+            ("openai-codex", hauth.get_codex_auth_status),
+        )
+        for slug, status_fn in oauth_checks:
+            try:
+                if status_fn().get("logged_in"):
+                    slugs.add(slug)
+            except Exception:
+                pass
+
+        try:
+            if _anthropic_oauth_available_for_picker():
+                slugs.add("anthropic")
+        except Exception:
+            pass
+    except Exception:
+        pass
     return slugs
 
 
@@ -1531,15 +1679,18 @@ def narrow_picker_providers_to_configured(
     current_model: str = "",
     current_provider: str = "",
 ) -> List[dict]:
-    """Keep only configured providers; show their full curated model lists.
+    """Keep explicitly configured providers plus active OAuth sessions.
 
     ``list_authenticated_providers`` returns every provider with credentials
-    (including stray env keys). The web composer picker limits rows to providers
-    declared in ``model.provider``, ``providers:``, or ``custom_providers``,
-    then lists the curated catalog for each — not unrelated authenticated
-    providers.
+    (including stray env keys). The web picker limits rows to providers
+    declared in ``model.provider``, ``model.configured_providers``,
+    ``providers:``, ``custom_providers``, auth-store setup, or with an active
+    OAuth / external CLI session — not unrelated env-key backends.
     """
-    from ector_cli.provider_model_catalog import get_recommended_models
+    from ector_cli.provider_model_catalog import (
+        get_recommended_models,
+        picker_models_for_provider,
+    )
 
     cfg = config if isinstance(config, dict) else {}
     if not cfg and isinstance(user_providers, dict):
@@ -1555,44 +1706,60 @@ def narrow_picker_providers_to_configured(
         cfg,
         current_provider=current_provider,
     )
+    active_provider = (current_provider or "").strip().lower()
+    oauth_slugs = _oauth_authenticated_picker_slugs()
+    configured_slugs |= oauth_slugs
+    if "anthropic" in configured_slugs and not _anthropic_usable_for_picker():
+        configured_slugs.discard("anthropic")
     if not configured_slugs:
         return []
 
     active_model = (current_model or "").strip()
-    active_provider = (current_provider or "").strip().lower()
     narrowed: List[dict] = []
 
-    for row in providers or []:
-        if not isinstance(row, dict):
+    provider_rows = [row for row in (providers or []) if isinstance(row, dict)]
+    present_slugs = {
+        str(row.get("slug") or "").strip().lower() for row in provider_rows
+    }
+    for slug in oauth_slugs:
+        if slug in present_slugs:
             continue
+        fallback = get_recommended_models(slug)
+        models = picker_models_for_provider(slug, fallback_models=fallback)
+        if not models:
+            continue
+        provider_rows.append(
+            {
+                "slug": slug,
+                "name": get_label(slug),
+                "is_current": slug == active_provider,
+                "is_user_defined": False,
+                "models": models,
+                "total_models": len(models),
+                "source": "oauth",
+            }
+        )
+
+    for row in provider_rows:
         slug = str(row.get("slug") or "").strip()
         if not slug:
             continue
         slug_l = slug.lower()
+        if slug_l == "anthropic" and not _anthropic_usable_for_picker():
+            continue
         if slug_l not in configured_slugs:
             continue
 
         ep_cfg = cfg_providers.get(slug) or cfg_providers.get(slug_l)
-        if isinstance(ep_cfg, dict):
-            models = _models_from_provider_config(ep_cfg)
-        else:
-            models = []
-
-        if not models:
-            models = [
-                str(m).strip()
-                for m in (row.get("models") or [])
-                if str(m).strip()
-            ]
-        if not models:
-            models = [
-                str(m).strip()
-                for m in get_recommended_models(slug)
-                if str(m).strip()
-            ]
-
-        if slug_l == active_provider and active_model and active_model not in models:
-            models = [active_model, *models]
+        config_models = (
+            _models_from_provider_config(ep_cfg) if isinstance(ep_cfg, dict) else []
+        )
+        models = picker_models_for_provider(
+            slug,
+            config_models=config_models,
+            fallback_models=row.get("models") or [],
+            active_model=active_model if slug_l == active_provider else "",
+        )
 
         if not models:
             continue
@@ -1604,3 +1771,39 @@ def narrow_picker_providers_to_configured(
 
     narrowed.sort(key=lambda r: (not r.get("is_current"), -int(r.get("total_models") or 0)))
     return narrowed
+
+
+def composer_model_is_available(
+    model: str,
+    provider: str = "",
+    *,
+    config: dict | None = None,
+) -> bool:
+    """True when model+provider would appear in the web composer picker."""
+    model = (model or "").strip()
+    provider = (provider or "").strip().lower()
+    if not model:
+        return False
+    try:
+        cfg = config if isinstance(config, dict) else {}
+        if not cfg:
+            from ector_cli.config import load_config
+
+            cfg = load_config() or {}
+
+        providers = narrow_picker_providers_to_configured(
+            list_authenticated_providers(max_models=50),
+            config=cfg,
+            current_model=model,
+            current_provider=provider,
+        )
+        for row in providers:
+            slug = str(row.get("slug") or "").strip().lower()
+            models = {str(m) for m in (row.get("models") or [])}
+            if model not in models:
+                continue
+            if not provider or slug == provider:
+                return True
+        return False
+    except Exception:
+        return True

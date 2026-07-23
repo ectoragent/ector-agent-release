@@ -10,12 +10,10 @@ Agente de IA autoaperfeiçoável — cria skills a partir da experiência, melho
 
 ```bash
 ./install.sh
-ector login          # identidade em https://ector.cc (obrigatório para o chat)
-ector                # chat interativo no terminal (CLI) em TTY
-ector chat           # idem (sem flags em TTY)
-ector chat -q "oi"   # abre o CLI e envia a mensagem (TTY)
-ector localhost      # painel web em http://ector.localhost:9000
-ector -z "oi"        # pergunta única para scripts (one-shot; só stdout)
+ector login          # identidade em https://ector.cc (obrigatório)
+ector                # abre o painel web (http://ector.localhost:9000)
+ector --up-online    # painel atrás de Nginx (VPS)
+ector kill           # encerra o painel em execução
 ```
 
 A configuração fica em `~/.ector/config.yaml`; chaves de API em `~/.ector/.env`. Para contribuir no código, veja [AGENTS.md](AGENTS.md).

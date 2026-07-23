@@ -89,8 +89,10 @@ from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY, PLATFORM_HINTS,
     MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE,
     ECTOR_AGENT_HELP_GUIDANCE,
-    EXPLICIT_ITERATIVE_WORKFLOW_GUIDANCE,
+    build_iterative_workflow_guidance,
+    LONG_RUNNING_TERMINAL_GUIDANCE,
     USER_FACING_RESPONSE_GUIDANCE,
+    build_visible_reasoning_guidance,
     build_git_commit_coauthor_guidance,
 )
 from agent.model_metadata import (
@@ -150,6 +152,7 @@ from agent.user_status import (
     history_compressed_retry_status,
     history_compressing_status,
     incomplete_response_fallback_status,
+    internet_unavailable_status,
     interrupt_during_reasoning_message,
     invalid_response_retry_status,
     rate_limit_fallback_status,
@@ -161,6 +164,13 @@ from agent.user_status import (
     stale_response_status,
     tool_stream_reconnect_status,
     unstable_connection_status,
+)
+from agent.network_errors import (
+    format_api_failure_final_response,
+    is_likely_internet_unavailable,
+    is_transient_connection_error,
+    offline_error_summary,
+    user_facing_api_error_summary,
 )
 from agent.display import (
     KawaiiSpinner, build_tool_preview as _build_tool_preview,
@@ -1248,6 +1258,7 @@ class AIAgent:
         # models to "give up" prematurely on complex tasks (#7915).
         self._budget_exhausted_injected = False
         self._budget_grace_call = False
+        self._tool_closure_grace_call = False
 
         # Activity tracking — updated on each API call, tool execution, and
         # stream chunk.  Used by the gateway timeout handler to report what the
@@ -1265,7 +1276,11 @@ class AIAgent:
         # Centralized logging — agent.log (INFO+) and errors.log (WARNING+)
         # both live under ~/.ector/logs/.  Idempotent, so gateway mode
         # (which creates a new AIAgent per message) won't duplicate handlers.
-        from ector_logging import setup_logging, setup_verbose_logging
+        from ector_logging import (
+            setup_logging,
+            setup_verbose_logging,
+            suppress_console_noise,
+        )
         setup_logging(ector_home=_ector_home)
 
         if self.verbose_logging:
@@ -1277,14 +1292,13 @@ class AIAgent:
                 # noise on the *console*. The TUI has its own rich display
                 # for status; logger INFO/WARNING messages just clutter it.
                 # File handlers (agent.log, errors.log) still capture everything.
-                for quiet_logger in [
+                suppress_console_noise([
                     'tools',               # all tools.* (terminal, browser, web, file, etc.)
                     'run_agent',            # agent runner internals
                     'trajectory_compressor',
                     'cron',                 # scheduler (only relevant in daemon mode)
                     'ector_cli',           # CLI helpers
-                ]:
-                    logging.getLogger(quiet_logger).setLevel(logging.ERROR)
+                ])
         
         # Internal stream callback (set during streaming TTS).
         # Initialized here so _vprint can reference it before run_conversation.
@@ -1561,6 +1575,7 @@ class AIAgent:
             disabled_toolsets=disabled_toolsets,
             quiet_mode=self.quiet_mode,
         )
+        self.tools = self._filter_tools_for_plan_mode(self.tools)
 
 
         # Show tool configuration and store valid tool names for validation
@@ -1824,6 +1839,12 @@ class AIAgent:
         compression_enabled = str(_compression_cfg.get("enabled", True)).lower() in ("true", "1", "yes")
         compression_target_ratio = float(_compression_cfg.get("target_ratio", 0.20))
         compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))
+        try:
+            compression_prune_threshold = float(_compression_cfg.get("prune_threshold", 0))
+        except (TypeError, ValueError):
+            compression_prune_threshold = 0.0
+        if compression_prune_threshold < 0:
+            compression_prune_threshold = 0.0
 
         # Read optional explicit context_length override for the auxiliary
         # compression model. Custom endpoints often cannot report this via
@@ -2002,6 +2023,7 @@ class AIAgent:
                 config_context_length=_config_context_length,
                 provider=self.provider,
                 api_mode=self.api_mode,
+                prune_threshold_percent=compression_prune_threshold,
             )
         self.compression_enabled = compression_enabled
 
@@ -2037,8 +2059,14 @@ class AIAgent:
 
         self._init_tool_routing(_agent_cfg)
 
+        try:
+            from agent.session_paths import resolve_session_cwd
+
+            _hint_cwd = resolve_session_cwd(self.session_id) or None
+        except Exception:
+            _hint_cwd = os.getenv("TERMINAL_CWD") or None
         self._subdirectory_hints = SubdirectoryHintTracker(
-            working_dir=os.getenv("TERMINAL_CWD") or None,
+            working_dir=_hint_cwd,
         )
         self._user_turn_count = 0
 
@@ -2378,8 +2406,8 @@ class AIAgent:
         calls are post-response housekeeping (``_mute_post_response``),
         all non-forced output is suppressed.
 
-        ``suppress_status_output`` is a stricter CLI automation mode used by
-        parseable single-query flows such as ``ector -z`` / ``ector chat -q`` (non-TTY). In that mode,
+        ``suppress_status_output`` is a stricter automation mode used when no
+        interactive UI is available. In that mode,
         all status/diagnostic prints routed through ``_vprint`` are suppressed
         so stdout stays machine-readable.
         """
@@ -3429,7 +3457,9 @@ class AIAgent:
         "4. ONLY CREATE A NEW SKILL when no existing skill reasonably covers the class. "
         "When you create one, name and scope it at the class level "
         "(\"react-i18n-setup\", not \"add-i18n-to-my-dashboard-app\"). The trigger "
-        "section must describe the class of situations, not this one session.\n\n"
+        "section must describe the class of situations, not this one session. "
+        "Never hardcode absolute repo paths — reference the current session workspace only. "
+        "Git/commit skills should be class-scoped (e.g. git-commit-push), not app-named.\n\n"
         "5. If you notice two existing skills that overlap, note it in your response "
         "so a future review can consolidate them. Do not consolidate now unless the "
         "overlap is obvious and low-risk.\n\n"
@@ -3451,7 +3481,8 @@ class AIAgent:
         "(\"desktop app build troubleshooting\", not \"fix my Tauri error\").\n"
         "  c. PREFER UPDATING/GENERALIZING an existing skill that covers the class.\n"
         "  d. ONLY CREATE A NEW SKILL if no existing one covers the class. Scope at "
-        "the class level, not this one session.\n"
+        "the class level, not this one session. Never hardcode absolute repo paths; "
+        "use the current session cwd. Git/commit skills: class names, not app names.\n"
         "  e. If you notice overlapping skills during the survey, note it so a future "
         "review can consolidate them.\n\n"
         "Only act if there's something genuinely worth saving. "
@@ -3730,6 +3761,7 @@ class AIAgent:
                 source=self.platform or "cli",
                 model=self.model,
                 user_id=getattr(self, "_user_id", None) or None,
+                parent_session_id=getattr(self, "_parent_session_id", None) or None,
             )
             start_idx = len(conversation_history) if conversation_history else 0
             flush_from = max(start_idx, self._last_flushed_db_idx)
@@ -3757,6 +3789,7 @@ class AIAgent:
                     reasoning_details=msg.get("reasoning_details") if role == "assistant" else None,
                     codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
                     codex_message_items=msg.get("codex_message_items") if role == "assistant" else None,
+                    timestamp=msg.get("timestamp"),
                 )
             self._last_flushed_db_idx = len(messages)
         except Exception as e:
@@ -4035,6 +4068,12 @@ class AIAgent:
         # Fallback: truncate the raw string but give more room than 200 chars
         status_code = getattr(error, "status_code", None)
         prefix = f"HTTP {status_code}: " if status_code else ""
+        if is_likely_internet_unavailable(error):
+            return offline_error_summary()
+        if is_transient_connection_error(error):
+            summary = user_facing_api_error_summary(error)
+            if summary:
+                return summary
         return f"{prefix}{raw[:500]}"
 
     def _mask_api_key_for_logs(self, key: Optional[str]) -> Optional[str]:
@@ -4877,6 +4916,14 @@ class AIAgent:
                     len(self._tool_router.all_tool_names),
                 )
 
+    def _filter_tools_for_plan_mode(self, tools):
+        try:
+            from tools.agent_mode import filter_tools_for_plan_mode
+
+            return filter_tools_for_plan_mode(tools or [], self.session_id or "")
+        except Exception:
+            return tools
+
     def _reload_tools_for_routing(self) -> None:
         """Refresh tool schemas and routing index after registry changes (MCP)."""
         try:
@@ -4885,6 +4932,7 @@ class AIAgent:
                 disabled_toolsets=getattr(self, "disabled_toolsets", None),
                 quiet_mode=True,
             )
+            self.tools = self._filter_tools_for_plan_mode(self.tools)
             self._inject_memory_provider_tools()
             self._inject_context_engine_tools()
             if self.tools:
@@ -5028,10 +5076,28 @@ class AIAgent:
 
         prompt_parts.append(USER_FACING_RESPONSE_GUIDANCE)
 
+        try:
+            from ector_cli.config import load_config
+
+            display = (load_config() or {}).get("display") or {}
+            if display.get("show_reasoning", True):
+                prompt_parts.append(build_visible_reasoning_guidance())
+        except Exception:
+            pass
+
         # Ector CLI/docs guidance (only when skills tools are loaded).
         if has_skills_index_tools(self.valid_tool_names):
             prompt_parts.append(ECTOR_AGENT_HELP_GUIDANCE)
-        prompt_parts.append(EXPLICIT_ITERATIVE_WORKFLOW_GUIDANCE)
+        try:
+            from tools.agent_mode import is_plan_mode
+
+            _skip_iterative = is_plan_mode(self.session_id or "")
+            _skip_tool_enforcement = _skip_iterative
+        except Exception:
+            _skip_iterative = False
+            _skip_tool_enforcement = False
+        if not _skip_iterative:
+            prompt_parts.append(build_iterative_workflow_guidance(self.valid_tool_names))
         if should_inject_git_coauthor_guidance(self.platform):
             _git_author_name, _git_author_email = _read_git_global_author()
             prompt_parts.append(
@@ -5050,6 +5116,8 @@ class AIAgent:
             tool_guidance.append(SESSION_SEARCH_GUIDANCE)
         if should_inject_skills_guidance(self.valid_tool_names):
             tool_guidance.append(SKILLS_GUIDANCE)
+        if "terminal" in self.valid_tool_names:
+            tool_guidance.append(LONG_RUNNING_TERMINAL_GUIDANCE)
         if tool_guidance:
             prompt_parts.append(" ".join(tool_guidance))
 
@@ -5074,7 +5142,7 @@ class AIAgent:
                 # "auto" or any unrecognised value — use hardcoded defaults
                 model_lower = (self.model or "").lower()
                 _inject = any(p in model_lower for p in TOOL_USE_ENFORCEMENT_MODELS)
-            if _inject:
+            if _inject and not _skip_tool_enforcement:
                 prompt_parts.append(TOOL_USE_ENFORCEMENT_GUIDANCE)
                 _model_lower = (self.model or "").lower()
                 # Google model operational guidance (conciseness, absolute
@@ -5118,6 +5186,8 @@ class AIAgent:
                 pass
 
         if has_skills_index_tools(self.valid_tool_names):
+            from agent.session_paths import resolve_session_cwd
+
             avail_toolsets = {
                 toolset
                 for toolset in (
@@ -5128,6 +5198,7 @@ class AIAgent:
             skills_prompt = build_skills_system_prompt(
                 available_tools=self.valid_tool_names,
                 available_toolsets=avail_toolsets,
+                session_cwd=resolve_session_cwd(self.session_id),
             )
         else:
             skills_prompt = ""
@@ -5135,11 +5206,11 @@ class AIAgent:
             prompt_parts.append(skills_prompt)
 
         if not self.skip_context_files:
-            # Use TERMINAL_CWD for context file discovery when set (gateway
-            # mode).  The gateway process runs from the ector-agent install
-            # dir, so os.getcwd() would pick up the repo's AGENTS.md and
-            # other dev files — inflating token usage by ~10k for no benefit.
-            _context_cwd = os.getenv("TERMINAL_CWD") or None
+            # Prefer per-session cwd — TERMINAL_CWD is process-global and may
+            # belong to another concurrent web chat.
+            from agent.session_paths import resolve_session_cwd
+
+            _context_cwd = resolve_session_cwd(self.session_id) or None
             context_files_prompt = build_context_files_prompt(
                 cwd=_context_cwd, skip_soul=_soul_loaded)
             if context_files_prompt:
@@ -6778,28 +6849,20 @@ class AIAgent:
                 # Accumulate text content — fire callback only when no tool calls
                 if delta and delta.content:
                     content_parts.append(delta.content)
-                    if not tool_calls_acc:
+                    _stream_preamble = (
+                        not tool_calls_acc
+                        or (self.platform or "").lower() == "web"
+                    )
+                    if _stream_preamble:
                         _fire_first_delta()
                         self._fire_stream_delta(delta.content)
                         deltas_were_sent["yes"] = True
-                    else:
-                        # Tool calls suppress regular content streaming (avoids
-                        # displaying chatty "I'll use the tool..." text alongside
-                        # tool calls).  But reasoning tags embedded in suppressed
-                        # content should still reach the display — otherwise the
-                        # reasoning box only appears as a post-response fallback,
-                        # rendering it confusingly after the already-streamed
-                        # response.  Route suppressed content through the stream
-                        # delta callback so its tag extraction can fire the
-                        # reasoning display.  Non-reasoning text is harmlessly
-                        # suppressed by the CLI's _stream_delta when the stream
-                        # box is already closed (tool boundary flush).
-                        if self.stream_delta_callback:
-                            try:
-                                self.stream_delta_callback(delta.content)
-                                self._record_streamed_assistant_text(delta.content)
-                            except Exception:
-                                pass
+                    elif self.stream_delta_callback:
+                        try:
+                            self.stream_delta_callback(delta.content)
+                            self._record_streamed_assistant_text(delta.content)
+                        except Exception:
+                            pass
 
                 # Accumulate tool call deltas — notify display on first name
                 if delta and delta.tool_calls:
@@ -6979,7 +7042,14 @@ class AIAgent:
                             delta_type = getattr(delta, "type", None)
                             if delta_type == "text_delta":
                                 text = getattr(delta, "text", "")
-                                if text and not has_tool_use:
+                                _stream_preamble = (
+                                    text
+                                    and (
+                                        not has_tool_use
+                                        or (self.platform or "").lower() == "web"
+                                    )
+                                )
+                                if _stream_preamble:
                                     _fire_first_delta()
                                     self._fire_stream_delta(text)
                                     deltas_were_sent["yes"] = True
@@ -7813,6 +7883,7 @@ class AIAgent:
             vision_source, cleanup_path = self._materialize_data_url_for_vision(vision_source)
 
         description = ""
+        vision_ok = False
         try:
             from tools.vision_tools import vision_analyze_tool
 
@@ -7820,7 +7891,12 @@ class AIAgent:
                 vision_analyze_tool(image_url=vision_source, user_prompt=analysis_prompt)
             )
             result = json.loads(result_json) if isinstance(result_json, str) else {}
-            description = (result.get("analysis") or "").strip()
+            if isinstance(result, dict) and result.get("success"):
+                description = (result.get("analysis") or "").strip()
+                vision_ok = bool(description)
+            elif isinstance(result, dict):
+                # Do not treat error payloads as image descriptions.
+                description = ""
         except Exception as e:
             description = f"Image analysis failed: {e}"
         finally:
@@ -7830,12 +7906,26 @@ class AIAgent:
                 except OSError:
                     pass
 
+        if not vision_ok:
+            local_source = vision_source
+            local_path = Path(os.path.expanduser(str(local_source or "")))
+            if local_path.is_file():
+                try:
+                    from tools.vision_tools import _local_image_analysis
+
+                    local = _local_image_analysis(local_path)
+                    if local and local.get("analysis"):
+                        description = str(local["analysis"]).strip()
+                        vision_ok = True
+                except Exception:
+                    pass
+
         if not description:
             description = "Image analysis failed."
 
         from agent.vision_prompts import format_image_context_block, format_image_context_failed
 
-        if description and description != "Image analysis failed.":
+        if vision_ok and description and description != "Image analysis failed.":
             note = format_image_context_block(description, vision_source)
         else:
             note = format_image_context_failed(vision_source)
@@ -8691,31 +8781,44 @@ class AIAgent:
 
         if self._session_db:
             try:
-                # Propagate title to the new session with auto-numbering
-                old_title = self._session_db.get_session_title(self.session_id)
-                # Trigger memory extraction on the old session before it rotates.
-                self.commit_memory_session(messages)
-                self._session_db.end_session(self.session_id, "compression")
-                old_session_id = self.session_id
-                self.session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
-                # Update session_log_file to point to the new session's JSON file
-                self.session_log_file = self.logs_dir / f"session_{self.session_id}.json"
-                self._session_db.create_session(
-                    session_id=self.session_id,
-                    source=self.platform or os.environ.get("ECTOR_SESSION_SOURCE", "cli"),
-                    model=self.model,
-                    parent_session_id=old_session_id,
-                )
-                # Auto-number the title for the continuation session
-                if old_title:
-                    try:
-                        new_title = self._session_db.get_next_title_in_lineage(old_title)
-                        self._session_db.set_session_title(self.session_id, new_title)
-                    except (ValueError, Exception) as e:
-                        logger.debug("Could not propagate title on compression: %s", e)
-                self._session_db.update_system_prompt(self.session_id, new_system_prompt)
-                # Reset flush cursor — new session starts with no messages written
-                self._last_flushed_db_idx = 0
+                platform_key = (self.platform or "").lower()
+                # Web dashboard resumes by stable URL session id. Splitting the
+                # SQLite row (CLI/gateway behaviour) writes post-compress traffic
+                # to a tip child; the next /api/chat/send reloads the root and
+                # drops context. Keep the same id and rewrite messages instead.
+                if platform_key == "web":
+                    self.commit_memory_session(messages)
+                    self._session_db.clear_messages(self.session_id)
+                    self._session_db.update_system_prompt(
+                        self.session_id, new_system_prompt
+                    )
+                    self._last_flushed_db_idx = 0
+                else:
+                    # Propagate title to the new session with auto-numbering
+                    old_title = self._session_db.get_session_title(self.session_id)
+                    # Trigger memory extraction on the old session before it rotates.
+                    self.commit_memory_session(messages)
+                    self._session_db.end_session(self.session_id, "compression")
+                    old_session_id = self.session_id
+                    self.session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+                    # Update session_log_file to point to the new session's JSON file
+                    self.session_log_file = self.logs_dir / f"session_{self.session_id}.json"
+                    self._session_db.create_session(
+                        session_id=self.session_id,
+                        source=self.platform or os.environ.get("ECTOR_SESSION_SOURCE", "cli"),
+                        model=self.model,
+                        parent_session_id=old_session_id,
+                    )
+                    # Auto-number the title for the continuation session
+                    if old_title:
+                        try:
+                            new_title = self._session_db.get_next_title_in_lineage(old_title)
+                            self._session_db.set_session_title(self.session_id, new_title)
+                        except (ValueError, Exception) as e:
+                            logger.debug("Could not propagate title on compression: %s", e)
+                    self._session_db.update_system_prompt(self.session_id, new_system_prompt)
+                    # Reset flush cursor — new session starts with no messages written
+                    self._last_flushed_db_idx = 0
             except Exception as e:
                 logger.warning("Session DB compression split failed — new session will NOT be indexed: %s", e)
 
@@ -8769,6 +8872,25 @@ class AIAgent:
         )
         return compressed, new_system_prompt
 
+    def _deliver_assistant_preamble_before_tools(self, assistant_message) -> None:
+        """Push assistant preamble to stream/interim consumers before tool cards."""
+        raw = getattr(assistant_message, "content", None)
+        if raw is None and isinstance(assistant_message, dict):
+            raw = assistant_message.get("content")
+        visible = self._strip_think_blocks(raw or "").strip()
+        if not visible or visible == "(empty)":
+            return
+        if self._interim_content_was_streamed(visible):
+            return
+        cb = getattr(self, "interim_assistant_callback", None)
+        if cb is not None:
+            try:
+                cb(visible, already_streamed=False)
+            except Exception:
+                logger.debug("interim preamble delivery failed", exc_info=True)
+        elif self._has_stream_consumers():
+            self._fire_stream_delta(visible if visible.endswith("\n") else f"{visible}\n\n")
+
     def _execute_tool_calls(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Execute tool calls from the assistant message and append results to messages.
 
@@ -8781,6 +8903,7 @@ class AIAgent:
         # Allow _vprint during tool execution even with stream consumers
         self._executing_tools = True
         try:
+            self._deliver_assistant_preamble_before_tools(assistant_message)
             if not _should_parallelize_tool_batch(tool_calls):
                 return self._execute_tool_calls_sequential(
                     assistant_message, messages, effective_task_id, api_call_count
@@ -8811,6 +8934,33 @@ class AIAgent:
             parent_agent=self,
         )
 
+    def _plan_mode_block_message(
+        self,
+        function_name: str,
+        function_args: dict,
+    ) -> Optional[str]:
+        try:
+            from tools.agent_mode import get_plan_mode_block_message
+
+            return get_plan_mode_block_message(
+                self.session_id or "",
+                function_name,
+                function_args,
+                platform=getattr(self, "platform", None),
+            )
+        except Exception:
+            return None
+
+    def _plan_mode_block_result(
+        self,
+        function_name: str,
+        function_args: dict,
+    ) -> Optional[str]:
+        block = self._plan_mode_block_message(function_name, function_args)
+        if block is None:
+            return None
+        return json.dumps({"error": block}, ensure_ascii=False)
+
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
                      tool_call_id: Optional[str] = None, messages: list = None) -> str:
         """Invoke a single tool and return the result string. No display logic.
@@ -8832,6 +8982,9 @@ class AIAgent:
             return json.dumps({"error": block_message}, ensure_ascii=False)
 
         function_name = canonical_wiser_tool_name(function_name)
+        plan_block = self._plan_mode_block_result(function_name, function_args)
+        if plan_block is not None:
+            return plan_block
         self._note_tool_execution(function_name)
 
         if function_name == "todo":
@@ -8851,6 +9004,13 @@ class AIAgent:
                 limit=function_args.get("limit", 3),
                 db=self._session_db,
                 current_session_id=self.session_id,
+            )
+        elif function_name == "mark_chapter":
+            from tools.mark_chapter_tool import mark_chapter as _mark_chapter
+            return _mark_chapter(
+                title=function_args.get("title", ""),
+                db=self._session_db,
+                session_id=self.session_id,
             )
         elif function_name == "memory":
             target = function_args.get("target", "memory")
@@ -8900,6 +9060,7 @@ class AIAgent:
                 session_id=self.session_id or "",
                 enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
                 skip_pre_tool_call_hook=True,
+                platform=self.platform,
             )
 
     @staticmethod
@@ -9275,6 +9436,9 @@ class AIAgent:
             except Exception:
                 pass
 
+            if _block_msg is None:
+                _block_msg = self._plan_mode_block_message(function_name, function_args)
+
             if _block_msg is not None:
                 # Tool blocked by plugin policy — skip counter resets.
                 # Execution is handled below in the tool dispatch chain.
@@ -9377,6 +9541,14 @@ class AIAgent:
                 tool_duration = time.time() - tool_start_time
                 if self._should_emit_quiet_tool_messages():
                     self._vprint(f"  {_get_cute_tool_message_impl('session_search', function_args, tool_duration, result=function_result)}")
+            elif function_name == "mark_chapter":
+                from tools.mark_chapter_tool import mark_chapter as _mark_chapter
+                function_result = _mark_chapter(
+                    title=function_args.get("title", ""),
+                    db=self._session_db,
+                    session_id=self.session_id,
+                )
+                tool_duration = time.time() - tool_start_time
             elif function_name == "memory":
                 target = function_args.get("target", "memory")
                 from model_tools import _run_async
@@ -9514,6 +9686,7 @@ class AIAgent:
                         session_id=self.session_id or "",
                         enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
                         skip_pre_tool_call_hook=True,
+                        platform=self.platform,
                     )
                     _spinner_result = function_result
                 except Exception as tool_error:
@@ -9534,6 +9707,7 @@ class AIAgent:
                         session_id=self.session_id or "",
                         enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
                         skip_pre_tool_call_hook=True,
+                        platform=self.platform,
                     )
                 except Exception as tool_error:
                     function_result = f"Error executing tool '{function_name}': {tool_error}"
@@ -9637,6 +9811,96 @@ class AIAgent:
             self._apply_pending_steer_to_tool_results(messages, num_tools_seq)
 
 
+
+    def _handle_tool_closure_grace(
+        self, messages: list, effective_task_id: str
+    ) -> str | None:
+        """One grace API call when the loop ends with pending tool results."""
+        nudge = (
+            "As ferramentas acima terminaram mas você não respondeu. "
+            "Analise os resultados (incluindo falhas ou interrupções) e continue: "
+            "explique o estado atual, proponha contramedidas concretas e "
+            "execute o próximo passo se apropriado."
+        )
+        messages.append({"role": "user", "content": nudge})
+        self._emit_status(
+            "↻ Ferramentas concluídas sem resposta — pedindo continuação ao modelo"
+        )
+
+        _needs_sanitize = self._should_sanitize_tool_calls()
+        api_messages = []
+        for msg in messages:
+            api_msg = msg.copy()
+            self._copy_reasoning_content_for_api(msg, api_msg)
+            for internal_field in ("reasoning", "finish_reason", "_thinking_prefill"):
+                api_msg.pop(internal_field, None)
+            if _needs_sanitize:
+                self._sanitize_tool_calls_for_strict_api(api_msg)
+            api_messages.append(api_msg)
+
+        effective_system = self._cached_system_prompt or ""
+        if self.ephemeral_system_prompt:
+            effective_system = (
+                effective_system + "\n\n" + self.ephemeral_system_prompt
+            ).strip()
+        if effective_system:
+            api_messages = [{"role": "system", "content": effective_system}] + api_messages
+        if self.prefill_messages:
+            sys_offset = 1 if effective_system else 0
+            for idx, pfm in enumerate(self.prefill_messages):
+                api_messages.insert(sys_offset + idx, pfm.copy())
+
+        try:
+            if self.api_mode == "codex_responses":
+                codex_kwargs = self._build_api_kwargs(api_messages)
+                response = self._run_codex_stream(codex_kwargs)
+                _transport = self._get_transport()
+                assistant_message = _transport.normalize_response(response)
+            elif self.api_mode == "anthropic_messages":
+                _transport = self._get_transport()
+                _ant_kw = _transport.build_kwargs(
+                    model=self.model,
+                    messages=self._prepare_anthropic_messages_for_api(api_messages),
+                    tools=self._get_effective_tools(),
+                    max_tokens=self.max_tokens,
+                    reasoning_config=self.reasoning_config,
+                    is_oauth=self._is_anthropic_oauth,
+                    preserve_dots=self._anthropic_preserve_dots(),
+                )
+                response = self._anthropic_messages_create(_ant_kw)
+                assistant_message = _transport.normalize_response(
+                    response, strip_tool_prefix=self._is_anthropic_oauth
+                )
+            else:
+                kwargs = self._build_api_kwargs(api_messages)
+                response = self._ensure_primary_openai_client(
+                    reason="tool_closure_grace"
+                ).chat.completions.create(**kwargs)
+                assistant_message = self._get_transport().normalize_response(response)
+
+            tool_calls = getattr(assistant_message, "tool_calls", None) or []
+            content = (getattr(assistant_message, "content", None) or "").strip()
+            if tool_calls:
+                interim = self._build_assistant_message(assistant_message, "tool_calls")
+                messages.append(interim)
+                self._execute_tool_calls(
+                    assistant_message, messages, effective_task_id, api_call_count=0
+                )
+                return None
+            if content:
+                if "<think>" in content:
+                    content = re.sub(
+                        r"<think>.*?</think>\s*",
+                        "",
+                        content,
+                        flags=re.DOTALL,
+                    ).strip()
+                if content:
+                    messages.append({"role": "assistant", "content": content})
+                    return content
+        except Exception as exc:
+            logging.warning("tool closure grace failed: %s", exc)
+        return None
 
     def _handle_max_iterations(self, messages: list, api_call_count: int) -> str:
         """Request a summary when max iterations are reached. Returns the final response text."""
@@ -9886,6 +10150,7 @@ class AIAgent:
         self._codex_incomplete_retries = 0
         self._thinking_prefill_retries = 0
         self._post_tool_empty_retried = False
+        self._tool_closure_grace_attempted = False
         self._last_content_with_tools = None
         self._last_content_tools_all_housekeeping = False
         self._mute_post_response = False
@@ -9958,8 +10223,11 @@ class AIAgent:
                 _should_review_memory = True
                 self._turns_since_memory = 0
 
-        # Add user message
-        user_msg = {"role": "user", "content": user_message}
+        # Add user message. Stamped with the real turn-start time — flushing to
+        # the session DB happens once at turn exit, so without this both the
+        # user and assistant rows would get ~the same time.time(), collapsing
+        # the dashboard's "turn duration" display to its 1s floor.
+        user_msg = {"role": "user", "content": user_message, "timestamp": time.time()}
         messages.append(user_msg)
         current_turn_user_idx = len(messages) - 1
         self._persist_user_message_idx = current_turn_user_idx
@@ -9988,6 +10256,31 @@ class AIAgent:
                         stored_prompt = session_row.get("system_prompt") or None
                 except Exception:
                     pass  # Fall through to build fresh
+
+            # Stale snapshot after openProject / landing bind: the SQLite prompt
+            # may still say home while resolve_session_cwd already points at the
+            # real project — rebuilding avoids the model "delirating" on /Users/…
+            if stored_prompt and self.session_id:
+                try:
+                    from agent.session_paths import resolve_session_cwd
+
+                    current_cwd = resolve_session_cwd(self.session_id)
+                    if current_cwd:
+                        current_resolved = str(
+                            Path(current_cwd).expanduser().resolve()
+                        )
+                        marker = (
+                            f"Terminal e ferramentas de arquivo rodam em: "
+                            f"`{current_resolved}`"
+                        )
+                        if marker not in stored_prompt:
+                            # Also accept the path with a different resolve form
+                            # (symlink) by checking basename + that home isn't
+                            # the only cwd claim.
+                            if current_resolved not in stored_prompt:
+                                stored_prompt = None
+                except Exception:
+                    pass
 
             if stored_prompt:
                 # Continuing session — reuse the exact system prompt from
@@ -10489,6 +10782,7 @@ class AIAgent:
             
             api_start_time = time.time()
             retry_count = 0
+            consecutive_offline_errors = 0
             max_retries = self._api_max_retries
             primary_recovery_attempted = False
             max_compression_attempts = 3
@@ -11387,6 +11681,13 @@ class AIAgent:
                     error_type = type(api_error).__name__
                     error_msg = str(api_error).lower()
                     _error_summary = self._summarize_api_error(api_error)
+                    if is_likely_internet_unavailable(api_error):
+                        consecutive_offline_errors += 1
+                        self._emit_status(internet_unavailable_status())
+                        if consecutive_offline_errors >= 2:
+                            retry_count = max_retries
+                    elif is_transient_connection_error(api_error):
+                        consecutive_offline_errors = 0
                     logger.warning(
                         "API call failed (attempt %s/%s) error_type=%s %s summary=%s",
                         retry_count,
@@ -11919,16 +12220,11 @@ class AIAgent:
                                 api_kwargs, reason="max_retries_exhausted", error=api_error,
                             )
                         self._persist_session(messages, conversation_history)
-                        _final_response = f"A chamada de API falhou após {max_retries} tentativas: {_final_summary}"
-                        if _is_stream_drop:
-                            _final_response += (
-                                "\n\nThe provider's stream connection keeps "
-                                "dropping — this often happens when generating "
-                                "very large tool call responses (e.g. write_file "
-                                "with long content). Try asking me to use "
-                                "execute_code with Python's open() for large "
-                                "files, or to write in smaller sections."
-                            )
+                        _final_response = format_api_failure_final_response(
+                            api_error,
+                            max_retries=max_retries,
+                            stream_drop=_is_stream_drop,
+                        )
                         return {
                             "final_response": _final_response,
                             "messages": messages,
@@ -11950,6 +12246,8 @@ class AIAgent:
                                 except (TypeError, ValueError):
                                     pass
                     wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+                    if is_likely_internet_unavailable(api_error):
+                        wait_time = min(wait_time, 3.0)
                     if is_rate_limited:
                         self._emit_status(
                             rate_limit_pause_status(
@@ -12090,24 +12388,20 @@ class AIAgent:
                         self._vprint(f"{self.log_prefix}🤖 Assistant: {assistant_message.content[:100]}{'...' if len(assistant_message.content) > 100 else ''}")
 
                 # Notify progress callback of model's thinking (used by subagent
-                # delegation to relay the child's reasoning to the parent display).
+                # delegation to relay the child's first-line commentary to the parent).
+                # Never publish assistant *content* as reasoning.available — that
+                # text is user-facing narration (TEXT / interim). Emitting it as
+                # REASONING makes the web UI show the same line under «Pensou».
                 if (assistant_message.content and self.tool_progress_callback):
                     _think_text = assistant_message.content.strip()
                     # Strip reasoning XML tags that shouldn't leak to parent display
                     _think_text = re.sub(
                         r'</?(?:REASONING_SCRATCHPAD|think|reasoning)>', '', _think_text
                     ).strip()
-                    # For subagents: relay first line to parent display (existing behaviour).
-                    # For all agents with a structured callback: emit reasoning.available event.
                     first_line = _think_text.split('\n')[0][:80] if _think_text else ""
                     if first_line and getattr(self, '_delegate_depth', 0) > 0:
                         try:
                             self.tool_progress_callback("_thinking", first_line)
-                        except Exception:
-                            pass
-                    elif _think_text:
-                        try:
-                            self.tool_progress_callback("reasoning.available", "_thinking", _think_text[:500], None)
                         except Exception:
                             pass
                 
@@ -12491,6 +12785,18 @@ class AIAgent:
                             tools=self._get_effective_tools() or None,
                         )
 
+                    if (
+                        self.compression_enabled
+                        and hasattr(_compressor, "should_prune")
+                        and _compressor.should_prune(_real_tokens)
+                    ):
+                        pruned_messages, pruned_count = _compressor.prune_tool_results(
+                            messages,
+                        )
+                        if pruned_count:
+                            messages = pruned_messages
+                            self._session_messages = messages
+
                     if self.compression_enabled and _compressor.should_compress(_real_tokens):
                         self._safe_print("  ⟳ compacting context…")
                         messages, active_system_prompt = self._compress_context(
@@ -12864,6 +13170,20 @@ class AIAgent:
                     messages.append({"role": "assistant", "content": final_response})
                     break
         
+        if (
+            final_response is None
+            and not interrupted
+            and messages
+            and messages[-1].get("role") == "tool"
+            and api_call_count < self.max_iterations
+            and not self._tool_closure_grace_attempted
+        ):
+            self._tool_closure_grace_attempted = True
+            grace_text = self._handle_tool_closure_grace(messages, effective_task_id)
+            if grace_text and grace_text.strip():
+                final_response = grace_text.strip()
+                _turn_exit_reason = "tool_closure_grace"
+
         if final_response is None and (
             api_call_count >= self.max_iterations
             or self.iteration_budget.remaining <= 0

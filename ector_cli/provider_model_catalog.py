@@ -62,6 +62,10 @@ def _build_recommended_models_by_provider() -> Dict[str, List[str]]:
 # Recommended models for setup pickers (synced from ector_cli.models._PROVIDER_MODELS).
 RECOMMENDED_MODELS_BY_PROVIDER: Dict[str, List[str]] = _build_recommended_models_by_provider()
 
+WEB_PICKER_MAX_MODELS_PER_PROVIDER = 4
+# OAuth/native providers with a small curated lineup — show the full list.
+_PICKER_UNCAPPED_PROVIDERS = frozenset({"anthropic"})
+
 
 def get_recommended_models(provider_id: str) -> List[str]:
     pid = (provider_id or "").strip().lower()
@@ -96,6 +100,38 @@ def merge_recommended_first(
     for m in models:
         _add(m)
     return out
+
+
+def picker_models_for_provider(
+    provider_id: str,
+    *,
+    config_models: Sequence[str] | None = None,
+    fallback_models: Sequence[str] | None = None,
+    active_model: str = "",
+    max_models: int = WEB_PICKER_MAX_MODELS_PER_PROVIDER,
+) -> List[str]:
+    """Curated picker list: recommended first, then config/fallback, capped."""
+    pid = (provider_id or "").strip()
+    extra = [str(m).strip() for m in (config_models or []) if str(m).strip()]
+    curated = get_recommended_models(pid)
+
+    if len(extra) >= 2:
+        models = list(extra)
+    elif curated:
+        models = merge_recommended_first(pid, models=extra)
+    elif fallback_models:
+        models = merge_recommended_first(pid, models=list(fallback_models))
+    else:
+        models = list(extra)
+
+    active = (active_model or "").strip()
+    if active and active not in models:
+        models = [active, *models]
+
+    cap = 0 if pid.lower() in _PICKER_UNCAPPED_PROVIDERS else max_models
+    if cap > 0:
+        return models[:cap]
+    return models
 
 
 def build_setup_catalog_rows(*, provider_registry: Dict[str, Any]) -> List[Dict[str, Any]]:

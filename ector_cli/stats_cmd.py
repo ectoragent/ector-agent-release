@@ -191,7 +191,7 @@ def print_stats_report(report: Dict[str, Any]) -> None:
             console.print(f"[dim]Nenhuma sessão nos últimos {days} dias.[/dim]")
         console.print(f"[dim]{store_hint}[/dim]")
         console.print(
-            "[dim]Use [bold]ector chat[/bold] ou [bold]ector localhost[/bold] "
+            "[dim]Use [bold]ector[/bold] "
             "para gerar histórico analisável.[/dim]"
         )
         console.print(

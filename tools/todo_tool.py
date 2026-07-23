@@ -209,8 +209,9 @@ def check_todo_requirements() -> bool:
 TODO_SCHEMA = {
     "name": "todo",
     "description": (
-        "Manage your task list for the current session. Use for complex tasks "
-        "with 3+ steps or when the user provides multiple tasks. "
+        "Session task list for multi-step work. Use when the task has 3+ concrete, "
+        "verifiable steps or the user listed several deliverables. "
+        "Skip for trivial 1–2 step asks — just execute.\n\n"
         "Call with no parameters to read the current list.\n\n"
         "Writing:\n"
         "- Provide 'todos' array to create/update items\n"
@@ -218,10 +219,15 @@ TODO_SCHEMA = {
         "- merge=true: update existing items by id, add any new ones\n\n"
         "Each item: {id: string, content: string, "
         "status: pending|in_progress|completed|cancelled}\n"
-        "List order is priority. Only ONE item in_progress at a time.\n"
-        "Mark items completed immediately when done. If something fails, "
-        "cancel it and add a revised item.\n\n"
-        "Always returns the full current list."
+        "Rules:\n"
+        "- List order is priority. Exactly ONE item in_progress at a time.\n"
+        "- content must be a verifiable outcome "
+        "(e.g. 'AssembleRelease APK exits 0'), not vague intent "
+        "('improve build', 'check everything').\n"
+        "- Mark completed immediately when done. On failure: cancel the step "
+        "and add a revised one — do not leave dead in_progress items.\n"
+        "- Keep the active list short (prefer ≤8). Cancel or collapse stale steps.\n"
+        "- Always returns the full current list."
     ),
     "parameters": {
         "type": "object",
@@ -238,7 +244,10 @@ TODO_SCHEMA = {
                         },
                         "content": {
                             "type": "string",
-                            "description": "Task description"
+                            "description": (
+                                "Verifiable outcome for this step "
+                                "(what done looks like)"
+                            ),
                         },
                         "status": {
                             "type": "string",

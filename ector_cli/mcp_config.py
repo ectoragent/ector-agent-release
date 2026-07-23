@@ -567,10 +567,9 @@ def _mcp_tools_label(cfg: dict) -> str:
 
 def cmd_mcp_list(args=None):
     """Lista todos os servidores MCP configurados."""
-    from rich import box
     from rich.console import Console
-    from rich.panel import Panel
-    from rich.table import Table
+
+    from ector_cli.list_format import LIST_PRIMARY, ListColumn, render_list_page
 
     servers = _get_mcp_servers()
     console = Console()
@@ -578,93 +577,62 @@ def cmd_mcp_list(args=None):
     config_hint = f"{dhh}/config.yaml [dim]→ mcp_servers[/dim]"
 
     if not servers:
-        grid = Table.grid(padding=(0, 2))
-        grid.add_column(style="dim", justify="right", no_wrap=True)
-        grid.add_column()
-        grid.add_row("Estado", "[dim]nenhum servidor configurado[/dim]")
-        grid.add_row("Config", config_hint)
-
-        console.print()
-        console.print(
-            Panel(
-                grid,
-                title=f"[bold {_ECTOR_ACCENT}]Servidores MCP[/bold {_ECTOR_ACCENT}]",
-                border_style=_ECTOR_ACCENT,
-                padding=(1, 2),
+        render_list_page(
+            console,
+            title="Servidores MCP",
+            sections=[],
+            empty_message="Nenhum servidor configurado.",
+            empty_hint=(
+                f"[dim]Config:[/] {config_hint}\n"
+                "[dim]Próximos passos:[/] [bold]ector mcp add[/] · "
+                "[bold]ector mcp test <nome>[/]"
             ),
+            primary=LIST_PRIMARY,
         )
-        console.print()
         _print_mcp_examples(console)
-        console.print()
         _print_mcp_agent_note(console)
-        console.print()
-        console.print(
-            "[dim]Próximos passos: [bold]ector mcp test <nome>[/bold]  ·  "
-            "[bold]ector mcp configure <nome>[/bold][/dim]"
-        )
-        console.print()
         return
 
     enabled_count = sum(1 for cfg in servers.values() if _mcp_enabled(cfg))
     disabled_count = len(servers) - enabled_count
 
-    table = Table(
-        box=box.ROUNDED,
-        show_header=True,
-        header_style="bold",
-        expand=True,
-        padding=(0, 1),
-        border_style=_ECTOR_ACCENT,
-    )
-    table.add_column("Nome", style="bold", no_wrap=True, ratio=1, max_width=16)
-    table.add_column("Transporte", overflow="fold", ratio=3)
-    table.add_column("Ferramentas", no_wrap=True, min_width=14)
-    table.add_column("Estado", no_wrap=True, min_width=12)
-
+    rows = []
     for name, cfg in servers.items():
-        if _mcp_enabled(cfg):
-            status = "[green]ativado[/green]"
-        else:
-            status = "[dim]desativado[/dim]"
-        table.add_row(
-            name,
-            _mcp_transport_label(cfg),
-            _mcp_tools_label(cfg),
-            status,
-        )
+        status = "[green]Ativado[/]" if _mcp_enabled(cfg) else "[dim]Desativado[/]"
+        rows.append((name, _mcp_transport_label(cfg), _mcp_tools_label(cfg), status))
 
-    console.print()
-    console.print(
-        Panel(
-            table,
-            title=(
-                f"[bold {_ECTOR_ACCENT}]Servidores MCP[/bold {_ECTOR_ACCENT}] "
-                f"[dim]({enabled_count}/{len(servers)} ativos"
-                + (f", {disabled_count} desativado(s)" if disabled_count else "")
-                + ")[/dim]"
-            ),
-            subtitle=config_hint,
-            border_style=_ECTOR_ACCENT,
-            padding=(0, 1),
+    render_list_page(
+        console,
+        title="Servidores MCP",
+        subtitle=config_hint,
+        sections=[
+            (
+                "Configurados",
+                (
+                    ListColumn("Nome", style=f"bold {LIST_PRIMARY}", min_width=14, ratio=1),
+                    ListColumn("Transporte", overflow="fold", ratio=3),
+                    ListColumn("Ferramentas", no_wrap=True, min_width=14, ratio=1),
+                    ListColumn("Estado", no_wrap=True, min_width=12, ratio=1),
+                ),
+                rows,
+            )
+        ],
+        summary=f"[dim]{enabled_count} ativo(s), {disabled_count} desativado(s)[/]",
+        footer=(
+            "[dim]Gerir:[/] [bold]ector mcp add[/] · "
+            "[bold]ector mcp remove <nome>[/] · "
+            "[bold]ector mcp test <nome>[/] · "
+            "[bold]ector mcp configure <nome>[/]"
         ),
+        primary=LIST_PRIMARY,
     )
-    console.print()
     _print_mcp_agent_note(
         console,
         servers_configured=len(servers),
         servers_active=enabled_count,
     )
-    console.print()
-    console.print(
-        "[dim]Gerir: [bold]ector mcp add[/bold]  ·  "
-        "[bold]ector mcp remove <nome>[/bold]  ·  "
-        "[bold]ector mcp test <nome>[/bold]  ·  "
-        "[bold]ector mcp configure <nome>[/bold][/dim]"
-    )
     if enabled_count == 0:
-        console.print()
         _print_mcp_examples(console)
-    console.print()
 
 
 # ─── ector mcp test ──────────────────────────────────────────────────────────

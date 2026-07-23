@@ -102,10 +102,14 @@ def _print_rich(text: str) -> None:
 # ---------------------------------------------------------------------------
 
 def _cmd_list(_args) -> None:
+    from rich.console import Console
+
     from ector_cli.config import load_config
+    from ector_cli.list_format import LIST_PRIMARY, ListColumn, render_list_page
     from agent import shell_hooks
 
     specs = shell_hooks.iter_configured_hooks(load_config())
+    console = Console()
 
     if not specs:
         _print_rich(_empty_hooks_hint())
@@ -122,32 +126,42 @@ def _cmd_list(_args) -> None:
         if isinstance(e, dict)
     }
 
-    print(f"Configured shell hooks ({len(specs)} total):\n")
-
+    sections = []
     for event in sorted(by_event.keys()):
-        print(f"  [{event}]")
+        rows = []
         for spec in by_event[event]:
             is_approved = (spec.event, spec.command) in approved
-            status = "✔ allowed" if is_approved else "✖ not allowlisted"
-            matcher_part = f" matcher={spec.matcher!r}" if spec.matcher else ""
-            print(
-                f"    - {spec.command}{matcher_part} "
-                f"(timeout={spec.timeout}s, {status})"
+            status = "[green]Permitido[/]" if is_approved else "[yellow]Não listado[/]"
+            matcher_part = spec.matcher or "—"
+            rows.append(
+                (
+                    spec.command,
+                    matcher_part,
+                    f"{spec.timeout}s",
+                    status,
+                )
             )
+        sections.append(
+            (
+                event,
+                (
+                    ListColumn("Comando", style=f"bold {LIST_PRIMARY}", overflow="fold", ratio=3),
+                    ListColumn("Matcher", style="dim", overflow="fold", ratio=2),
+                    ListColumn("Timeout", no_wrap=True, min_width=8, ratio=1),
+                    ListColumn("Estado", no_wrap=True, min_width=14, ratio=1),
+                ),
+                rows,
+            )
+        )
 
-            if is_approved:
-                entry = shell_hooks.allowlist_entry_for(spec.event, spec.command)
-                if entry and entry.get("approved_at"):
-                    print(f"      approved_at: {entry['approved_at']}")
-                    mtime_now = shell_hooks.script_mtime_iso(spec.command)
-                    mtime_at = entry.get("script_mtime_at_approval")
-                    if mtime_now and mtime_at and mtime_now > mtime_at:
-                        print(
-                            f"      ▲ script modified since approval "
-                            f"(was {mtime_at}, now {mtime_now}) — "
-                            f"run `ector hooks doctor` to re-validate"
-                        )
-        print()
+    render_list_page(
+        console,
+        title="Shell hooks",
+        subtitle=f"{len(specs)} configurado(s)",
+        sections=sections,
+        footer="[dim]Validar:[/] [bold]ector hooks doctor[/] · [bold]ector hooks test <evento>[/]",
+        primary=LIST_PRIMARY,
+    )
 
 
 # ---------------------------------------------------------------------------

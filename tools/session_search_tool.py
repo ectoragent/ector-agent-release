@@ -717,8 +717,8 @@ def session_search(
 def check_session_search_requirements() -> bool:
     """Requires SQLite state database (auxiliary model only if summarize is enabled)."""
     try:
-        from ector_state import DEFAULT_DB_PATH
-        return DEFAULT_DB_PATH.parent.exists()
+        from ector_constants import get_ector_home
+        return get_ector_home().exists()
     except ImportError:
         return False
 

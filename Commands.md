@@ -6,23 +6,18 @@ Referência gerada a partir do código (`ector_cli/main.py`, `ector_cli/commands
 
 ## Uso sem subcomando
 
-Em TTY, `ector` (sem subcomando) abre o **chat interativo** (TUI Ink), equivalente ao fluxo de `ector chat` com as mesmas flags de topo quando aplicável.
+`ector` (sem subcomando) abre o **painel web** (`http://ector.localhost:9000`). Em SSH, só imprime a URL (sem abrir o browser).
 
-Atalhos úteis no nível raiz:
+Flags úteis no nível raiz:
 
-- `ector -z "prompt"` / `--oneshot` — uma pergunta, só a resposta no stdout
-- `ector -m / --model`, `ector --provider` — sobrescrevem modelo/provedor (com `-z` ou chat)
-- `ector --resume <id>`, `ector -c [nome]` — atalho para retomar sessão (roteado para `chat`)
+- `ector --up-online` — Nginx + TLS/BasicAuth para VPS (`--server-name`, `--listen-port`, `--tls`, …)
+- `ector kill` — encerra o painel em execução
+
+Para retomar uma sessão, use `ector sessions browse` ou abra `/chat` no painel.
 
 ---
 
 ## Subcomandos do CLI (`ector <subcomando>`)
-
-### `chat`
-
-- **TTY:** chat interativo (Ink TUI); `-q` / `--query` envia a mensagem ao abrir; `--image` anexa no arranque.
-- **Sem TTY:** `-q` / `--image` → one-shot (equivalente a `ector -z`; só stdout).
-- Flags: `-m`, `--provider`, `-t` / `--toolsets`, `-s` / `--skills`, `-z` / `--oneshot`, etc.
 
 ### `provider`
 
@@ -174,14 +169,9 @@ Servidor ACP (editores).
 
 - `list`, `use`, `create`, `delete`, `show`, `alias`, `rename`, `export`, `import`
 
-### `localhost`
+### `kill`
 
-Painel web em `/chat`; página **Canais** em `/channels` para configurar os canais suportados: Telegram, WhatsApp (QR), Discord e Slack.
-
-Opções de topo (`--port`, `--host`, `--no-open`, …). Subcomandos:
-
-- `kill`, `nginx-setup` (legado; equivalente a `--up-online`)
-- `--up-online` — Nginx + TLS/BasicAuth para VPS (`--server-name`, `--listen-port`, `--tls`, …)
+Encerra o painel web em execução (`--port`, padrão 9000). Também desabilita o site Nginx `ector-dashboard` no Linux, quando aplicável.
 
 ### `logs`
 

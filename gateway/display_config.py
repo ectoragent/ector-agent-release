@@ -32,7 +32,7 @@ from typing import Any
 
 _GLOBAL_DEFAULTS: dict[str, Any] = {
     "tool_progress": "all",
-    "show_reasoning": False,
+    "show_reasoning": True,
     "tool_preview_length": 0,
     "streaming": None,  # None = follow top-level streaming config
 }

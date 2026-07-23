@@ -2813,6 +2813,15 @@ def _source_matches(source: SkillSource, source_name: str) -> bool:
     return source.source_id() == normalized
 
 
+def is_cloud_managed_hub_entry(entry: Dict[str, Any]) -> bool:
+    """Skills instaladas via biblioteca na nuvem (Hub Ector), não fontes GitHub/hub."""
+    source = str(entry.get("source") or "").strip().lower()
+    if source == "ector-cloud":
+        return True
+    meta = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
+    return bool(meta.get("cloud_managed"))
+
+
 def check_for_skill_updates(
     name: Optional[str] = None,
     *,
@@ -2831,6 +2840,15 @@ def check_for_skill_updates(
 
     results: List[dict] = []
     for entry in installed:
+        if is_cloud_managed_hub_entry(entry):
+            results.append({
+                "name": entry.get("name", ""),
+                "identifier": entry.get("identifier", ""),
+                "source": entry.get("source", ""),
+                "status": "cloud_library",
+            })
+            continue
+
         identifier = entry.get("identifier", "")
         source_name = entry.get("source", "")
         candidate_sources = [src for src in sources if _source_matches(src, source_name)] or sources
@@ -2867,6 +2885,33 @@ def check_for_skill_updates(
         })
 
     return results
+
+
+def collect_installed_skill_update_names(
+    hub_installed: Optional[Dict[str, Dict[str, Any]]] = None,
+    *,
+    lock: Optional[HubLockFile] = None,
+    auth: Optional[GitHubAuth] = None,
+) -> set[str]:
+    """Nomes de skills instaladas com atualização pendente (hub GitHub ou biblioteca na nuvem)."""
+    lock = lock or HubLockFile()
+    installed_map = hub_installed or {entry["name"]: entry for entry in lock.list_installed()}
+    pending: set[str] = set()
+
+    for entry in check_for_skill_updates(lock=lock, auth=auth):
+        if entry.get("status") == "update_available":
+            name = str(entry.get("name") or "").strip()
+            if name:
+                pending.add(name)
+
+    try:
+        from tools.cloud_skills_sync import collect_cloud_skill_update_names
+
+        pending.update(collect_cloud_skill_update_names(installed_map))
+    except Exception:
+        logger.debug("collect_installed_skill_update_names cloud check failed", exc_info=True)
+
+    return pending
 
 
 # ---------------------------------------------------------------------------

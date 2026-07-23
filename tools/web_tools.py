@@ -46,7 +46,8 @@ import logging
 import os
 import re
 import asyncio
-from typing import List, Dict, Any, Optional
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from typing import List, Dict, Any, Optional, Callable, TypeVar
 import httpx
 import warnings
 
@@ -84,6 +85,61 @@ def _load_web_config() -> dict:
         return load_config().get("web", {})
     except (ImportError, Exception):
         return {}
+
+
+_DEFAULT_WEB_REQUEST_TIMEOUT = 60
+_DEFAULT_WEB_CRAWL_TIMEOUT = 300
+_T = TypeVar("_T")
+
+
+def _web_request_timeout() -> float:
+    raw = _load_web_config().get("request_timeout", _DEFAULT_WEB_REQUEST_TIMEOUT)
+    try:
+        return max(1.0, float(raw))
+    except (TypeError, ValueError):
+        return float(_DEFAULT_WEB_REQUEST_TIMEOUT)
+
+
+def _web_crawl_timeout() -> float:
+    raw = _load_web_config().get("crawl_timeout", _DEFAULT_WEB_CRAWL_TIMEOUT)
+    try:
+        return max(1.0, float(raw))
+    except (TypeError, ValueError):
+        return float(_DEFAULT_WEB_CRAWL_TIMEOUT)
+
+
+def _web_timeout_message(seconds: float, *, crawl: bool = False) -> str:
+    from agent.user_status import web_request_timeout_status
+    return web_request_timeout_status(int(seconds), crawl=crawl)
+
+
+def _run_bounded_sync(
+    fn: Callable[..., _T],
+    /,
+    *args: object,
+    timeout: float | None = None,
+    **kwargs: object,
+) -> _T:
+    """Run a blocking SDK/HTTP call with a hard timeout (sync callers)."""
+    limit = _web_request_timeout() if timeout is None else float(timeout)
+    pool = ThreadPoolExecutor(max_workers=1)
+    future = pool.submit(fn, *args, **kwargs)
+    try:
+        return future.result(timeout=limit)
+    except FuturesTimeoutError as exc:
+        raise TimeoutError(_web_timeout_message(limit)) from exc
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+async def _run_bounded_async(awaitable, timeout: float | None = None):
+    """Await an async SDK call with a hard timeout."""
+    limit = _web_request_timeout() if timeout is None else float(timeout)
+    try:
+        return await asyncio.wait_for(awaitable, timeout=limit)
+    except asyncio.TimeoutError as exc:
+        raise TimeoutError(_web_timeout_message(limit)) from exc
+
 
 def _get_backend() -> str:
     """Determine which web backend to use.
@@ -254,7 +310,8 @@ def _tavily_request(endpoint: str, payload: dict) -> dict:
     payload["api_key"] = api_key
     url = f"{_TAVILY_BASE_URL}/{endpoint.lstrip('/')}"
     logger.info("Tavily %s request to %s", endpoint, url)
-    response = httpx.post(url, json=payload, timeout=60)
+    timeout = _web_request_timeout()
+    response = httpx.post(url, json=payload, timeout=timeout)
     response.raise_for_status()
     return response.json()
 
@@ -857,13 +914,16 @@ def _exa_search(query: str, limit: int = 10) -> dict:
         return {"error": "Interrupted", "success": False}
 
     logger.info("Exa search: '%s' (limit=%d)", query, limit)
-    response = _get_exa_client().search(
-        query,
-        num_results=limit,
-        contents={
-            "highlights": True,
-        },
-    )
+    try:
+        response = _run_bounded_sync(
+            _get_exa_client().search,
+            query,
+            num_results=limit,
+            contents={"highlights": True},
+            timeout=_web_request_timeout(),
+        )
+    except TimeoutError as exc:
+        return {"error": str(exc), "success": False}
 
     web_results = []
     for i, result in enumerate(response.results or []):
@@ -889,10 +949,15 @@ def _exa_extract(urls: List[str]) -> List[Dict[str, Any]]:
         return [{"url": u, "error": "Interrupted", "title": ""} for u in urls]
 
     logger.info("Exa extract: %d URL(s)", len(urls))
-    response = _get_exa_client().get_contents(
-        urls,
-        text=True,
-    )
+    try:
+        response = _run_bounded_sync(
+            _get_exa_client().get_contents,
+            urls,
+            text=True,
+            timeout=_web_request_timeout(),
+        )
+    except TimeoutError as exc:
+        return [{"url": u, "error": str(exc), "title": ""} for u in urls]
 
     results = []
     for result in response.results or []:
@@ -923,12 +988,17 @@ def _parallel_search(query: str, limit: int = 5) -> dict:
         mode = "agentic"
 
     logger.info("Parallel search: '%s' (mode=%s, limit=%d)", query, mode, limit)
-    response = _get_parallel_client().beta.search(
-        search_queries=[query],
-        objective=query,
-        mode=mode,
-        max_results=min(limit, 20),
-    )
+    try:
+        response = _run_bounded_sync(
+            _get_parallel_client().beta.search,
+            search_queries=[query],
+            objective=query,
+            mode=mode,
+            max_results=min(limit, 20),
+            timeout=_web_request_timeout(),
+        )
+    except TimeoutError as exc:
+        return {"error": str(exc), "success": False}
 
     web_results = []
     for i, result in enumerate(response.results or []):
@@ -954,10 +1024,16 @@ async def _parallel_extract(urls: List[str]) -> List[Dict[str, Any]]:
         return [{"url": u, "error": "Interrupted", "title": ""} for u in urls]
 
     logger.info("Parallel extract: %d URL(s)", len(urls))
-    response = await _get_async_parallel_client().beta.extract(
-        urls=urls,
-        full_content=True,
-    )
+    try:
+        response = await _run_bounded_async(
+            _get_async_parallel_client().beta.extract(
+                urls=urls,
+                full_content=True,
+            ),
+            timeout=_web_request_timeout(),
+        )
+    except TimeoutError as exc:
+        return [{"url": u, "error": str(exc), "title": ""} for u in urls]
 
     results = []
     for result in response.results or []:
@@ -1075,10 +1151,15 @@ def web_search_tool(query: str, limit: int = 5) -> str:
 
         logger.info("Searching the web for: '%s' (limit: %d)", query, limit)
 
-        response = _get_firecrawl_client().search(
-            query=query,
-            limit=limit
-        )
+        try:
+            response = _run_bounded_sync(
+                _get_firecrawl_client().search,
+                query=query,
+                limit=limit,
+                timeout=_web_request_timeout(),
+            )
+        except TimeoutError as exc:
+            return tool_error(str(exc), success=False)
 
         web_results = _extract_web_search_results(response)
         results_count = len(web_results)
@@ -1242,8 +1323,7 @@ async def web_extract_tool(
 
                     try:
                         logger.info("Scraping: %s", url)
-                        # Run synchronous Firecrawl scrape in a thread with a
-                        # 60s timeout so a hung fetch doesn't block the session.
+                        scrape_timeout = _web_request_timeout()
                         try:
                             scrape_result = await asyncio.wait_for(
                                 asyncio.to_thread(
@@ -1251,13 +1331,13 @@ async def web_extract_tool(
                                     url=url,
                                     formats=formats,
                                 ),
-                                timeout=60,
+                                timeout=scrape_timeout,
                             )
                         except asyncio.TimeoutError:
                             logger.warning("Firecrawl scrape timed out for %s", url)
                             results.append({
                                 "url": url, "title": "", "content": "",
-                                "error": "Scrape timed out after 60s — page may be too large or unresponsive. Try browser_navigate instead.",
+                                "error": _web_timeout_message(scrape_timeout),
                             })
                             continue
 
@@ -1632,10 +1712,17 @@ async def web_crawl_tool(
             return tool_error("Interrupted", success=False)
 
         try:
-            crawl_result = _get_firecrawl_client().crawl(
-                url=url,
-                **crawl_params
+            crawl_timeout = _web_crawl_timeout()
+            crawl_result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    _get_firecrawl_client().crawl,
+                    url=url,
+                    **crawl_params,
+                ),
+                timeout=crawl_timeout,
             )
+        except asyncio.TimeoutError:
+            return tool_error(_web_timeout_message(crawl_timeout, crawl=True), success=False)
         except Exception as e:
             logger.debug("Crawl API call failed: %s", e)
             raise

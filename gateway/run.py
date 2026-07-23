@@ -356,6 +356,27 @@ def _whatsapp_user_id_for_log(user_id: str) -> str:
 _AGENT_PENDING_SENTINEL = object()
 
 
+def _sync_agent_mode_to_resident_agents(candidates: list, prompt: str | None) -> None:
+    """Push a fresh Plan/Agent-mode ephemeral prompt + tool list onto any
+    already-constructed agent object in *candidates* (mid-turn or idle-cached).
+
+    Without this, switching /plan <-> /agent mid-session would only take
+    effect the next time the agent is rebuilt from scratch — the resident
+    agent's tool schema (filtered once at construction) would silently keep
+    reflecting whichever mode was active when it was first built.
+    """
+    for agent in candidates:
+        if agent is None or agent is _AGENT_PENDING_SENTINEL:
+            continue
+        agent.ephemeral_system_prompt = prompt
+        invalidate = getattr(agent, "_invalidate_system_prompt", None)
+        if callable(invalidate):
+            invalidate()
+        reload_tools = getattr(agent, "_reload_tools_for_routing", None)
+        if callable(reload_tools):
+            reload_tools()
+
+
 def _resolve_runtime_agent_kwargs() -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances.
 
@@ -614,6 +635,24 @@ _INTERRUPT_REASON_SSE_DISCONNECT = "Cliente SSE desconectado"
 _INTERRUPT_REASON_GATEWAY_SHUTDOWN = "Encerramento do gateway"
 _INTERRUPT_REASON_GATEWAY_RESTART = "Reinício do gateway"
 
+_WEB_TOOL_TIMEOUT_HINT_TOOLS = frozenset({
+    "web_search",
+    "web_extract",
+    "web_crawl",
+    "browser_navigate",
+    "browser_snapshot",
+})
+
+
+def _web_tool_timeout_hint(tool_name: str | None) -> str | None:
+    if not tool_name or tool_name not in _WEB_TOOL_TIMEOUT_HINT_TOOLS:
+        return None
+    return (
+        "Se estiver usando pesquisa ou navegação web, verifique sua conexão "
+        "e as chaves de API (Tavily, Firecrawl, Exa, etc.)."
+    )
+
+
 _CONTROL_INTERRUPT_MESSAGES = frozenset(
     {
         _INTERRUPT_REASON_STOP.lower(),
@@ -782,11 +821,14 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
         _pat = evt.get("pattern", "?")
         _out = evt.get("output", "")
         _sup = evt.get("suppressed", 0)
+        _safe_out = (_out or "").rstrip().replace("```", "'''") or "(sem saída)"
         text = (
             f"[IMPORTANTE: O processo em segundo plano {_sid} correspondeu ao "
             f"padrão de monitoramento \"{_pat}\".\n"
             f"Comando: {_cmd}\n"
-            f"Saída correspondente:\n{_out}"
+            f"Saída correspondente:\n```text\n{_safe_out}\n```\n"
+            "NÃO cole este bloco na resposta. Resuma o resultado ao utilizador "
+            "em linguagem clara."
         )
         if _sup:
             text += f"\n({_sup} earlier matches were suppressed by rate limit)"
@@ -1730,7 +1772,7 @@ class GatewayRunner:
             if cfg_path.exists():
                 with open(cfg_path, encoding="utf-8") as _f:
                     cfg = _y.safe_load(_f) or {}
-                return bool(cfg.get("display", {}).get("show_reasoning", False))
+                return bool(cfg.get("display", {}).get("show_reasoning", True))
         except Exception:
             pass
         return False
@@ -4290,6 +4332,12 @@ class GatewayRunner:
 
         if canonical == "yolo":
             return await self._handle_yolo_command(event)
+
+        if canonical == "plan":
+            return await self._handle_agent_mode_command(event, "plan")
+
+        if canonical == "agent":
+            return await self._handle_agent_mode_command(event, "agent")
 
         if canonical == "provider":
             return await self._handle_model_command(event)
@@ -7588,6 +7636,45 @@ class GatewayRunner:
             enable_session_yolo(session_key)
             return "⚡ Modo YOLO **ATIVADO** nesta sessão — todos os comandos aprovados automaticamente. Use com cuidado."
 
+    async def _handle_agent_mode_command(self, event: MessageEvent, mode: str) -> str:
+        """Handle /plan and /agent — toggle session-scoped agent mode.
+
+        Mirrors the web dashboard's mode dropdown (_set_web_chat_agent_mode
+        in ector_cli/web_server.py) for gateway/messaging platforms, which
+        previously had no way to enter Plan mode at all.
+        """
+        from tools.agent_mode import (
+            agent_mode_label,
+            ephemeral_prompt_for_mode,
+            set_session_agent_mode,
+        )
+
+        session_key = self._session_key_for_source(event.source)
+        normalized = set_session_agent_mode(session_key, mode)
+        label = agent_mode_label(normalized)
+        platform = event.source.platform.value if event.source.platform else ""
+        prompt = ephemeral_prompt_for_mode(normalized, platform=platform)
+
+        # Sync any resident agent (mid-turn or idle-cached) so tool
+        # availability and the ephemeral system prompt reflect the new mode
+        # immediately, without waiting for the agent to be rebuilt.
+        candidates = [self._running_agents.get(session_key)]
+        _cache_lock = getattr(self, "_agent_cache_lock", None)
+        _cache = getattr(self, "_agent_cache", None)
+        if _cache_lock and _cache is not None:
+            with _cache_lock:
+                cached = _cache.get(session_key)
+                if cached:
+                    candidates.append(cached[0])
+        _sync_agent_mode_to_resident_agents(candidates, prompt)
+
+        if normalized == "plan":
+            return (
+                f"🗒️ Modo **{label}** ativado nesta sessão — vou planejar sem executar mudanças.\n"
+                "Envie `/agent` quando quiser que eu execute o que for planejado."
+            )
+        return f"🤖 Modo **{label}** ativado nesta sessão — execução normal."
+
     async def _handle_verbose_command(self, event: MessageEvent) -> str:
         """Handle /verbose command — cycle tool progress display mode.
 
@@ -8477,6 +8564,7 @@ class GatewayRunner:
             format_image_context_failed,
         )
         from agent.document_stack.extract import extract_document
+        from agent.document_stack.local_image import understand_image_local
         from agent.document_stack.markers import (
             format_document_context_block,
             format_document_context_failed,
@@ -8487,6 +8575,11 @@ class GatewayRunner:
         analysis_prompt = build_preanalysis_prompt(user_text)
         doc_mode = str(getattr(self.config, "documents_preanalysis", "vision_then_ocr") or "vision_then_ocr").lower()
         dark_mode_boost = bool(getattr(self.config, "documents_dark_mode_boost", True))
+        local_vlm = str(getattr(self.config, "documents_local_vlm", "auto") or "auto")
+        florence_model = str(
+            getattr(self.config, "documents_florence_model", "microsoft/Florence-2-base")
+            or "microsoft/Florence-2-base"
+        )
 
         enriched_parts = []
         for path in image_paths:
@@ -8515,6 +8608,22 @@ class GatewayRunner:
 
             if vision_ok or doc_mode == "vision_only":
                 continue
+
+            local = understand_image_local(
+                path,
+                local_vlm=local_vlm,
+                florence_model=florence_model,
+            )
+            if local.get("success") and (local.get("markdown") or "").strip():
+                enriched_parts.append(
+                    format_document_context_block(
+                        local.get("markdown", ""),
+                        path,
+                        local.get("backend", "tesseract+florence"),
+                    )
+                )
+                continue
+
             extracted = extract_document(
                 path,
                 force_ocr=True,
@@ -8827,11 +8936,14 @@ class GatewayRunner:
                 if agent_notify and not _pr_check.is_completion_consumed(session_id):
                     from tools.ansi_strip import strip_ansi
                     _out = strip_ansi(session.output_buffer[-2000:]) if session.output_buffer else ""
+                    _safe_out = (_out or "").rstrip().replace("```", "'''") or "(sem saída)"
                     synth_text = (
                         f"[IMPORTANTE: O processo em segundo plano {session_id} foi concluído "
                         f"(código de saída {session.exit_code}).\n"
                         f"Comando: {session.command}\n"
-                        f"Saída:\n{_out}]"
+                        f"Saída:\n```text\n{_safe_out}\n```\n"
+                        "NÃO cole este bloco na resposta. Resuma o resultado ao utilizador "
+                        "em linguagem clara; se houver erros, cite trechos curtos em fences.]"
                     )
                     source = self._build_process_event_source({
                         "session_id": session_id,
@@ -10976,6 +11088,9 @@ class GatewayRunner:
                         f"({_secs_ago:.0f}s desde a última atividade, "
                         f"iteração {_iter_n}/{_iter_max})."
                     )
+                    _web_hint = _web_tool_timeout_hint(_cur_tool)
+                    if _web_hint:
+                        _diag_lines.append(_web_hint)
                 else:
                     _diag_lines.append(
                         f"Última atividade: {_last_desc} (há {_secs_ago:.0f}s, "

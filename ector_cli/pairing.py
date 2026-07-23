@@ -30,35 +30,79 @@ def pairing_command(args):
 
 def _cmd_list(store):
     """List all pending and approved users."""
+    from rich.console import Console
+
+    from ector_cli.list_format import LIST_PRIMARY, ListColumn, render_list_page
+
     pending = store.list_pending()
     approved = store.list_approved()
+    console = Console()
 
     if not pending and not approved:
-        print("Nenhum dado de emparelhamento encontrado. Ninguém tentou emparelhar ainda~")
+        render_list_page(
+            console,
+            title="Emparelhamento",
+            sections=[],
+            empty_message="Ninguém tentou emparelhar ainda.",
+            primary=LIST_PRIMARY,
+        )
         return
 
+    sections = []
     if pending:
-        print(f"\n  Solicitações de Emparelhamento Pendentes ({len(pending)}):")
-        print(f"  {'Plataforma':<12} {'Código':<10} {'ID Usuário':<20} {'Nome':<20} {'Idade'}")
-        print(f"  {'----------':<12} {'------':<10} {'----------':<20} {'----':<20} {'-----'}")
-        for p in pending:
-            print(
-                f"  {p['platform']:<12} {p['code']:<10} {p['user_id']:<20} "
-                f"{(p.get('user_name') or ''):<20} {p['age_minutes']}m atrás"
+        pending_rows = [
+            (
+                str(p.get("platform", "")),
+                str(p.get("code", "")),
+                str(p.get("user_id", "")),
+                str(p.get("user_name") or "—"),
+                f"{p.get('age_minutes', '?')}m",
             )
-    else:
-        print("\n  Nenhuma solicitação de emparelhamento pendente.")
+            for p in pending
+        ]
+        sections.append(
+            (
+                "Pendentes",
+                (
+                    ListColumn("Plataforma", style=f"bold {LIST_PRIMARY}", ratio=1),
+                    ListColumn("Código", no_wrap=True, ratio=1),
+                    ListColumn("ID usuário", overflow="fold", ratio=2),
+                    ListColumn("Nome", overflow="fold", ratio=2),
+                    ListColumn("Idade", style="dim", no_wrap=True, ratio=1),
+                ),
+                pending_rows,
+            )
+        )
 
     if approved:
-        print(f"\n  Usuários Aprovados ({len(approved)}):")
-        print(f"  {'Plataforma':<12} {'ID Usuário':<20} {'Nome':<20}")
-        print(f"  {'----------':<12} {'----------':<20} {'----':<20}")
-        for a in approved:
-            print(f"  {a['platform']:<12} {a['user_id']:<20} {(a.get('user_name') or ''):<20}")
-    else:
-        print("\n  Nenhum usuário aprovado.")
+        approved_rows = [
+            (
+                str(a.get("platform", "")),
+                str(a.get("user_id", "")),
+                str(a.get("user_name") or "—"),
+            )
+            for a in approved
+        ]
+        sections.append(
+            (
+                "Aprovados",
+                (
+                    ListColumn("Plataforma", style=f"bold {LIST_PRIMARY}", ratio=1),
+                    ListColumn("ID usuário", overflow="fold", ratio=2),
+                    ListColumn("Nome", overflow="fold", ratio=2),
+                ),
+                approved_rows,
+            )
+        )
 
-    print()
+    render_list_page(
+        console,
+        title="Emparelhamento",
+        sections=sections,
+        summary=f"[dim]{len(pending)} pendente(s) · {len(approved)} aprovado(s)[/]",
+        footer="[dim]Aprovar:[/] [bold]ector pairing approve <plataforma> <código>[/]",
+        primary=LIST_PRIMARY,
+    )
 
 
 def _cmd_approve(store, platform: str, code: str):

@@ -30,7 +30,8 @@ Usage:
     result = terminal_tool("python server.py", background=True)
 """
 
-from agent.session_paths import rewrite_phantom_cd_command
+from agent.prompt_builder import TERMINAL_MINIMAL_COMMAND_GUIDANCE
+from agent.session_paths import rewrite_phantom_cd_command, rewrite_open_outside_session
 import importlib.util
 import json
 import logging
@@ -763,6 +764,12 @@ from tools.environments.modal import ModalEnvironment as _ModalEnvironment
 
 
 # Tool description for LLM
+TERMINAL_COMMAND_PARAM_DESCRIPTION = (
+    "Shell command executed by Ector on the user's machine — not a script for the user to copy. "
+    "Use only what must run (e.g. `rm -rf ~/.bun`). Do not append `echo` for status/OK/=== banners; "
+    "confirm in assistant text and `description`. Prefer one short command per call over long `&&` chains."
+)
+
 TERMINAL_TOOL_DESCRIPTION = """Execute shell commands on a Linux environment. Filesystem usually persists between calls.
 
 Always set ``description`` to one short line in Brazilian Portuguese (pt-BR) for the activity feed (≈5–12 words): polite, objective, and varied. **Do not start every line with "Vou"** — alternate naturally, e.g. "Conferindo o status do repositório", "Resumo das alterações", "Preparando arquivos para commit", "Commit com trailer do Ector". Gerund or concise objective phrases are preferred; use "Vou …" only occasionally. Never repeat the same opening across consecutive calls. The UI shows this text verbatim; it is not shown to you again in the tool result.
@@ -776,10 +783,13 @@ Do NOT use sed/awk to edit files — use patch instead.
 Do NOT use echo/cat heredoc to create files — use write_file instead.
 Reserve terminal for: builds, installs, git, processes, scripts, network, package managers, and anything that needs a shell.
 
+Disk / storage investigations: NEVER run `du ~/.*` or whole-home dotfile globs — too slow and often interrupted. Scan one path at a time (`du -sh ~/Library`, then `~/Downloads`, `~/.cache`, etc.). Use `timeout 30` on exploratory `du`. For scans expected to exceed ~60s, use background=true with notify_on_complete=true.
+
 Foreground (default): Commands return INSTANTLY when done, even if the timeout is high. Set timeout=300 for long builds/scripts — you'll still get the result in seconds if it's fast. Prefer foreground for short commands.
 Background: Set background=true to get a session_id. Two patterns:
   (1) Long-lived processes that never exit (servers, watchers).
   (2) Long-running tasks with notify_on_complete=true — you can keep working on other things and the system auto-notifies you when the task finishes. Great for test suites, builds, deployments, or anything that takes more than a minute.
+NEVER end your turn saying you will "leave it running" / "deixando rodar" unless the job was started with background=true AND notify_on_complete=true (or an active process wait). Do not abandon long downloads/builds by only checking ls/wc and stopping — the user will not get a completion notice.
 For servers/watchers, do NOT use shell-level background wrappers (nohup/disown/setsid/trailing '&') in foreground mode. Use background=true so Ector can track lifecycle and output.
 After starting a server, verify readiness with a health check or log signal, then run tests in a separate terminal() call. Avoid blind sleep loops.
 Use process(action="poll") for progress checks, process(action="wait") to block until done.
@@ -787,7 +797,7 @@ Working directory: Use 'workdir' for per-command cwd.
 PTY mode: Set pty=true for interactive CLI tools (Codex, Claude Code, Python REPL).
 
 Do NOT use vim/nano/interactive tools without pty=true — they hang without a pseudo-terminal. Pipe git output to cat if it might page.
-"""
+""" + TERMINAL_MINIMAL_COMMAND_GUIDANCE
 
 # Global state for environment lifecycle management
 _active_environments: Dict[str, Any] = {}
@@ -823,9 +833,16 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
 
     Args:
         task_id: The rollout's unique task identifier
-        overrides: Dict of config keys to override
+        overrides: Dict of config keys to override (merged into any existing
+            overrides for this task — callers that only set ``cwd`` must not
+            wipe image settings).
     """
-    _task_env_overrides[task_id] = overrides
+    if not task_id:
+        return
+    existing = _task_env_overrides.get(task_id) or {}
+    merged = dict(existing)
+    merged.update(overrides or {})
+    _task_env_overrides[task_id] = merged
 
 
 def clear_task_env_overrides(task_id: str):
@@ -855,10 +872,38 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     task_id, we honour it by returning the task_id unchanged -- those
     rollouts need their own isolated sandbox, which is the whole point of
     the override.
+
+    Web chat also registers per-session ``cwd`` overrides. If the override was
+    cleared but this session still has a live env, keep the session key —
+    collapsing to ``"default"`` would run tools in another chat's cwd while
+    the git status bar still shows this session's project.
     """
-    if task_id and task_id in _task_env_overrides:
+    if not task_id:
+        return "default"
+    if task_id in _task_env_overrides:
         return task_id
+    with _env_lock:
+        if task_id in _active_environments:
+            return task_id
     return "default"
+
+
+def _cwd_for_task(effective_task_id: str, overrides: Dict[str, Any], config_cwd: str) -> str:
+    """Resolve cwd for a terminal env, rehydrating from SQLite when needed."""
+    override_cwd = overrides.get("cwd")
+    if isinstance(override_cwd, str) and override_cwd.strip():
+        return override_cwd.strip()
+    if effective_task_id and effective_task_id != "default":
+        try:
+            from agent.session_cwd import load_persisted_session_cwd
+
+            persisted = load_persisted_session_cwd(effective_task_id)
+            if persisted:
+                register_task_env_overrides(effective_task_id, {"cwd": persisted})
+                return persisted
+        except Exception:
+            pass
+    return config_cwd
 
 
 # Configuration from environment variables
@@ -1386,6 +1431,36 @@ _LONG_LIVED_FOREGROUND_PATTERNS = (
     re.compile(r"\bpython(?:3)?\s+-m\s+http\.server\b", re.IGNORECASE),
 )
 
+# Whole-home / dotfile-glob disk scans — slow on macOS and often interrupted (exit 130).
+_EXPENSIVE_HOME_DU_RE = re.compile(
+    r"\bdu\b.*?(?:~/\.\*|~/?\.\s|\$HOME/\.\*|~/\*|\bdu\s+-sh\s+~\s*(?:\||;|$))",
+    re.IGNORECASE | re.DOTALL,
+)
+_EXPENSIVE_ROOT_FIND_RE = re.compile(
+    r"\bfind\s+/(?:\s|\.)",
+    re.IGNORECASE,
+)
+
+
+def _expensive_scan_guidance(command: str) -> str | None:
+    """Block foreground commands that scan huge trees in one shot."""
+    if _looks_like_help_or_version_command(command):
+        return None
+    normalized = " ".join(command.split())
+    if _EXPENSIVE_HOME_DU_RE.search(normalized):
+        return (
+            "Varredura ampla da home (`du ~/.*` ou equivalente) é lenta e costuma ser "
+            "interrompida. Use passos granulares: `du -sh` em um caminho por vez "
+            "(ex. ~/Library, ~/Downloads, ~/.cache). Para varredura >60s use "
+            "background=true com notify_on_complete=true e timeout adequado."
+        )
+    if _EXPENSIVE_ROOT_FIND_RE.search(normalized):
+        return (
+            "Evite `find /` em foreground. Limite o escopo (`find ~/Library -maxdepth 3 …`) "
+            "ou use background=true para buscas longas."
+        )
+    return None
+
 
 def _looks_like_help_or_version_command(command: str) -> bool:
     """Return True for informational invocations that should never be blocked."""
@@ -1538,7 +1613,9 @@ def terminal_tool(
         else:
             image = ""
 
-        cwd = overrides.get("cwd") or config["cwd"]
+        cwd = _cwd_for_task(effective_task_id, overrides, config["cwd"])
+        # Re-read overrides in case SQLite rehydration just registered cwd
+        overrides = _task_env_overrides.get(effective_task_id, overrides)
         default_timeout = config["timeout"]
         effective_timeout = timeout or default_timeout
 
@@ -1562,6 +1639,14 @@ def terminal_tool(
                     "output": "",
                     "exit_code": -1,
                     "error": guidance,
+                    "status": "error",
+                }, ensure_ascii=False)
+            scan_guidance = _expensive_scan_guidance(command)
+            if scan_guidance:
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": scan_guidance,
                     "status": "error",
                 }, ensure_ascii=False)
 
@@ -1669,6 +1754,18 @@ def terminal_tool(
                 cd_note,
             )
             command = rewritten
+        else:
+            rewritten, open_note = rewrite_open_outside_session(command, session_cwd)
+            if rewritten != command:
+                logger.info(
+                    "Rewrote open outside session cwd %s: %r -> %r (%s)",
+                    session_cwd,
+                    command[:120],
+                    rewritten[:120],
+                    open_note,
+                )
+                command = rewritten
+                cd_note = open_note
 
         if not force:
             approval = _check_all_guards(command, env_type)
@@ -2100,11 +2197,11 @@ TERMINAL_SCHEMA = {
         "properties": {
             "command": {
                 "type": "string",
-                "description": "The command to execute on the VM"
+                "description": TERMINAL_COMMAND_PARAM_DESCRIPTION,
             },
             "description": {
                 "type": "string",
-                "description": "Uma linha curta em pt-BR para o feed de atividade: o que está acontecendo e por quê (≈5–12 palavras). Varie a formulação entre chamadas — gerúndio (\"Conferindo o status…\") ou frase objetiva (\"Resumo das alterações\"); não repita \"Vou …\" em toda chamada. Não é executado no shell."
+                "description": "Rótulo curto para o card de atividade na UI (≈5–12 palavras, pt-BR): o que a ferramenta faz tecnicamente. Não substitui sua mensagem ao usuário — no painel web, escreva primeiro uma frase natural na resposta de texto antes de chamar terminal. Varie a formulação; não repita \"Vou …\" em toda chamada. Não é executado no shell."
             },
             "background": {
                 "type": "boolean",

@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from ector_constants import get_config_path, get_skills_dir
+from ector_constants import get_builtin_skills_dir, get_config_path, get_skills_dir
 
 logger = logging.getLogger(__name__)
 
@@ -225,13 +225,23 @@ def get_external_skills_dirs() -> List[Path]:
 
 
 def get_all_skills_dirs() -> List[Path]:
-    """Return all skill directories: local ``~/.ector/skills/`` first, then external.
+    """Return skill directories: local, then config external, then builtin.
 
-    The local dir is always first (and always included even if it doesn't exist
-    yet — callers handle that).  External dirs follow in config order.
+    Precedence on name collision (first wins in the skills index):
+    1. Local ``~/.ector/skills/`` (agent-created, Hub installs, cloud library)
+    2. ``skills.external_dirs`` from config.yaml
+    3. Repo ``builtin-skills/`` (always-on, offline, read-only)
+
+    The local dir is always first even if it does not exist yet.
     """
     dirs = [get_skills_dir()]
     dirs.extend(get_external_skills_dirs())
+    seen = {d.resolve() for d in dirs}
+    builtin = get_builtin_skills_dir()
+    if builtin.is_dir():
+        resolved = builtin.resolve()
+        if resolved not in seen:
+            dirs.append(resolved)
     return dirs
 
 

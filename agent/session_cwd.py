@@ -96,6 +96,54 @@ def bootstrap_interactive_terminal_cwd() -> str:
     return resolved
 
 
+def config_has_explicit_terminal_cwd() -> bool:
+    """True when ``terminal.cwd`` in config is a concrete path (not . / auto / cwd)."""
+    try:
+        cfg = _load_config() or {}
+        term = cfg.get("terminal") or {}
+        if isinstance(term, dict):
+            raw = str(term.get("cwd") or "").strip()
+            return bool(raw and raw not in CWD_PLACEHOLDERS)
+    except Exception:
+        pass
+    return False
+
+
+def web_workspace_defined(session_id: Optional[str] = None) -> bool:
+    """Whether the web dashboard should show an opened project (vs. prompt to open folder)."""
+    if config_has_explicit_terminal_cwd():
+        return True
+
+    default_home = os.path.abspath(configured_terminal_cwd(cwd_placeholder="home"))
+
+    if session_id:
+        persisted = load_persisted_session_cwd(session_id)
+        if not persisted:
+            return False
+        return os.path.abspath(persisted) != default_home
+
+    raw = os.environ.get("TERMINAL_CWD", "").strip()
+    if raw and raw not in CWD_PLACEHOLDERS:
+        resolved = os.path.abspath(os.path.expanduser(raw))
+        return resolved != default_home
+    return False
+
+
+def path_is_web_workspace(path: str) -> bool:
+    """True when *path* is a concrete project folder (not the default home cwd)."""
+    if config_has_explicit_terminal_cwd():
+        return True
+    text = (path or "").strip()
+    if not text or text in CWD_PLACEHOLDERS:
+        return False
+    try:
+        resolved = os.path.abspath(os.path.expanduser(text))
+    except Exception:
+        return False
+    default_home = os.path.abspath(configured_terminal_cwd(cwd_placeholder="home"))
+    return resolved != default_home
+
+
 def cwd_from_model_config(raw: Any) -> Optional[str]:
     if not raw:
         return None
@@ -139,7 +187,15 @@ def persist_session_cwd(
         db = SessionDB()
         try:
             sid = db.resolve_session_id(session_id) or session_id
-            db.ensure_session(sid, source=source)
+            exists = db.get_session(sid) is not None
+            # Web: never create a ghost session row just to store cwd — that
+            # shows up as empty "Novo chat" entries in the sidebar. In-memory
+            # apply_session_cwd + landing cwd cover the gap until the first
+            # real chat turn calls ensure_session.
+            if not exists:
+                if source == "web":
+                    return
+                db.ensure_session(sid, source=source)
             db.merge_model_config(sid, {"cwd": cwd})
         finally:
             db.close()
@@ -166,11 +222,14 @@ def cwd_from_terminal_env(task_id: str) -> Optional[str]:
 def apply_session_cwd(
     session_id: str, cwd: str, *, cwd_placeholder: str = "launch"
 ) -> str:
-    """Bind *cwd* to a chat session (env var + per-session terminal env)."""
+    """Bind *cwd* to a chat session (per-session terminal env override).
+
+    Does **not** write ``TERMINAL_CWD`` when *session_id* is set — that env var
+    is process-global and would leak folders across concurrent web chats.
+    """
     resolved = os.path.abspath(os.path.expanduser((cwd or "").strip()))
     if not resolved:
         resolved = configured_terminal_cwd(cwd_placeholder=cwd_placeholder)
-    os.environ["TERMINAL_CWD"] = resolved
     if session_id:
         try:
             from tools.terminal_tool import (
@@ -184,6 +243,8 @@ def apply_session_cwd(
                 env.cwd = resolved
         except Exception:
             pass
+    else:
+        os.environ["TERMINAL_CWD"] = resolved
     return resolved
 
 
@@ -193,6 +254,12 @@ def prime_session_cwd(
     """Bootstrap cwd for *session_id* without clobbering a live terminal env."""
     if not session_id:
         return
+    # openProject / landing bind may have registered a real project before the
+    # session row exists — never replace that with the home placeholder.
+    existing_override = cwd_from_task_override(session_id)
+    if existing_override and path_is_web_workspace(existing_override):
+        return
+
     persisted = load_persisted_session_cwd(session_id)
     configured = configured_terminal_cwd(cwd_placeholder=cwd_placeholder)
     try:
@@ -214,7 +281,6 @@ def prime_session_cwd(
                         session_id, persisted, cwd_placeholder=cwd_placeholder
                     )
                     return
-                os.environ["TERMINAL_CWD"] = resolved
                 register_task_env_overrides(session_id, {"cwd": resolved})
             return
     except Exception:
@@ -224,11 +290,9 @@ def prime_session_cwd(
 
 
 def live_terminal_cwd(session_id: Optional[str] = None) -> Optional[str]:
-    """Best-effort live cwd (per-session sandbox, then shared ``default``)."""
+    """Best-effort live cwd (per-session sandbox only — never shared ``default``)."""
     if session_id:
-        active = cwd_from_terminal_env(session_id)
-        if active:
-            return active
+        return cwd_from_terminal_env(session_id)
     return cwd_from_terminal_env("default")
 
 
@@ -240,18 +304,17 @@ def sync_session_cwd_from_env(
     Read-only footer loads must not call this with ``allow_default_env`` — a
     shared ``default`` shell at home would overwrite per-chat directories
     after a server restart or dashboard rebuild.
+
+    Never falls back to process-global ``TERMINAL_CWD``: that value is often
+    the last *other* chat that was primed and must not be written into this
+    session's SQLite row.
     """
     if not session_id:
         return
     active = cwd_from_terminal_env(session_id)
     if not active and allow_default_env:
         active = cwd_from_terminal_env("default")
-    if not active:
-        raw = os.environ.get("TERMINAL_CWD", "").strip()
-        if raw:
-            active = os.path.abspath(os.path.expanduser(raw))
     if active:
-        os.environ["TERMINAL_CWD"] = active
         try:
             from tools.terminal_tool import register_task_env_overrides
 
@@ -259,6 +322,22 @@ def sync_session_cwd_from_env(
         except Exception:
             pass
         persist_session_cwd(session_id, active, source=source)
+
+
+def cwd_from_task_override(task_id: Optional[str]) -> Optional[str]:
+    """Cwd registered via ``register_task_env_overrides`` (before shell exists)."""
+    if not task_id:
+        return None
+    try:
+        from tools.terminal_tool import _task_env_overrides
+
+        raw = _task_env_overrides.get(task_id) or {}
+        cwd = raw.get("cwd")
+        if isinstance(cwd, str) and cwd.strip():
+            return os.path.abspath(os.path.expanduser(cwd.strip()))
+    except Exception:
+        return None
+    return None
 
 
 def resolve_chat_cwd(
@@ -273,6 +352,9 @@ def resolve_chat_cwd(
         session_live = cwd_from_terminal_env(session_id)
         if session_live:
             return session_live
+        override = cwd_from_task_override(session_id)
+        if override:
+            return override
         if allow_default_env:
             default_live = cwd_from_terminal_env("default")
             if default_live:

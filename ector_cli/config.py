@@ -498,6 +498,11 @@ DEFAULT_CONFIG = {
         "persistent_shell": True,
     },
     
+    "web": {
+        "request_timeout": 60,   # HTTP/SDK search+extract (seconds)
+        "crawl_timeout": 300,    # crawl jobs (seconds)
+    },
+
     "browser": {
         "inactivity_timeout": 120,
         "command_timeout": 30,  # Timeout for browser commands in seconds (screenshot, navigate, etc.)
@@ -570,7 +575,9 @@ DEFAULT_CONFIG = {
         "threshold": 0.50,            # compress when context usage exceeds this ratio
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
         "protect_last_n": 20,         # minimum recent messages to keep uncompressed
-
+        # Opt-in: cheap tool-result pruning before full LLM compression (0 = disabled).
+        # Example: 0.35 prunes old outputs when usage hits 35% of context window.
+        "prune_threshold": 0,
     },
 
     # Ephemeral per-turn context injected into the user message (memory/RAG/plugins).
@@ -719,6 +726,11 @@ DEFAULT_CONFIG = {
         "cache_extracts": True,
         "heavy_tier": "auto",  # auto | off | marker
         "ocr_engine": "auto",  # auto | rapidocr | tesseract | ocrmac
+        # Local VLM for image fallback when cloud vision fails (or ocr_only):
+        # auto = Florence-2 when ector-agent[documents-vision] is installed
+        # florence = require Florence-2 | off = Tesseract/OCR only
+        "local_vlm": "auto",  # auto | florence | off
+        "florence_model": "microsoft/Florence-2-base",
     },
     
     "display": {
@@ -728,7 +740,7 @@ DEFAULT_CONFIG = {
         # home_channel da mesma plataforma (ref + ignorar / ref + texto).
         "busy_interrupt_ask_home_channel": False,
         "bell_on_complete": False,
-        "show_reasoning": False,
+        "show_reasoning": True,
         "streaming": True,
         "final_response_markdown": "strip",  # render | strip | raw
         "inline_diffs": True,     # Show inline diff previews for write actions (write_file, patch, skill_manage)
@@ -754,7 +766,7 @@ DEFAULT_CONFIG = {
     # Web dashboard settings
     "dashboard": {
         "theme": "default",  # Dashboard visual theme: "default", "midnight", "ember", "mono", "cyberpunk", "rose"
-        # Friendly URL for `ector localhost` (RFC 6761 *.localhost). Empty disables (127.0.0.1).
+        # Friendly URL for bare `ector` (RFC 6761 *.localhost). Empty disables (127.0.0.1).
         "local_hostname": "ector.localhost",
         "smart_menu": True,  # Auto-collapse dashboard sidebar after inactivity (desktop only)
     },
@@ -894,7 +906,7 @@ DEFAULT_CONFIG = {
                                        # raise if children time out before producing output.
         "reasoning_effort": "",  # reasoning effort for subagents: "xhigh", "high", "medium",
                                  # "low", "minimal", "none" (empty = inherit parent's level)
-        "max_concurrent_children": 3,  # max parallel children per batch; floor of 1 enforced, no ceiling
+        "max_concurrent_children": 10,  # max parallel children per batch; floor of 1 enforced, no ceiling
         # Orchestrator role controls (see tools/delegate_tool.py:_get_max_spawn_depth
         # and _get_orchestrator_enabled).  Values are clamped to [1, 3] with a
         # warning log if out of range.
@@ -959,6 +971,12 @@ DEFAULT_CONFIG = {
         # A cada N iterações de ferramenta, o agente pode revisar a conversa e
         # salvar ou atualizar skills (background review em run_agent.py).
         "creation_nudge_interval": 10,
+        # Opt-in: cap skills listed in the system prompt index (0 = no cap).
+        # When set, excess skills are omitted with a note to call skills_list().
+        "max_index_entries": 0,
+        # Opt-in: max chars returned by skill_view (default in code: 100_000).
+        # Uncomment to lower for very large SKILL.md files:
+        # "max_content_chars": 100000,
     },
 
     # IANA timezone (e.g. "Asia/Kolkata", "America/New_York").
@@ -1207,7 +1225,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 26,
+    "_config_version": 27,
 }
 
 # =============================================================================
@@ -1325,6 +1343,14 @@ OPTIONAL_ENV_VARS = {
     },
     "Z_AI_API_KEY": {
         "description": "Chave API da Z.AI (alias para GLM_API_KEY)",
+        "prompt": "Chave API da Z.AI",
+        "url": "https://z.ai/",
+        "password": True,
+        "category": "provider",
+        "advanced": True,
+    },
+    "ZHIPU_API_KEY": {
+        "description": "Chave API da Z.AI (nome oficial usado na doc da Z.AI/models.dev; alias para GLM_API_KEY)",
         "prompt": "Chave API da Z.AI",
         "url": "https://z.ai/",
         "password": True,
@@ -2960,6 +2986,20 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
             if not quiet:
                 print("  ✔ Personalidade: chaves legadas migradas ou removidas")
 
+    # ── Version 26 → 27: display.show_reasoning defaults to on ──
+    if current_ver < 27:
+        config = read_raw_config()
+        display = config.get("display")
+        if not isinstance(display, dict):
+            display = {}
+            config["display"] = display
+        if display.get("show_reasoning") is not True:
+            display["show_reasoning"] = True
+            save_config(config)
+            results["config_added"].append("display.show_reasoning (default on)")
+            if not quiet:
+                print("  ✔ display.show_reasoning = true (padrão)")
+
     if current_ver < latest_ver and not quiet:
         print(f"Versão da config: {current_ver} → {latest_ver}")
     
@@ -3983,7 +4023,7 @@ def show_config():
         ("Personalidade", _format_personality_summary(config)),
         (
             "Raciocínio",
-            "ligado" if display.get("show_reasoning", False) else "desligado",
+            "ligado" if display.get("show_reasoning", True) else "desligado",
         ),
         (
             "Notificação sonora",

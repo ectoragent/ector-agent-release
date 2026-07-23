@@ -117,6 +117,11 @@ CONFIGURABLE_TOOLSETS = [
         "Pedir confirmação ou escolha ao utilizador antes de ações sensíveis ou ambíguas.",
     ),
     (
+        "mark_chapter",
+        "Capítulos da sessão",
+        "Marcar capítulos no índice flutuante do dashboard quando a conversa muda de fase.",
+    ),
+    (
         "delegation",
         "Delegação",
         "Lançar subagentes com contexto isolado para subtarefas paralelas ou mais complexas.",
@@ -2168,44 +2173,99 @@ def _apply_mcp_change(config: dict, targets: List[str], action: str) -> Set[str]
 
 def _print_tools_list(enabled_toolsets: set, mcp_servers: dict, platform: str = "cli"):
     """Print a summary of enabled/disabled toolsets and MCP tool filters."""
+    from rich.console import Console
+
+    from ector_cli.list_format import LIST_PRIMARY, ListColumn, render_list_page
+
     effective_all = _get_effective_configurable_toolsets()
     effective = [
         (k, l, d) for (k, l, d) in effective_all
         if _toolset_allowed_for_platform(k, platform)
     ]
     builtin_keys = {ts_key for ts_key, _, _ in CONFIGURABLE_TOOLSETS}
+    console = Console()
 
-    print(f"Conjuntos de ferramentas integrados ({platform}):")
+    sections: list[tuple[str, tuple[ListColumn, ...], list[tuple[str, ...]]]] = []
+
+    builtin_rows = []
     for ts_key, label, _ in effective:
         if ts_key not in builtin_keys:
             continue
-        status = (color("✔ enabled", Colors.GREEN) if ts_key in enabled_toolsets
-                  else color("✖ disabled", Colors.RED))
-        print(f"  {status}  {ts_key}  {color(label, Colors.DIM)}")
+        status = (
+            "[green]Habilitado[/]" if ts_key in enabled_toolsets else "[red]Desabilitado[/]"
+        )
+        builtin_rows.append((ts_key, label, status))
+    if builtin_rows:
+        sections.append(
+            (
+                f"Integrados ({platform})",
+                (
+                    ListColumn("Toolset", style=f"bold {LIST_PRIMARY}", ratio=1),
+                    ListColumn("Descrição", style="dim", overflow="fold", ratio=3),
+                    ListColumn("Estado", no_wrap=True, min_width=14, ratio=1),
+                ),
+                builtin_rows,
+            )
+        )
 
-    # Plugin toolsets
-    plugin_entries = [(k, l) for k, l, _ in effective if k not in builtin_keys]
-    if plugin_entries:
-        print()
-        print(f"Plugin toolsets ({platform}):")
-        for ts_key, label in plugin_entries:
-            status = (color("✔ enabled", Colors.GREEN) if ts_key in enabled_toolsets
-                      else color("✖ disabled", Colors.RED))
-            print(f"  {status}  {ts_key}  {color(label, Colors.DIM)}")
+    plugin_rows = []
+    for ts_key, label, _ in effective:
+        if ts_key in builtin_keys:
+            continue
+        status = (
+            "[green]Habilitado[/]" if ts_key in enabled_toolsets else "[red]Desabilitado[/]"
+        )
+        plugin_rows.append((ts_key, label, status))
+    if plugin_rows:
+        sections.append(
+            (
+                f"Plugins ({platform})",
+                (
+                    ListColumn("Toolset", style=f"bold {LIST_PRIMARY}", ratio=1),
+                    ListColumn("Descrição", style="dim", overflow="fold", ratio=3),
+                    ListColumn("Estado", no_wrap=True, min_width=14, ratio=1),
+                ),
+                plugin_rows,
+            )
+        )
 
+    mcp_rows = []
     if mcp_servers:
-        print()
-        print("MCP servers:")
         for srv_name, srv_cfg in mcp_servers.items():
             tools_cfg = srv_cfg.get("tools") or {}
             exclude = tools_cfg.get("exclude") or []
             include = tools_cfg.get("include") or []
             if include:
-                _print_info(f"{srv_name}  [include only: {', '.join(include)}]")
+                filt = f"só: {', '.join(include)}"
             elif exclude:
-                _print_info(f"{srv_name}  [excluded: {color(', '.join(exclude), Colors.YELLOW)}]")
+                filt = f"excl.: {', '.join(exclude)}"
             else:
-                _print_info(f"{srv_name}  {color('all tools enabled', Colors.DIM)}")
+                filt = "todas"
+            mcp_rows.append((srv_name, filt))
+    if mcp_rows:
+        sections.append(
+            (
+                "MCP",
+                (
+                    ListColumn("Servidor", style=f"bold {LIST_PRIMARY}", ratio=1),
+                    ListColumn("Ferramentas", style="dim", overflow="fold", ratio=3),
+                ),
+                mcp_rows,
+            )
+        )
+
+    enabled_n = sum(1 for row in builtin_rows + plugin_rows if "Habilitado" in row[2])
+    total_n = len(builtin_rows) + len(plugin_rows)
+
+    render_list_page(
+        console,
+        title="Ferramentas",
+        subtitle=f"plataforma: {platform}",
+        sections=sections,
+        summary=f"[dim]{enabled_n}/{total_n} toolset(s) habilitado(s)[/]" if total_n else "",
+        footer=f"[dim]Gerir:[/] [bold]ector tools enable|disable <nome> --platform {platform}[/]",
+        primary=LIST_PRIMARY,
+    )
 
 
 def tools_disable_enable_command(args):

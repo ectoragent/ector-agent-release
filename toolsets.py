@@ -52,6 +52,8 @@ _ECTOR_CORE_TOOLS = [
     "todo", "memory",
     # Session history search
     "session_search",
+    # Chapter markers for the dashboard's floating table of contents
+    "mark_chapter",
     # Wiser — pergunta ao usuário (decisão / lacuna de contexto)
     "wiser",
     # Code execution + delegation
@@ -191,7 +193,13 @@ TOOLSETS = {
         "tools": ["session_search"],
         "includes": []
     },
-    
+
+    "mark_chapter": {
+        "description": "Marcar capítulos no índice flutuante do dashboard quando a conversa muda de fase.",
+        "tools": ["mark_chapter"],
+        "includes": []
+    },
+
     "wiser": {
         "description": "Pedir confirmação ou escolha ao utilizador antes de ações sensíveis ou ambíguas.",
         "tools": ["wiser"],

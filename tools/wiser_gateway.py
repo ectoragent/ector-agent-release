@@ -44,6 +44,16 @@ def unregister_gateway_wiser_notify(session_key: str) -> None:
             entry.event.set()
 
 
+def detach_gateway_wiser_notify(session_key: str) -> None:
+    """Drop the UI notify callback without resolving pending Wiser prompts.
+
+    Used when the web SSE client disconnects (page reload) so the agent
+    thread can keep waiting for /api/chat/wiser while the UI reconnects.
+    """
+    with _lock:
+        _gateway_notify_cbs.pop(session_key, None)
+
+
 def resolve_gateway_wiser(session_key: str, answer: str) -> int:
     """Unblock the oldest pending Wiser prompt for *session_key*. Returns count resolved."""
     with _lock:
@@ -75,16 +85,16 @@ def peek_blocking_wiser(session_key: str) -> Optional[dict]:
 def format_wiser_prompt_text(question: str, choices: Optional[list]) -> str:
     """Plain-text Wiser prompt for platforms without button UI."""
     lines = ["**Wiser** — preciso da sua escolha:", "", question.strip(), ""]
-    if choices:
-        for i, c in enumerate(choices, 1):
-            lines.append(f"{i}. {c}")
-        lines.append(f"{len(choices) + 1}. Outro (responda com texto livre)")
-        lines.append("")
-        lines.append(
-            "Responda com o número da opção ou escreva sua resposta em texto livre."
-        )
-    else:
-        lines.append("Responda em texto livre.")
+    opts = [str(c).strip() for c in (choices or []) if str(c).strip()]
+    if not opts:
+        opts = ["Continuar com a melhor opção", "Parar por agora"]
+    for i, c in enumerate(opts, 1):
+        lines.append(f"{i}. {c}")
+    lines.append(f"{len(opts) + 1}. Outro (responda com texto livre)")
+    lines.append("")
+    lines.append(
+        "Responda com o número da opção ou escreva sua resposta em texto livre."
+    )
     return "\n".join(lines)
 
 
@@ -93,13 +103,14 @@ def parse_wiser_reply(text: str, choices: Optional[list]) -> str:
     raw = (text or "").strip()
     if not raw:
         return raw
-    if not choices:
+    opts = [str(c).strip() for c in (choices or []) if str(c).strip()]
+    if not opts:
         return raw
     if raw.isdigit():
         idx = int(raw)
-        if 1 <= idx <= len(choices):
-            return choices[idx - 1]
-        if idx == len(choices) + 1:
+        if 1 <= idx <= len(opts):
+            return opts[idx - 1]
+        if idx == len(opts) + 1:
             return raw
     return raw
 

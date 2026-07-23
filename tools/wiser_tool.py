@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Wiser — pergunta estruturada ao usuário (múltipla escolha ou texto livre).
+Wiser — pergunta estruturada ao usuário (opções + texto livre).
 
 O modelo chama ``wiser`` quando precisa de uma decisão ou informação do humano.
 A UI (CLI / gateway / TUI) injeta ``wiser_callback`` no ``AIAgent``.
+Sempre oferece opções; a UI acrescenta resposta em texto livre como alternativa.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from typing import Any, Callable, List, Optional
 
 from tools.registry import registry, tool_error
 
+MIN_CHOICES = 2
 MAX_CHOICES = 4
 MAX_QUESTION_CHARS = 4000
 MAX_CONTEXT_CHARS = 600
@@ -50,10 +52,10 @@ def get_wiser_timeout_seconds(config: Optional[dict] = None) -> int:
     return max(MIN_TIMEOUT_SECONDS, min(MAX_TIMEOUT_SECONDS, timeout))
 
 
-def _normalize_choices(choices: Optional[List[str]]) -> tuple[Optional[List[str]], bool]:
+def _normalize_choices(choices: Optional[List[str]]) -> tuple[List[str], bool]:
     """Return (deduped choices up to MAX_CHOICES, was_truncated)."""
     if choices is None:
-        return None, False
+        raise ValueError("choices is required")
     if not isinstance(choices, list):
         raise TypeError("choices must be a list")
     seen: set[str] = set()
@@ -66,8 +68,11 @@ def _normalize_choices(choices: Optional[List[str]]) -> tuple[Optional[List[str]
             raise ValueError(f"choice exceeds {MAX_CHOICE_CHARS} characters")
         seen.add(s)
         normalized.append(s)
-    if not normalized:
-        return None, False
+    if len(normalized) < MIN_CHOICES:
+        raise ValueError(
+            f"Provide at least {MIN_CHOICES} mutually exclusive choices "
+            f"(got {len(normalized)})."
+        )
     truncated = len(normalized) > MAX_CHOICES
     if truncated:
         normalized = normalized[:MAX_CHOICES]
@@ -89,7 +94,7 @@ def wiser_tool(
     callback: Optional[Callable[..., str]] = None,
 ) -> str:
     """
-    Pede uma resposta ao usuário: até 4 opções fixas + "Outro", ou só texto livre.
+    Pede uma resposta ao usuário: 2–4 opções fixas; a UI acrescenta texto livre.
 
     ``context`` (opcional) é uma linha curta de enquadramento mostrada acima da
     pergunta na UI — não substitui a pergunta no JSON devolvido ao modelo.
@@ -113,15 +118,19 @@ def wiser_tool(
                 success=False,
             )
 
-    choices_truncated = False
-    normalized_choices: Optional[List[str]] = None
-    if choices is not None:
-        if not isinstance(choices, list):
-            return tool_error("``choices`` deve ser uma lista de strings.", success=False)
-        try:
-            normalized_choices, choices_truncated = _normalize_choices(choices)
-        except ValueError as exc:
-            return tool_error(str(exc), success=False)
+    if choices is None:
+        return tool_error(
+            f"``choices`` é obrigatório — forneça de {MIN_CHOICES} a {MAX_CHOICES} "
+            "opções mutuamente exclusivas. A UI permite texto livre como alternativa.",
+            success=False,
+        )
+    if not isinstance(choices, list):
+        return tool_error("``choices`` deve ser uma lista de strings.", success=False)
+
+    try:
+        normalized_choices, choices_truncated = _normalize_choices(choices)
+    except (TypeError, ValueError) as exc:
+        return tool_error(str(exc), success=False)
 
     if callback is None:
         return json.dumps(
@@ -163,8 +172,9 @@ WISER_SCHEMA = {
         "**Não use** para notícias, fatos atuais, clima, preços, versões de software, nem para pedir "
         "permissão para pesquisar na web — use ``web_search`` (ou outra ferramenta de consulta) "
         "direto e responda com o que encontrou.\n\n"
-        "Modos: (1) até 4 opções em ``choices`` — a UI acrescenta “Outro”; "
-        "(2) sem ``choices`` — resposta em texto livre.\n\n"
+        "Sempre passe ``choices`` com **2 a 4** opções claras e mutuamente exclusivas. "
+        "A UI acrescenta automaticamente resposta em **texto livre** (“Outro”) — não inclua "
+        "uma opção “Outro/Outra” nas ``choices``.\n\n"
         "Use ``context`` só para uma linha curta de enquadramento (ex.: “Sobre o deploy de ontem”). "
         "Seja direto na ``question``; não empilhe várias perguntas — uma por chamada.\n\n"
         "Não use para confirmação de comando perigoso do terminal (há fluxo próprio). "
@@ -187,14 +197,15 @@ WISER_SCHEMA = {
             "choices": {
                 "type": "array",
                 "items": {"type": "string"},
+                "minItems": MIN_CHOICES,
                 "maxItems": MAX_CHOICES,
                 "description": (
-                    "Até 4 opções mutuamente exclusivas. Omita o parâmetro inteiro para pergunta aberta. "
-                    "Redija opções curtas e paralelas (mesmo tipo de resposta)."
+                    f"Obrigatório. {MIN_CHOICES}–{MAX_CHOICES} opções mutuamente exclusivas, curtas e paralelas. "
+                    "Não inclua “Outro” — a UI já oferece texto livre."
                 ),
             },
         },
-        "required": ["question"],
+        "required": ["question", "choices"],
     },
 }
 

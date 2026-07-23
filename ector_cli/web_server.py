@@ -84,7 +84,7 @@ _SESSION_HEADER_NAME = "X-Ector-Session-Token"
 
 # ---------------------------------------------------------------------------
 # "Real" dashboard authentication (optional): signed access tokens exchanged
-# for an HttpOnly cookie. Enables token URL on `ector localhost` startup.
+# for an HttpOnly cookie. Enables token URL on bare ``ector`` startup.
 # ---------------------------------------------------------------------------
 _DASH_AUTH_COOKIE_NAME = "ector_dash_auth"
 _DASH_AUTH_QUERY_PARAM = "token"
@@ -131,9 +131,9 @@ def clear_dashboard_pid_file() -> None:
 _DASHBOARD_CMD_PATTERNS = (
     "ector_cli.dashboard_daemon",
     "ector_cli.web_server",
-    "ector_cli.main localhost",
-    "ector_cli/main.py localhost",
-    "ector localhost",
+    "ector_cli.main",
+    "ector_cli/main.py",
+    "ector",
     "ector_cli.main web",
     "ector_cli/main.py web",
 )
@@ -752,7 +752,7 @@ async def dashboard_access_middleware(request: Request, call_next):
     """Gate the entire dashboard behind a signed access token/cookie.
 
     Flow:
-    - User hits any URL with `?token=...` (generated when starting `ector localhost`)
+    - User hits any URL with `?token=...` (generated when starting `ector`)
     - If valid, we set an HttpOnly cookie and redirect to the same URL without the token.
     - Subsequent requests are authorized by the cookie.
     """
@@ -1020,6 +1020,11 @@ class OpenProjectBody(BaseModel):
     session_id: Optional[str] = None
 
 
+class FsMkdirBody(BaseModel):
+    path: str
+    name: str
+
+
 class SetupInferenceBlock(BaseModel):
     """Provedor + modelo + segredos opcionais (mesma semântica do ``ector setup`` rápido)."""
 
@@ -1088,11 +1093,27 @@ def _setup_merge_model_dict(
 ) -> None:
     """Atualiza ``cfg['model']`` como dict com default, provider e base_url."""
     from ector_constants import OPENROUTER_BASE_URL
+    from ector_cli.model_switch import (
+        pin_provider_model_in_config,
+        track_configured_provider,
+    )
+    from ector_cli.models import normalize_provider
 
     md: Dict[str, Any] = {}
     existing = cfg.get("model")
     if isinstance(existing, dict):
         md = dict(existing)
+        old_provider = str(existing.get("provider") or "").strip()
+        old_model = str(existing.get("default") or "").strip()
+        new_provider = str(provider_id or "").strip()
+        if (
+            old_provider
+            and old_model
+            and new_provider
+            and normalize_provider(old_provider) != normalize_provider(new_provider)
+        ):
+            pin_provider_model_in_config(cfg, old_provider, old_model)
+            track_configured_provider(cfg, old_provider)
     name = (model_default or "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="Informe o nome do modelo.")
@@ -1110,6 +1131,8 @@ def _setup_merge_model_dict(
         else:
             md.pop("base_url", None)
     cfg["model"] = md
+    pin_provider_model_in_config(cfg, provider_id, name)
+    track_configured_provider(cfg, provider_id)
 
 
 def _setup_apply_recommended_agent_defaults(cfg: Dict[str, Any]) -> None:
@@ -1305,6 +1328,10 @@ async def get_status(session_id: Optional[str] = None):
         "managed_system": managed_system,
         "cwd": _footer.get("cwd", ""),
         "cwd_label": _footer.get("cwd_label", ""),
+        "cwd_dir_name": _footer.get("cwd_dir_name", ""),
+        "git_branch": _footer.get("git_branch"),
+        "git_modified": _footer.get("git_modified", 0),
+        "git_untracked": _footer.get("git_untracked", 0),
         "model": _footer.get("model", ""),
         "model_label": _footer.get("model_label", ""),
         "provider": _footer.get("provider", ""),
@@ -1396,6 +1423,17 @@ def _tail_lines(path: Path, n: int) -> List[str]:
 
 def _spawn_gateway_cli_action(subcommand: str, action_name: str) -> dict:
     try:
+        if subcommand in ("start", "restart"):
+            try:
+                from gateway.status import write_runtime_status
+
+                write_runtime_status(
+                    gateway_state="starting",
+                    exit_reason=None,
+                    restart_requested=subcommand == "restart",
+                )
+            except Exception:
+                pass
         proc = _spawn_ector_action(["gateway", subcommand], action_name)
     except Exception as exc:
         _log.exception("Failed to spawn gateway %s", subcommand)
@@ -1591,15 +1629,26 @@ async def get_sessions(limit: int = 20, offset: int = 0):
         from ector_state import SessionDB
         db = SessionDB()
         try:
-            sessions = db.list_sessions_rich(limit=limit, offset=offset)
-            total = db.session_count()
+            # Over-fetch then drop empty untitled shells so ghost rows from
+            # cwd-only ensures / leaked tests do not fill the Recentes list.
+            fetch_limit = max(limit + offset, limit) * 3
+            sessions = db.list_sessions_rich(limit=fetch_limit, offset=0)
+            visible = [
+                s
+                for s in sessions
+                if (s.get("title") or "").strip()
+                or (s.get("preview") or "").strip()
+                or int(s.get("message_count") or 0) > 0
+            ]
+            total = len(visible)
+            page = visible[offset : offset + limit]
             now = time.time()
-            for s in sessions:
+            for s in page:
                 s["is_active"] = (
                     s.get("ended_at") is None
                     and (now - s.get("last_active", s.get("started_at", 0))) < 300
                 )
-            return {"sessions": sessions, "total": total, "limit": limit, "offset": offset}
+            return {"sessions": page, "total": total, "limit": limit, "offset": offset}
         finally:
             db.close()
     except Exception as e:
@@ -1695,6 +1744,10 @@ _EMPTY_MODEL_INFO: dict = {
     "model_label": "(modelo)",
     "cwd": "",
     "cwd_label": "",
+    "cwd_dir_name": "",
+    "git_branch": None,
+    "git_modified": 0,
+    "git_untracked": 0,
     "auto_context_length": 0,
     "config_context_length": 0,
     "effective_context_length": 0,
@@ -1703,7 +1756,8 @@ _EMPTY_MODEL_INFO: dict = {
 
 
 def _short_display_cwd(cwd: str, max_len: int = 40) -> str:
-    """Compact path for dashboard composer footer (parity with Ink TUI)."""
+    """Home-relative path for dashboard composer footer (UI clips; no pre-truncation)."""
+    del max_len  # kept for call-site compatibility
     try:
         home = os.path.expanduser("~")
     except Exception:
@@ -1711,9 +1765,51 @@ def _short_display_cwd(cwd: str, max_len: int = 40) -> str:
     p = cwd
     if home and p.startswith(home):
         p = "~" + p[len(home) :]
-    if len(p) <= max_len:
-        return p
-    return "\u2026" + p[-(max_len - 1) :]
+    return p
+
+
+def _cwd_footer_fields(
+    cwd: str, *, session_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """Cwd + compact git summary for composer footer payloads."""
+    from agent.git_footer import resolve_git_footer
+    from agent.session_cwd import path_is_web_workspace, web_workspace_defined
+
+    text = (cwd or "").strip()
+    label = _short_display_cwd(text) if text else ""
+    # Prefer session persistence; also treat the cwd in this payload as the
+    # opened project (landing opens no longer mutate TERMINAL_CWD).
+    workspace_defined = web_workspace_defined(session_id) or (
+        path_is_web_workspace(text) if text else False
+    )
+    payload: Dict[str, Any] = {
+        "cwd": text,
+        "cwd_label": label or text,
+        "workspace_defined": workspace_defined,
+    }
+    if text:
+        payload.update(resolve_git_footer(text).as_payload())
+    else:
+        payload.update(
+            {
+                "cwd_dir_name": "",
+                "git_branch": None,
+                "git_modified": 0,
+                "git_untracked": 0,
+            }
+        )
+    return payload
+
+
+def _git_footer_slice(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "cwd_dir_name": payload.get("cwd_dir_name", ""),
+        "git_branch": payload.get("git_branch"),
+        "git_modified": payload.get("git_modified", 0),
+        "git_untracked": payload.get("git_untracked", 0),
+        "git_ahead": payload.get("git_ahead", 0),
+        "git_behind": payload.get("git_behind", 0),
+    }
 
 
 def _short_display_model(model: str) -> str:
@@ -1771,6 +1867,25 @@ def _apply_web_dashboard_terminal_cwd(*, reset_envs: bool = False) -> str:
     return cwd
 
 
+# Pasta escolhida no landing (sem session_id) — não partilhar via TERMINAL_CWD.
+_WEB_LANDING_CWD: Optional[str] = None
+_WEB_LANDING_CWD_LOCK = threading.Lock()
+
+
+def _set_web_landing_cwd(cwd: Optional[str]) -> None:
+    global _WEB_LANDING_CWD
+    with _WEB_LANDING_CWD_LOCK:
+        text = (cwd or "").strip()
+        _WEB_LANDING_CWD = (
+            os.path.abspath(os.path.expanduser(text)) if text else None
+        )
+
+
+def _get_web_landing_cwd() -> Optional[str]:
+    with _WEB_LANDING_CWD_LOCK:
+        return _WEB_LANDING_CWD
+
+
 def _cwd_from_model_config(raw: Any) -> Optional[str]:
     from agent.session_cwd import cwd_from_model_config
 
@@ -1786,13 +1901,46 @@ def _load_persisted_session_cwd(session_id: str) -> Optional[str]:
 def _apply_web_session_cwd(session_id: str, cwd: str) -> str:
     from agent.session_cwd import apply_session_cwd
 
-    return apply_session_cwd(session_id, cwd)
+    return apply_session_cwd(session_id, cwd, cwd_placeholder="home")
 
 
 def _prime_web_session_cwd(session_id: Optional[str]) -> None:
-    from agent.session_cwd import prime_session_cwd
+    from agent.session_cwd import path_is_web_workspace, prime_session_cwd
 
+    sid = (session_id or "").strip()
+    if sid:
+        # Prefer the UI project (landing / openProject) over priming to home —
+        # footer polls must not register a home override that the agent then
+        # treats as the session cwd while the chip still shows the repo.
+        desired = _resolve_web_chat_cwd(sid)
+        if path_is_web_workspace(desired):
+            _apply_web_session_cwd(sid, desired)
+            return
     prime_session_cwd(session_id, cwd_placeholder="home")
+
+
+def _bind_web_session_cwd_after_ensure(session_id: str) -> str:
+    """After ``ensure_session``, attach the UI project folder to the agent turn.
+
+    Landing / openProject may have the folder before a SQLite row exists. Capture
+    that path (via ``_resolve_web_chat_cwd``), then apply+persist so tools and the
+    system prompt see the same cwd as the git chip — not the user home.
+    """
+    from agent.session_cwd import path_is_web_workspace
+
+    sid = (session_id or "").strip()
+    if not sid:
+        return ""
+
+    desired = _resolve_web_chat_cwd(sid)
+    if path_is_web_workspace(desired):
+        applied = _apply_web_session_cwd(sid, desired)
+        _persist_web_session_cwd(sid, applied)
+        _set_web_landing_cwd(None)
+        return applied
+
+    _prime_web_session_cwd(sid)
+    return _resolve_web_chat_cwd(sid)
 
 
 def _persist_web_session_cwd(session_id: str, cwd: str) -> None:
@@ -1824,9 +1972,21 @@ def _sync_web_session_cwd_from_env(
 
 
 def _resolve_web_chat_cwd(session_id: Optional[str] = None) -> str:
-    from agent.session_cwd import resolve_chat_cwd
+    from agent.session_cwd import path_is_web_workspace, resolve_chat_cwd
 
-    return resolve_chat_cwd(session_id, cwd_placeholder="home")
+    sid = (session_id or "").strip()
+    landing = _get_web_landing_cwd()
+    if sid:
+        cwd = resolve_chat_cwd(sid, cwd_placeholder="home")
+        # Fresh session created from the landing screen before openProject
+        # binds the folder — keep the landing project so the git bar does
+        # not flicker back to "Abrir pasta".
+        if landing and not path_is_web_workspace(cwd):
+            return landing
+        return cwd
+    if landing:
+        return landing
+    return resolve_chat_cwd(None, cwd_placeholder="home")
 
 
 def _resolve_web_chat_model_from_config() -> tuple[str, str]:
@@ -1993,24 +2153,49 @@ def _resolve_web_session_cost(session_id: Optional[str] = None) -> tuple[Optiona
     return None, "unknown"
 
 
+def _composer_model_is_available(model: str, provider: str = "") -> bool:
+    try:
+        from ector_cli.model_switch import composer_model_is_available
+
+        return composer_model_is_available(model, provider, config=load_config() or {})
+    except Exception:
+        return True
+
+
 def _chat_footer_payload(session_id: Optional[str] = None) -> Dict[str, Any]:
+    from tools.agent_mode import agent_mode_label, get_session_agent_mode
+
     model, provider = _resolve_web_chat_model_for_footer()
+    if model and not _composer_model_is_available(model, provider):
+        model, provider = "", ""
     cwd = _resolve_web_chat_cwd(session_id)
-    cwd_label = _short_display_cwd(cwd) if cwd else ""
     show_cost = _display_show_cost_enabled()
+    agent_mode = get_session_agent_mode((session_id or "").strip())
     payload: Dict[str, Any] = {
         "model": model,
-        "model_label": _short_display_model(model),
+        "model_label": _short_display_model(model) if model else "(modelo)",
         "provider": provider,
-        "cwd": cwd,
-        "cwd_label": cwd_label or cwd,
         "show_cost": show_cost,
+        "agent_mode": agent_mode,
+        "agent_mode_label": agent_mode_label(agent_mode),
+        **_cwd_footer_fields(cwd, session_id=session_id),
     }
     if show_cost:
         cost_usd, cost_status = _resolve_web_session_cost(session_id)
         if cost_usd is not None and cost_usd > 0:
             payload["cost_usd"] = cost_usd
             payload["cost_status"] = cost_status
+    sid = (session_id or "").strip()
+    if sid:
+        try:
+            from agent.plan_store import read_session_plan
+
+            plan = read_session_plan(sid)
+            if plan:
+                payload["has_plan"] = True
+                payload["plan_display_path"] = plan.get("display_path") or ""
+        except Exception:
+            pass
     return payload
 
 
@@ -2019,8 +2204,7 @@ def get_working_directory(session_id: Optional[str] = None):
     """Current working directory for the web composer footer."""
     _prime_web_session_cwd(session_id)
     cwd = _resolve_web_chat_cwd(session_id)
-    label = _short_display_cwd(cwd) if cwd else ""
-    return {"cwd": cwd, "cwd_label": label or cwd}
+    return _cwd_footer_fields(cwd, session_id=session_id)
 
 
 @app.get("/api/chat/context")
@@ -2031,18 +2215,21 @@ def get_chat_context(session_id: Optional[str] = None):
         return _chat_footer_payload(session_id)
     except Exception:
         _log.exception("GET /api/chat/context failed")
+        from tools.agent_mode import agent_mode_label, get_session_agent_mode
+
         cwd = ""
         try:
             cwd = _resolve_web_chat_cwd(session_id)
         except Exception:
             pass
-        label = _short_display_cwd(cwd) if cwd else ""
+        mode = get_session_agent_mode((session_id or "").strip())
         return {
             "model": "",
             "model_label": "(modelo)",
             "provider": "",
-            "cwd": cwd,
-            "cwd_label": label or cwd,
+            "agent_mode": mode,
+            "agent_mode_label": agent_mode_label(mode),
+            **_cwd_footer_fields(cwd, session_id=session_id),
         }
 
 
@@ -2077,12 +2264,22 @@ def open_project(body: OpenProjectBody):
     if sid:
         _apply_web_session_cwd(sid, resolved)
         _persist_web_session_cwd(sid, resolved)
+        _invalidate_web_session_system_prompt(sid)
+        # Only drop landing once SQLite has the cwd. Persist is a no-op when the
+        # session row does not exist yet — keep landing so the next chat send
+        # can still bind the project instead of priming to home.
+        persisted = _load_persisted_session_cwd(sid)
+        if persisted and os.path.abspath(persisted) == os.path.abspath(resolved):
+            _set_web_landing_cwd(None)
+        else:
+            _set_web_landing_cwd(resolved)
     else:
-        os.environ["TERMINAL_CWD"] = resolved
+        # Landing (sem sessão): só memória de landing — não mutar TERMINAL_CWD
+        # nem invalidar agentes de outros chats em paralelo.
+        _set_web_landing_cwd(resolved)
 
     record_project_open(resolved)
-    label = _short_display_cwd(resolved)
-    return {"cwd": resolved, "cwd_label": label or resolved}
+    return _cwd_footer_fields(resolved, session_id=sid or None)
 
 
 @app.get("/api/fs/browse")
@@ -2100,6 +2297,21 @@ def browse_folders(path: str = "", q: str = "", hide_hidden: bool = False):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return payload
+
+
+@app.post("/api/fs/mkdir")
+def create_folder(body: FsMkdirBody):
+    """Create a subdirectory for the web folder picker."""
+    from ector_cli.fs_browse import create_directory
+
+    try:
+        return create_directory(
+            body.path,
+            body.name,
+            label_fn=_short_display_cwd,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/model/options")
@@ -2121,6 +2333,10 @@ def get_model_options(session_id: Optional[str] = None):
                     current_model = str(agent_model).strip()
                 if agent_provider and str(agent_provider).strip():
                     current_provider = str(agent_provider).strip()
+        if current_model and not _composer_model_is_available(
+            current_model, current_provider
+        ):
+            current_model, current_provider = "", ""
         user_providers = (
             cfg.get("providers") if isinstance(cfg.get("providers"), dict) else {}
         )
@@ -2186,6 +2402,7 @@ def get_model_info(session_id: Optional[str] = None):
                 "provider": provider or footer["provider"],
                 "cwd": footer["cwd"],
                 "cwd_label": footer["cwd_label"],
+                **_git_footer_slice(footer),
             }
 
         # Resolve auto-detected context length (pass config_ctx=None to get
@@ -2236,6 +2453,7 @@ def get_model_info(session_id: Optional[str] = None):
             "capabilities": caps,
             "cwd": footer["cwd"],
             "cwd_label": footer["cwd_label"],
+            **_git_footer_slice(footer),
             "model_label": display_label,
         }
     except Exception:
@@ -2246,6 +2464,7 @@ def get_model_info(session_id: Optional[str] = None):
                 **dict(_EMPTY_MODEL_INFO),
                 "cwd": footer["cwd"],
                 "cwd_label": footer["cwd_label"],
+                **_git_footer_slice(footer),
                 "model_label": footer["model_label"],
                 "model": footer["model"],
                 "provider": footer["provider"],
@@ -2498,6 +2717,7 @@ async def get_env_vars():
             "is_password": info.get("password", False),
             "tools": info.get("tools", []),
             "advanced": info.get("advanced", False),
+            "deprecated": info.get("deprecated", False),
         }
     return result
 
@@ -2596,23 +2816,35 @@ def _truncate_token(value: Optional[str], visible: int = 6) -> str:
     return f"…{s[-visible:]}"
 
 
-def _anthropic_oauth_status() -> Dict[str, Any]:
-    """Combined status across the three Anthropic credential sources we read.
+def _oauth_expires_at_iso(value: Any) -> Optional[str]:
+    """Normalize OAuth expiry values (ms int or ISO str) for the dashboard."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, str):
+        return value
+    try:
+        from datetime import datetime, timezone
 
-    Ector resolves Anthropic creds in this order at runtime:
-    1. ``~/.ector/.anthropic_oauth.json`` — Ector-managed PKCE flow
-    2. ``~/.claude/.credentials.json`` — Claude Code CLI credentials (auto)
-    3. ``ANTHROPIC_TOKEN`` / ``ANTHROPIC_API_KEY`` env vars
-    The dashboard reports the highest-priority source that's actually present.
+        ts = int(value)
+        if ts > 10_000_000_000:
+            ts //= 1000
+        return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def _anthropic_oauth_status() -> Dict[str, Any]:
+    """Status for Ector-managed Anthropic OAuth (PKCE file + env token).
+
+    Claude Code credentials are reported separately via
+    ``_claude_code_only_status`` so this card never mirrors ~/.claude/*.
     """
     try:
         from agent.anthropic_adapter import (
             read_ector_oauth_credentials,
-            read_claude_code_credentials,
             _ECTOR_OAUTH_FILE,
         )
     except ImportError:
-        read_claude_code_credentials = None  # type: ignore
         read_ector_oauth_credentials = None  # type: ignore
         _ECTOR_OAUTH_FILE = None  # type: ignore
 
@@ -2632,23 +2864,20 @@ def _anthropic_oauth_status() -> Dict[str, Any]:
             "has_refresh_token": bool(ector_creds.get("refreshToken")),
         }
 
-    cc_creds = None
-    if read_claude_code_credentials:
-        try:
-            cc_creds = read_claude_code_credentials()
-        except Exception:
-            cc_creds = None
-    if cc_creds and cc_creds.get("accessToken"):
-        return {
-            "logged_in": True,
-            "source": "claude_code",
-            "source_label": "Claude Code (~/.claude/.credentials.json)",
-            "token_preview": _truncate_token(cc_creds.get("accessToken")),
-            "expires_at": cc_creds.get("expiresAt"),
-            "has_refresh_token": bool(cc_creds.get("refreshToken")),
-        }
-
     env_token = os.getenv("ANTHROPIC_TOKEN") or os.getenv("CLAUDE_CODE_OAUTH_TOKEN")
+    if env_token:
+        try:
+            from ector_cli.auth import is_source_suppressed
+
+            env_source = (
+                "env:ANTHROPIC_TOKEN"
+                if os.getenv("ANTHROPIC_TOKEN")
+                else "env:CLAUDE_CODE_OAUTH_TOKEN"
+            )
+            if is_source_suppressed("anthropic", env_source):
+                env_token = None
+        except ImportError:
+            pass
     if env_token:
         return {
             "logged_in": True,
@@ -2673,16 +2902,37 @@ def _claude_code_only_status() -> Dict[str, Any]:
         creds = read_claude_code_credentials()
     except Exception:
         creds = None
-    if creds and creds.get("accessToken"):
-        return {
-            "logged_in": True,
-            "source": "claude_code_cli",
-            "source_label": "~/.claude/.credentials.json",
-            "token_preview": _truncate_token(creds.get("accessToken")),
-            "expires_at": creds.get("expiresAt"),
-            "has_refresh_token": bool(creds.get("refreshToken")),
-        }
-    return {"logged_in": False, "source": None}
+
+    if not creds or not creds.get("accessToken"):
+        return {"logged_in": False, "source": None, "credentials_present": False}
+
+    try:
+        from ector_cli.auth import (
+            is_source_suppressed,
+            maybe_unsuppress_claude_code_on_fresh_credentials,
+        )
+
+        maybe_unsuppress_claude_code_on_fresh_credentials(creds)
+        suppressed = is_source_suppressed("anthropic", "claude_code")
+    except ImportError:
+        suppressed = False
+
+    source = creds.get("source") or "claude_code_cli"
+    if source == "macos_keychain":
+        source_label = "macOS Keychain (Claude Code-credentials)"
+    else:
+        source_label = "~/.claude/.credentials.json"
+
+    return {
+        "logged_in": not suppressed,
+        "credentials_present": True,
+        "suppressed": suppressed,
+        "source": source,
+        "source_label": source_label,
+        "token_preview": _truncate_token(creds.get("accessToken")),
+        "expires_at": _oauth_expires_at_iso(creds.get("expiresAt")),
+        "has_refresh_token": bool(creds.get("refreshToken")),
+    }
 
 
 # Provider catalog. The order matters — it's how we render the UI list.
@@ -2832,6 +3082,38 @@ async def list_oauth_providers():
     return {"providers": providers}
 
 
+@app.post("/api/providers/oauth/{provider_id}/connect")
+async def connect_oauth_provider(provider_id: str, request: Request):
+    """Re-enable an external OAuth provider after a dashboard disconnect."""
+    _require_token(request)
+
+    if provider_id != "claude-code":
+        raise HTTPException(
+            status_code=400,
+            detail="Reconexão automática disponível apenas para Claude Code.",
+        )
+
+    try:
+        from ector_cli.auth import connect_claude_code_auth
+
+        ok = connect_claude_code_auth()
+    except Exception as e:
+        _log.exception("oauth/connect: claude-code failed")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+    if not ok:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Credenciais do Claude Code não encontradas. "
+                "Execute `claude setup-token` no terminal e tente de novo."
+            ),
+        )
+
+    _log.info("oauth/connect: claude-code (ok=%s)", ok)
+    return {"ok": True, "provider": provider_id}
+
+
 @app.delete("/api/providers/oauth/{provider_id}")
 async def disconnect_oauth_provider(provider_id: str, request: Request):
     """Disconnect an OAuth provider. Token-protected (matches /env/reveal)."""
@@ -2845,25 +3127,18 @@ async def disconnect_oauth_provider(provider_id: str, request: Request):
                    f"Disponíveis: {', '.join(sorted(valid_ids))}",
         )
 
-    # Anthropic and claude-code clear the same Ector-managed PKCE file
-    # AND forget the Claude Code import. We don't touch ~/.claude/* directly
-    # — that's owned by the Claude Code CLI; users can re-auth there if they
-    # want to undo a disconnect.
+    # Anthropic and claude-code share credential sources but disconnect
+    # different slices: Ector PKCE/env vs Claude Code import suppression.
     if provider_id in ("anthropic", "claude-code"):
         try:
-            from agent.anthropic_adapter import _ECTOR_OAUTH_FILE
-            if _ECTOR_OAUTH_FILE.exists():
-                _ECTOR_OAUTH_FILE.unlink()
-        except Exception:
-            pass
-        # Also clear the credential pool entry if present.
-        try:
-            from ector_cli.auth import clear_provider_auth
-            clear_provider_auth("anthropic")
-        except Exception:
-            pass
-        _log.info("oauth/disconnect: %s", provider_id)
-        return {"ok": True, "provider": provider_id}
+            from ector_cli.auth import disconnect_oauth_provider_auth
+
+            ok = disconnect_oauth_provider_auth(provider_id)
+        except Exception as e:
+            _log.exception("oauth/disconnect: %s failed", provider_id)
+            raise HTTPException(status_code=500, detail=str(e)) from e
+        _log.info("oauth/disconnect: %s (ok=%s)", provider_id, ok)
+        return {"ok": bool(ok), "provider": provider_id}
 
     if provider_id == "google-gemini-cli":
         file_cleared = False
@@ -3027,6 +3302,15 @@ def _save_anthropic_oauth_creds(access_token: str, refresh_token: str, expires_a
         pool.add_entry(entry)
     except Exception as e:
         _log.warning("anthropic pool add (dashboard) failed: %s", e)
+    try:
+        from ector_cli.config import load_config, save_config
+        from ector_cli.model_switch import track_configured_provider
+
+        cfg = load_config()
+        track_configured_provider(cfg, "anthropic")
+        save_config(cfg)
+    except Exception as e:
+        _log.debug("anthropic configured_providers update failed: %s", e)
 
 
 def _start_anthropic_pkce() -> Dict[str, Any]:
@@ -3422,11 +3706,16 @@ def _token_stats_from_row(row: dict) -> Dict[str, Any]:
 
 def _build_session_usage_summary(session_id: str, db) -> Dict[str, Any]:
     """Aggregate usage across compression lineage (root → tip)."""
-    chain = db._session_lineage_root_to_tip(session_id)
-    tip_id = chain[-1] if chain else session_id
+    tip_id = _web_chat_history_session_id(db, session_id)
+    chain = db._session_lineage_root_to_tip(tip_id)
+    if session_id not in chain:
+        # Tip may sit below a root that walked upward won't include when we
+        # start from tip alone — prepend the client-facing id when distinct.
+        chain = list(dict.fromkeys([session_id, *chain]))
 
     with _CHAT_AGENTS_LOCK:
-        live_agent = _CHAT_AGENTS.get(tip_id)
+        # Web agents are keyed by the client/URL session id, not the tip.
+        live_agent = _CHAT_AGENTS.get(session_id) or _CHAT_AGENTS.get(tip_id)
 
     models: list[str] = []
     models_seen: set[str] = set()
@@ -3555,9 +3844,29 @@ async def get_session_messages(session_id: str):
         if not sid:
             raise HTTPException(status_code=404, detail="Sessão não encontrada")
         messages = prepare_session_messages_for_dashboard(
-            db.get_messages(sid), session_id=sid
+            db.get_messages(_web_chat_history_session_id(db, sid)), session_id=sid
         )
         return {"session_id": sid, "messages": messages}
+    finally:
+        db.close()
+
+
+@app.get("/api/sessions/{session_id}/chapters")
+async def get_session_chapters(session_id: str):
+    """Chapter markers for the dashboard's floating table of contents.
+
+    Written by the agent's ``mark_chapter`` tool. Anchored by timestamp, not
+    message index, so the frontend places each divider before the first
+    message whose own timestamp is >= the chapter's ``created_at``.
+    """
+    from ector_state import SessionDB
+    db = SessionDB()
+    try:
+        sid = db.resolve_session_id(session_id)
+        if not sid:
+            raise HTTPException(status_code=404, detail="Sessão não encontrada")
+        chapters = db.get_chapters(_web_chat_history_session_id(db, sid))
+        return {"session_id": sid, "chapters": chapters}
     finally:
         db.close()
 
@@ -3626,6 +3935,13 @@ _CHAT_AGENTS_LOCK = threading.RLock()
 _CHAT_INFLIGHT: dict[str, dict[str, Any]] = {}  # session_id → {request_id, started_at}
 _CHAT_SESSION_DB: Any | None = None
 
+# Stop pressed while the agent for this session is still being constructed
+# (config load, model resolution, AIAgent init) — no object exists yet in
+# _CHAT_AGENTS to call .interrupt() on. Recorded here so the run() worker
+# thread honors it the instant the agent is registered, instead of silently
+# running the turn to completion while the UI already looks stopped.
+_CHAT_STOP_REQUESTED: set[str] = set()
+
 
 def _mark_chat_inflight(session_id: str, request_id: str) -> None:
     with _CHAT_AGENTS_LOCK:
@@ -3638,10 +3954,56 @@ def _mark_chat_inflight(session_id: str, request_id: str) -> None:
 def _clear_chat_inflight(session_id: str) -> None:
     with _CHAT_AGENTS_LOCK:
         _CHAT_INFLIGHT.pop(session_id, None)
+    _CHAT_INFLIGHT_STUCK_REVISION.pop(session_id, None)
+
+
+def _promote_web_chat_bg_notify(session_id: str) -> int:
+    """Ensure running bg processes wake the agent when the turn ends idle.
+
+    Agents often spawn ``background=true`` without ``notify_on_complete`` and
+    then say "deixando rodar". Promoting notify on turn release keeps the
+    existing web process watcher able to resume the chat when the job exits.
+    """
+    sid = (session_id or "").strip()
+    if not sid:
+        return 0
+    try:
+        from tools.process_registry import process_registry
+    except Exception:
+        return 0
+
+    promoted = 0
+    for entry in process_registry.list_for_session_key(sid):
+        if entry.get("status") != "running":
+            continue
+        proc_id = str(entry.get("session_id") or "").strip()
+        if not proc_id:
+            continue
+        session = process_registry.get(proc_id)
+        if session is None or session.exited:
+            continue
+        if session.notify_on_complete:
+            continue
+        # Active watch_patterns already deliver mid-process events; leave them.
+        watch_active = bool(session.watch_patterns) and not getattr(
+            session, "_watch_disabled", False
+        )
+        if watch_active:
+            continue
+        session.notify_on_complete = True
+        promoted += 1
+    return promoted
 
 
 def _release_web_chat_turn(session_id: str) -> None:
     """Drop in-flight markers and live overlay when a turn ends (idempotent)."""
+    try:
+        _promote_web_chat_bg_notify(session_id)
+    except Exception:
+        _log.exception(
+            "Failed to promote background notify_on_complete for session %s",
+            session_id,
+        )
     _clear_chat_inflight(session_id)
     try:
         from ector_cli import web_chat_live as _web_chat_live
@@ -3651,9 +4013,351 @@ def _release_web_chat_turn(session_id: str) -> None:
         pass
 
 
+def _fence_process_output_for_prompt(out: str) -> str:
+    """Wrap process stdout in a markdown fence for agent prompts / echo safety."""
+    text = (out or "").rstrip()
+    if not text:
+        return "(sem saída)"
+    # Avoid breaking outer fences if the log itself contains ```.
+    safe = text.replace("```", "'''")
+    return f"```text\n{safe}\n```"
 
 
+def _format_web_process_notification(evt: dict) -> str | None:
+    """Format a process completion/watch event for a synthetic web chat turn."""
+    evt_type = evt.get("type", "completion")
+    sid = evt.get("session_id", "unknown")
+    cmd = evt.get("command", "unknown")
+
+    if evt_type == "watch_disabled":
+        msg = evt.get("message") or ""
+        return f"[IMPORTANTE: {msg}]" if msg else None
+
+    if evt_type == "watch_match":
+        pat = evt.get("pattern", "?")
+        out = evt.get("output", "")
+        return (
+            f"[IMPORTANTE: O processo em segundo plano {sid} correspondeu ao "
+            f'padrão de observação "{pat}".\n'
+            f"Comando: {cmd}\n"
+            f"Saída correspondente:\n{_fence_process_output_for_prompt(out)}\n"
+            "NÃO cole este bloco na resposta. Resuma o resultado ao utilizador "
+            "em linguagem clara; se houver erros, cite trechos curtos em fences.]"
+        )
+
+    if evt_type != "completion":
+        return None
+
+    exit_code = evt.get("exit_code", "?")
+    out = evt.get("output", "")
+    return (
+        f"[IMPORTANTE: O processo em segundo plano {sid} foi concluído "
+        f"(código de saída {exit_code}).\n"
+        f"Comando: {cmd}\n"
+        f"Saída:\n{_fence_process_output_for_prompt(out)}\n"
+        "NÃO cole este bloco na resposta. Resuma o resultado ao utilizador "
+        "em linguagem clara; se houver erros, cite trechos curtos em fences "
+        "de código e continue se ainda houver trabalho.]"
+    )
+
+
+def _web_chat_session_id_for_process_event(evt: dict) -> str:
+    return str(evt.get("session_key") or evt.get("task_id") or "").strip()
+
+
+def _run_web_chat_process_notification(session_id: str, prompt: str) -> None:
+    """Resume a web chat agent after a background process event (no SSE client)."""
+    from ector_cli import web_chat_live as _web_chat_live
+
+    sid = (session_id or "").strip()
+    text = (prompt or "").strip()
+    if not sid or not text:
+        return
+    if _is_chat_inflight(sid):
+        return
+
+    request_id = str(uuid.uuid4())
+    _mark_chat_inflight(sid, request_id)
+    _web_chat_live.begin_turn(sid, request_id)
+
+    def on_chunk(chunk: str) -> None:
+        if chunk:
+            _web_chat_live.append_text(sid, chunk)
+
+    def on_status(kind: str, status_text: str = None) -> None:
+        if status_text:
+            _web_chat_live.set_status(sid, status_text)
+
+    def on_tool_start(tc_id, name, args) -> None:
+        import json as _j
+
+        context = ""
+        technical = ""
+        try:
+            from agent.display import build_tool_preview, build_tool_technical_summary
+
+            context = build_tool_preview(name, args, max_len=240) or ""
+            technical = build_tool_technical_summary(name, args) or ""
+        except Exception:
+            pass
+        args_str = args if isinstance(args, str) else _j.dumps(args)
+        _web_chat_live.tool_start(
+            sid,
+            tool_id=str(tc_id or ""),
+            name=str(name or "tool"),
+            args=args_str,
+            live_label=context,
+            live_technical=technical,
+        )
+
+    def on_tool_complete(tc_id, name, args, result) -> None:
+        import json as _j
+
+        if name in ("terminal", "shell", "process"):
+            _sync_web_session_cwd_from_env(sid, allow_default_env=False)
+        result_str = str(result) if result is not None else None
+        args_str = args if isinstance(args, str) else _j.dumps(args)
+        _web_chat_live.tool_complete(
+            sid,
+            tool_id=str(tc_id or ""),
+            name=str(name or "tool"),
+            args=args_str,
+            result=result_str,
+        )
+
+    def on_tool_progress(tc_id, name, label) -> None:
+        _web_chat_live.tool_progress(
+            sid,
+            tool_id=str(tc_id or ""),
+            tool_name=str(name or "tool"),
+            preview=str(label or ""),
+        )
+
+    def on_thinking(text: str = None) -> None:
+        _web_chat_live.set_thinking(sid)
+
+    def on_reasoning(text: str = None) -> None:
+        if text:
+            _web_chat_live.set_thinking(sid)
+
+    def on_approval_request(approval_data: dict) -> None:
+        # No live SSE client — approval is recovered via /api/chat/approval/pending.
+        return
+
+    def on_wiser_request(_wiser_data: dict) -> None:
+        # No live SSE client — Wiser is recovered via /api/chat/wiser/pending.
+        return
+
+    try:
+        agent = None
+        with _CHAT_AGENTS_LOCK:
+            agent = _CHAT_AGENTS.get(sid)
+        if agent is None:
+            _log.info(
+                "Skipping background process notification — no web agent for session %s",
+                sid,
+            )
+            return
+
+        agent.tool_start_callback = on_tool_start
+        agent.tool_complete_callback = on_tool_complete
+        agent.tool_progress_callback = on_tool_progress
+        agent.thinking_callback = on_thinking
+        agent.reasoning_callback = on_reasoning
+        agent.status_callback = on_status
+        agent.stream_delta_callback = on_chunk
+        agent.interim_assistant_callback = None
+
+        history = None
+        session_db = getattr(agent, "_session_db", None)
+        if session_db is not None:
+            try:
+                history_sid = _web_chat_history_session_id(session_db, sid)
+                session_db.ensure_session(
+                    history_sid, source="web", model=getattr(agent, "model", None)
+                )
+                history = session_db.get_messages_as_conversation(history_sid) or None
+            except Exception:
+                _log.debug(
+                    "Failed to load history for background notification session=%s",
+                    sid,
+                    exc_info=True,
+                )
+                history = None
+
+        with _web_chat_interactive_context(sid, on_approval_request, on_wiser_request):
+            _apply_web_agent_wiser_callback(agent, sid)
+            _prime_web_session_cwd(sid)
+            result = agent.run_conversation(
+                text,
+                conversation_history=history,
+                task_id=sid,
+                # Agent-only notify — never leak ``` fences / IMPORTANTE into the bubble.
+                persist_user_message="",
+            )
+
+        final = (result or {}).get("final_response") or ""
+        interrupted = bool((result or {}).get("interrupted"))
+        if not final.strip():
+            from agent.turn_closure import build_turn_closure_markdown
+
+            closure = build_turn_closure_markdown(
+                (result or {}).get("messages") or [],
+                interrupted=interrupted,
+            )
+            if closure:
+                _web_chat_live.append_text(sid, closure)
+                final = closure
+                if session_db is not None:
+                    try:
+                        session_db.append_message(sid, "assistant", closure)
+                    except Exception:
+                        _log.debug(
+                            "Failed to persist closure for background notification session=%s",
+                            sid,
+                            exc_info=True,
+                        )
+    except Exception:
+        _log.exception(
+            "Web chat background process notification failed session=%s", sid
+        )
+    finally:
+        _release_web_chat_turn(sid)
+
+
+_WEB_PROCESS_WATCHER_STARTED = False
+_WEB_PROCESS_WATCHER_LOCK = threading.Lock()
+_WEB_PROCESS_PENDING: list[dict[str, Any]] = []
+_WEB_PROCESS_PENDING_LOCK = threading.Lock()
+
+
+def _web_chat_process_watcher_loop() -> None:
+    """Drain process completion_queue and resume idle web chat agents."""
+    from queue import Empty
+
+    from tools.process_registry import process_registry
+
+    while True:
+        try:
+            time.sleep(1.0)
+            drained: list[dict[str, Any]] = []
+            while True:
+                try:
+                    drained.append(process_registry.completion_queue.get_nowait())
+                except Empty:
+                    break
+
+            with _WEB_PROCESS_PENDING_LOCK:
+                if drained:
+                    _WEB_PROCESS_PENDING.extend(drained)
+                pending = list(_WEB_PROCESS_PENDING)
+                _WEB_PROCESS_PENDING.clear()
+
+            still_pending: list[dict[str, Any]] = []
+            for evt in pending:
+                if not isinstance(evt, dict):
+                    continue
+                proc_id = str(evt.get("session_id") or "").strip()
+                if proc_id and process_registry.is_completion_consumed(proc_id):
+                    continue
+                chat_sid = _web_chat_session_id_for_process_event(evt)
+                if not chat_sid:
+                    continue
+                with _CHAT_AGENTS_LOCK:
+                    has_agent = chat_sid in _CHAT_AGENTS
+                if not has_agent:
+                    # Keep briefly in case agent is still being created.
+                    age = time.time() - float(evt.get("_queued_at") or time.time())
+                    if "_queued_at" not in evt:
+                        evt = dict(evt)
+                        evt["_queued_at"] = time.time()
+                    if age < 120:
+                        still_pending.append(evt)
+                    continue
+                if _is_chat_inflight(chat_sid):
+                    still_pending.append(evt)
+                    continue
+                prompt = _format_web_process_notification(evt)
+                if not prompt:
+                    continue
+                try:
+                    _run_web_chat_process_notification(chat_sid, prompt)
+                except Exception:
+                    _log.exception(
+                        "Failed to deliver process notification to web session %s",
+                        chat_sid,
+                    )
+                    still_pending.append(evt)
+
+            if still_pending:
+                with _WEB_PROCESS_PENDING_LOCK:
+                    _WEB_PROCESS_PENDING[:0] = still_pending
+        except Exception:
+            _log.exception("Web chat process watcher loop error")
+
+
+def _ensure_web_chat_process_watcher() -> None:
+    global _WEB_PROCESS_WATCHER_STARTED
+    with _WEB_PROCESS_WATCHER_LOCK:
+        if _WEB_PROCESS_WATCHER_STARTED:
+            return
+        thread = threading.Thread(
+            target=_web_chat_process_watcher_loop,
+            name="web-chat-process-watcher",
+            daemon=True,
+        )
+        thread.start()
+        _WEB_PROCESS_WATCHER_STARTED = True
+
+
+
+
+# Absolute stale ceiling for in-flight web chat turns (seconds).
 _CHAT_INFLIGHT_STALE_SEC = 600.0
+# Turn with live snapshot but no revision progress (seconds).
+_CHAT_INFLIGHT_STUCK_SEC = 90.0
+# Agent activity newer than this → turn is alive (terminal/API still working).
+_WEB_CHAT_ACTIVITY_GRACE_SEC = 45.0
+_EXEC_TOOL_NAMES = frozenset({"terminal", "shell", "process"})
+_CHAT_INFLIGHT_STUCK_REVISION: dict[str, dict[str, float | int]] = {}
+
+
+def _web_chat_agent_seconds_since_activity(session_id: str) -> float | None:
+    with _CHAT_AGENTS_LOCK:
+        agent = _CHAT_AGENTS.get(session_id)
+    if agent is None:
+        return None
+    try:
+        summary = agent.get_activity_summary()
+        return float(summary.get("seconds_since_activity", 9999.0))
+    except Exception:
+        return None
+
+
+def _web_chat_has_running_exec_tool(session_id: str) -> bool:
+    try:
+        from ector_cli import web_chat_live as _web_chat_live
+
+        snap = _web_chat_live.snapshot(session_id)
+        if not snap:
+            return False
+        for row in reversed(snap.get("tool_calls") or []):
+            if row.get("status") != "running":
+                continue
+            name = str(row.get("name") or "").strip().lower()
+            if name in _EXEC_TOOL_NAMES:
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _web_chat_turn_should_skip_heal(session_id: str) -> bool:
+    """Skip inflight heal while the agent is still doing real work."""
+    elapsed = _web_chat_agent_seconds_since_activity(session_id)
+    if elapsed is not None and elapsed < _WEB_CHAT_ACTIVITY_GRACE_SEC:
+        return True
+    return _web_chat_has_running_exec_tool(session_id)
 
 
 def _chat_inflight_age_sec(session_id: str) -> float | None:
@@ -3673,6 +4377,79 @@ def _interrupt_web_chat_agent(session_id: str) -> None:
         agent.interrupt()
     except Exception:
         pass
+
+
+def _cancel_web_chat_interactive_waits(session_id: str) -> None:
+    """Unblock approval/Wiser waits so an interrupted agent thread can exit."""
+    sid = (session_id or "").strip()
+    if not sid:
+        return
+    try:
+        from tools.approval import resolve_gateway_approval
+
+        resolve_gateway_approval(sid, "deny", resolve_all=True)
+    except Exception:
+        pass
+    try:
+        from tools.wiser_gateway import resolve_gateway_wiser
+        from tools.wiser_tool import WISER_USER_CANCELLED
+
+        while resolve_gateway_wiser(sid, WISER_USER_CANCELLED) > 0:
+            pass
+    except Exception:
+        pass
+
+
+def _register_chat_agent_and_check_pending_stop(session_id: str, agent: Any) -> bool:
+    """Register *agent* in _CHAT_AGENTS; return True if a stop was already
+    requested for this session while the agent was still being built.
+
+    When True, ``agent.interrupt()`` has already been called and the agent
+    has been removed from _CHAT_AGENTS again — the caller must not proceed
+    to run the turn.
+    """
+    with _CHAT_AGENTS_LOCK:
+        stop_requested_early = session_id in _CHAT_STOP_REQUESTED
+        _CHAT_STOP_REQUESTED.discard(session_id)
+        _CHAT_AGENTS[session_id] = agent
+    if not stop_requested_early:
+        return False
+    try:
+        agent.interrupt()
+    except Exception:
+        pass
+    with _CHAT_AGENTS_LOCK:
+        _CHAT_AGENTS.pop(session_id, None)
+    return True
+
+
+def _user_stop_web_chat_turn(session_id: str) -> None:
+    """Stop an in-flight web chat turn from the UI Parar button.
+
+    Interrupts the agent, unblocks interactive waits, and releases inflight /
+    live overlay immediately so the composer unlocks (client also uses
+    isComposerBusy, but status/polling must not keep reporting busy).
+
+    The agent object is detached from ``_CHAT_AGENTS`` so a follow-up send can
+    create a fresh agent while the interrupted thread exits on its local ref.
+    """
+    sid = (session_id or "").strip()
+    if not sid:
+        return
+    with _CHAT_AGENTS_LOCK:
+        agent = _CHAT_AGENTS.pop(sid, None)
+        if agent is None:
+            # Agent may still be under construction on the run() worker
+            # thread — record the stop so it's honored the instant it
+            # registers itself, instead of continuing unattended.
+            _CHAT_STOP_REQUESTED.add(sid)
+    if agent is not None:
+        try:
+            agent.interrupt()
+        except Exception:
+            pass
+    _cancel_web_chat_interactive_waits(sid)
+    _release_web_chat_turn(sid)
 
 
 def _repair_orphan_chat_inflight(
@@ -3697,6 +4474,47 @@ def _repair_orphan_chat_inflight(
     return True
 
 
+def _repair_stuck_chat_inflight(session_id: str) -> bool:
+    """Inflight turn with live snapshot but no revision progress for too long."""
+    if not _is_chat_inflight(session_id):
+        _CHAT_INFLIGHT_STUCK_REVISION.pop(session_id, None)
+        return False
+    age = _chat_inflight_age_sec(session_id)
+    if age is None or age < _CHAT_INFLIGHT_STUCK_SEC:
+        return False
+    try:
+        from ector_cli import web_chat_live as _web_chat_live
+
+        snap = _web_chat_live.snapshot(session_id)
+        if snap is None:
+            return False
+        revision = int(snap.get("revision") or 0)
+    except Exception:
+        return False
+
+    now = time.time()
+    with _CHAT_AGENTS_LOCK:
+        track = _CHAT_INFLIGHT_STUCK_REVISION.get(session_id)
+        if track is None or track.get("revision") != revision:
+            _CHAT_INFLIGHT_STUCK_REVISION[session_id] = {
+                "revision": revision,
+                "since": now,
+            }
+            return False
+        stable_for = now - float(track.get("since") or now)
+
+    if stable_for < _CHAT_INFLIGHT_STUCK_SEC:
+        return False
+
+    if _web_chat_turn_should_skip_heal(session_id):
+        return False
+
+    _CHAT_INFLIGHT_STUCK_REVISION.pop(session_id, None)
+    _interrupt_web_chat_agent(session_id)
+    _release_web_chat_turn(session_id)
+    return True
+
+
 def _repair_stale_chat_inflight(
     session_id: str,
     *,
@@ -3704,6 +4522,8 @@ def _repair_stale_chat_inflight(
 ) -> bool:
     age = _chat_inflight_age_sec(session_id)
     if age is None or age < _CHAT_INFLIGHT_STALE_SEC:
+        return False
+    if _web_chat_turn_should_skip_heal(session_id):
         return False
     if interrupt_agent:
         _interrupt_web_chat_agent(session_id)
@@ -3714,8 +4534,25 @@ def _repair_stale_chat_inflight(
 def _heal_chat_inflight(session_id: str) -> bool:
     """Best-effort recovery for stuck web-chat turns (idempotent)."""
     repaired = _repair_orphan_chat_inflight(session_id)
+    repaired = _repair_stuck_chat_inflight(session_id) or repaired
     repaired = _repair_stale_chat_inflight(session_id) or repaired
     return repaired
+
+
+def _web_chat_assistant_failure_text(result: dict | None) -> str | None:
+    """Friendly assistant bubble when a turn ends failed without visible text."""
+    if not isinstance(result, dict) or not result.get("failed"):
+        return None
+    if str(result.get("final_response") or "").strip():
+        return None
+    from agent.network_errors import user_facing_failure_text
+
+    err = result.get("error")
+    if isinstance(err, Exception):
+        return user_facing_failure_text(error=err)
+    if isinstance(err, str) and err.strip():
+        return user_facing_failure_text(error=err)
+    return user_facing_failure_text(error=None)
 
 
 def _is_chat_inflight(session_id: str) -> bool:
@@ -3735,6 +4572,34 @@ def _web_chat_pending_approval(session_id: str) -> bool:
         return has_blocking_approval(session_id)
     except Exception:
         return False
+
+
+def _web_chat_pending_wiser(session_id: str) -> bool:
+    try:
+        from tools.wiser_gateway import has_blocking_wiser
+
+        return has_blocking_wiser(session_id)
+    except Exception:
+        return False
+
+
+def _invalidate_web_session_system_prompt(session_id: str) -> None:
+    """Force system prompt rebuild after cwd/project changes in web chat."""
+    sid = (session_id or "").strip()
+    if not sid:
+        return
+    with _CHAT_AGENTS_LOCK:
+        agent = _CHAT_AGENTS.get(sid)
+    if agent is not None:
+        invalidate = getattr(agent, "_invalidate_system_prompt", None)
+        if callable(invalidate):
+            invalidate()
+    try:
+        from ector_state import SessionDB
+
+        SessionDB().update_system_prompt(sid, "")
+    except Exception:
+        pass
 
 
 def _invalidate_web_chat_agents() -> None:
@@ -3811,6 +4676,33 @@ def _web_chat_cached_agent_stale(
     return False
 
 
+def _web_chat_history_session_id(session_db: Any, session_id: str) -> str:
+    """SQLite row that holds live messages for a web chat session key.
+
+    Pre-fix web turns could compression-split into a tip child while the
+    dashboard kept the root id in the URL. Always prefer the tip so context
+    is not truncated on the next load.
+    """
+    sid = str(session_id or "").strip()
+    if not sid or session_db is None:
+        return sid
+    try:
+        tip = session_db.get_compression_tip(sid)
+        tip_id = str(tip or "").strip()
+        if tip_id:
+            return tip_id
+    except Exception:
+        pass
+    return sid
+
+
+def _web_chat_agent_lineage_stale(agent: Any, session_id: str, session_db: Any) -> bool:
+    """True when a cached agent writes to a different compression tip than expected."""
+    expected = _web_chat_history_session_id(session_db, session_id)
+    current = str(getattr(agent, "session_id", "") or "").strip()
+    return bool(expected and current and current != expected)
+
+
 _CHAT_SESSION_DB_LOCK = threading.Lock()
 _WEB_RUNTIME_HOME_FALLBACK = PROJECT_ROOT / ".ector-web-runtime"
 
@@ -3882,6 +4774,56 @@ def _web_chat_approval_context(session_id: str, notify_cb):
                 os.environ[key] = value
 
 
+@contextlib.contextmanager
+def _web_chat_wiser_context(session_id: str, notify_cb):
+    """Enable gateway-style blocking Wiser prompts for one web chat agent thread."""
+    from tools.wiser_gateway import (
+        register_gateway_wiser_notify,
+        unregister_gateway_wiser_notify,
+    )
+
+    register_gateway_wiser_notify(session_id, notify_cb)
+    try:
+        yield
+    finally:
+        unregister_gateway_wiser_notify(session_id)
+
+
+@contextlib.contextmanager
+def _web_chat_interactive_context(session_id: str, on_approval, on_wiser):
+    """Approval + Wiser blocking prompts for one web chat agent thread."""
+    with _web_chat_approval_context(session_id, on_approval):
+        with _web_chat_wiser_context(session_id, on_wiser):
+            yield
+
+
+def _apply_web_agent_wiser_callback(
+    agent, session_id: str, touch_activity=None
+) -> None:
+    """Attach gateway Wiser callback before each web chat turn.
+
+    ``touch_activity`` (when the caller has a live SSE connection) lets the
+    blocking wait send periodic keepalive bytes — without it, a turn paused
+    on Wiser sends nothing for the whole wait, and some browsers/proxies
+    treat that as a dead connection and abort the fetch with a generic
+    network error well before the real Wiser timeout.
+    """
+    if agent is None:
+        return
+    try:
+        from ector_cli.config import load_config
+        from tools.wiser_tool import get_wiser_timeout_seconds
+        from tools.wiser_gateway import make_gateway_wiser_callback
+
+        agent.wiser_callback = make_gateway_wiser_callback(
+            session_id,
+            get_wiser_timeout_seconds(load_config() or {}),
+            touch_activity,
+        )
+    except Exception:
+        pass
+
+
 def _web_chat_client_disconnect(session_id: str) -> None:
     """Handle SSE client disconnect without denying a pending approval.
 
@@ -3893,6 +4835,12 @@ def _web_chat_client_disconnect(session_id: str) -> None:
         from tools.approval import detach_gateway_notify
 
         detach_gateway_notify(session_id)
+    except Exception:
+        pass
+    try:
+        from tools.wiser_gateway import detach_gateway_wiser_notify
+
+        detach_gateway_wiser_notify(session_id)
     except Exception:
         pass
 
@@ -3920,9 +4868,231 @@ def _toggle_web_chat_yolo(session_id: str) -> dict:
         "enabled": True,
         "message": (
             "Modo YOLO **ativado** nesta sessão — todos os comandos aprovados automaticamente. "
-            "Use com cuidado. (A flag `ector localhost --yolo` afeta todo o processo.)"
+            "Use com cuidado. (A flag `--yolo` no gateway afeta todo o processo.)"
         ),
     }
+
+
+def _apply_web_chat_agent_mode_to_agent(session_id: str, mode: str) -> None:
+    """Sync cached web agent ephemeral prompt with session agent mode."""
+    from tools.agent_mode import ephemeral_prompt_for_mode, normalize_agent_mode
+
+    normalized = normalize_agent_mode(mode)
+    prompt = ephemeral_prompt_for_mode(normalized, platform="web")
+    with _CHAT_AGENTS_LOCK:
+        agent = _CHAT_AGENTS.get(session_id)
+    if agent is None:
+        return
+    agent.ephemeral_system_prompt = prompt
+    invalidate = getattr(agent, "_invalidate_system_prompt", None)
+    if callable(invalidate):
+        invalidate()
+    reload_tools = getattr(agent, "_reload_tools_for_routing", None)
+    if callable(reload_tools):
+        reload_tools()
+
+
+def _set_web_chat_agent_mode(session_id: str, mode: str) -> dict:
+    """Set session-scoped agent mode for web chat (agent vs plan)."""
+    from tools.agent_mode import (
+        agent_mode_label,
+        set_session_agent_mode,
+    )
+
+    normalized = set_session_agent_mode(session_id, mode)
+    _apply_web_chat_agent_mode_to_agent(session_id, normalized)
+    return {
+        "ok": True,
+        "mode": normalized,
+        "label": agent_mode_label(normalized),
+    }
+
+
+_WEB_CHAT_SSE_TOOL_RESULT_MAX_BYTES = 8192
+
+
+def _clip_text_to_bytes(text: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    budget = max(0, max_chars - 3)
+    chunk = text[:budget]
+    break_at = max(chunk.rfind("\n\n"), chunk.rfind("\n"))
+    if break_at >= int(budget * 0.35):
+        chunk = chunk[:break_at].rstrip()
+    return f"{chunk}..."
+
+
+def _compact_skill_view_result_for_sse(
+    result_str: str,
+    max_bytes: int = _WEB_CHAT_SSE_TOOL_RESULT_MAX_BYTES,
+) -> tuple[Optional[str], bool]:
+    """Keep skill metadata for the chat card when the full SKILL.md is huge."""
+    import json as _j
+
+    if len(result_str) <= max_bytes:
+        return result_str, False
+
+    try:
+        data = _j.loads(result_str)
+    except Exception:
+        return None, True
+    if not isinstance(data, dict):
+        return None, True
+
+    def _build(content_cap: int) -> str:
+        payload: dict = {
+            "success": data.get("success", True),
+            "truncated": True,
+        }
+        for key in (
+            "name",
+            "description",
+            "file",
+            "path",
+            "usage_hint",
+        ):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                payload[key] = value
+        tags = data.get("tags")
+        if isinstance(tags, list):
+            payload["tags"] = [str(t) for t in tags if str(t).strip()][:24]
+        related = data.get("related_skills")
+        if isinstance(related, list):
+            payload["related_skills"] = [
+                str(t) for t in related if str(t).strip()
+            ][:24]
+        if data.get("setup_needed") is True:
+            payload["setup_needed"] = True
+        linked = data.get("linked_files")
+        if isinstance(linked, dict):
+            compact_linked: dict[str, list[str]] = {}
+            for group, files in linked.items():
+                if not isinstance(files, list):
+                    continue
+                clipped = [str(f) for f in files if str(f).strip()][:12]
+                if clipped:
+                    compact_linked[str(group)] = clipped
+            if compact_linked:
+                payload["linked_files"] = compact_linked
+        content = data.get("content")
+        if isinstance(content, str) and content.strip() and content_cap > 0:
+            payload["content"] = _clip_text_to_bytes(content, content_cap)
+        return _j.dumps(payload, ensure_ascii=False)
+
+    for content_cap in (4000, 2000, 800, 200, 0):
+        compact = _build(content_cap)
+        if len(compact) <= max_bytes:
+            return compact, True
+
+    return None, True
+
+
+def _clip_delegate_summary(summary: str, cap: int) -> str:
+    """Trim a subagent summary for SSE without shredding Markdown mid-token."""
+    text = summary.strip()
+    if cap <= 0:
+        return ""
+    if len(text) <= cap:
+        return text
+
+    budget = max(0, cap - 3)
+    chunk = text[:budget]
+    # Prefer a paragraph / line break so lists and headings stay intact.
+    break_at = max(chunk.rfind("\n\n"), chunk.rfind("\n"))
+    if break_at >= int(budget * 0.35):
+        chunk = chunk[:break_at].rstrip()
+    else:
+        space_at = chunk.rfind(" ")
+        if space_at >= int(budget * 0.5):
+            chunk = chunk[:space_at].rstrip()
+    return f"{chunk}..."
+
+
+def _compact_delegate_result_for_sse(
+    result_str: str,
+    max_bytes: int = _WEB_CHAT_SSE_TOOL_RESULT_MAX_BYTES,
+) -> tuple[Optional[str], bool]:
+    """Shrink delegate_task JSON so SSE can carry per-task status when full payload is huge."""
+    import json as _j
+
+    if len(result_str) <= max_bytes:
+        return result_str, False
+
+    try:
+        data = _j.loads(result_str)
+    except Exception:
+        return None, True
+    if not isinstance(data, dict):
+        return None, True
+
+    raw_results = data.get("results")
+    if not isinstance(raw_results, list):
+        return None, True
+
+    def _build(summary_cap: int) -> str:
+        compact_rows = []
+        for idx, entry in enumerate(raw_results):
+            if not isinstance(entry, dict):
+                continue
+            task_index = entry.get("task_index")
+            if not isinstance(task_index, int):
+                task_index = idx
+            summary = str(entry.get("summary") or "").strip()
+            if summary_cap >= 0:
+                summary = _clip_delegate_summary(summary, summary_cap)
+            status = entry.get("status") or "completed"
+            compact_rows.append(
+                {
+                    "task_index": task_index,
+                    "status": status,
+                    "summary": summary,
+                }
+            )
+        payload: dict = {
+            "results": compact_rows,
+            "truncated": True,
+        }
+        total_duration = data.get("total_duration_seconds")
+        if isinstance(total_duration, (int, float)):
+            payload["total_duration_seconds"] = total_duration
+        return _j.dumps(payload, ensure_ascii=False)
+
+    # Prefer larger caps first so Markdown structure survives when possible.
+    for summary_cap in (1800, 1000, 500, 200, 80, 0):
+        compact = _build(summary_cap)
+        if len(compact) <= max_bytes:
+            return compact, True
+
+    return None, True
+
+
+_SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+}
+
+# Keep below frontend CHAT_STREAM_INACTIVITY_MS (180s). Long terminal tools
+# emit nothing until complete — without these pings the browser aborts SSE.
+_WEB_CHAT_SSE_KEEPALIVE_SEC = 20.0
+
+
+async def _iter_web_chat_sse_chunks(queue: "asyncio.Queue[str | None]"):
+    """Yield queue payloads, inserting ``PING|`` when idle too long."""
+    while True:
+        try:
+            chunk = await asyncio.wait_for(
+                queue.get(), timeout=_WEB_CHAT_SSE_KEEPALIVE_SEC
+            )
+        except asyncio.TimeoutError:
+            yield "PING|"
+            continue
+        yield chunk
+        if chunk is None:
+            return
 
 
 @app.post("/api/chat/send")
@@ -3949,6 +5119,12 @@ async def chat_send(request: Request):
     session_id = str(body.get("session_id") or "").strip() or str(uuid.uuid4())
     request_id = str(uuid.uuid4())
     message = body.get("message", "").strip()
+    raw_mode = body.get("mode")
+    if raw_mode is not None and str(raw_mode).strip():
+        try:
+            _set_web_chat_agent_mode(session_id, str(raw_mode))
+        except Exception:
+            pass
     raw_images = body.get("images") or []
     raw_documents = body.get("documents") or body.get("document") or []
     if raw_documents and not isinstance(raw_documents, list):
@@ -4004,13 +5180,6 @@ async def chat_send(request: Request):
         return _CHAT_SESSION_DB
 
     from ector_cli import web_chat_live as _web_chat_live
-
-    _SSE_HEADERS = {
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-        "X-Accel-Buffering": "no",
-    }
-
 
     age = _chat_inflight_age_sec(session_id)
     if age is not None and age >= _CHAT_INFLIGHT_STALE_SEC:
@@ -4122,9 +5291,10 @@ async def chat_send(request: Request):
     def on_tool_complete(tc_id, name, args, result):
         import json as _j
         if name in ("terminal", "shell", "process"):
-            _sync_web_session_cwd_from_env(session_id, allow_default_env=True)
+            _sync_web_session_cwd_from_env(session_id, allow_default_env=False)
         footer_cwd = None
         result_str = str(result) if result is not None else None
+        args_str = args if isinstance(args, str) else _j.dumps(args)
         try:
             payload_obj: dict = {
                 "id": tc_id,
@@ -4133,11 +5303,46 @@ async def chat_send(request: Request):
             if name in ("terminal", "shell", "process"):
                 footer_cwd = _resolve_web_chat_cwd(session_id)
                 if footer_cwd:
-                    payload_obj["cwd"] = footer_cwd
-                    payload_obj["cwd_label"] = _short_display_cwd(footer_cwd)
+                    payload_obj.update(_cwd_footer_fields(footer_cwd, session_id=session_id))
+                if args_str:
+                    payload_obj["args"] = args_str
             if result_str is not None:
-                if name == "text_to_speech" or len(result_str) <= 8192:
-                    payload_obj["result"] = result_str
+                sse_result = result_str
+                content_truncated = False
+                tool_name = str(name or "")
+                if (
+                    tool_name == "delegate_task"
+                    and len(result_str) > _WEB_CHAT_SSE_TOOL_RESULT_MAX_BYTES
+                ):
+                    compact, content_truncated = _compact_delegate_result_for_sse(
+                        result_str
+                    )
+                    if compact:
+                        sse_result = compact
+                elif (
+                    tool_name == "skill_view"
+                    and len(result_str) > _WEB_CHAT_SSE_TOOL_RESULT_MAX_BYTES
+                ):
+                    compact, content_truncated = _compact_skill_view_result_for_sse(
+                        result_str
+                    )
+                    if compact:
+                        sse_result = compact
+
+                if (
+                    name == "text_to_speech"
+                    or len(sse_result) <= _WEB_CHAT_SSE_TOOL_RESULT_MAX_BYTES
+                ):
+                    payload_obj["result"] = sse_result
+                    if content_truncated:
+                        payload_obj["truncated"] = True
+                else:
+                    from agent.tool_result_status import infer_tool_failed
+
+                    payload_obj["truncated"] = True
+                    payload_obj["status"] = (
+                        "error" if infer_tool_failed(str(name or ""), result_str) else "complete"
+                    )
             payload = _j.dumps(payload_obj, ensure_ascii=False)
         except Exception:
             payload = name
@@ -4147,6 +5352,7 @@ async def chat_send(request: Request):
             name=str(name or "tool"),
             result=result_str,
             cwd=footer_cwd,
+            args=args_str if name in ("terminal", "shell") else None,
         )
         _send("TOOL_COMPLETE", payload)
         if name == "text_to_speech" and result:
@@ -4242,30 +5448,46 @@ async def chat_send(request: Request):
                 technical = build_tool_technical_summary(name, args) or ""
         except Exception:
             pass
+        tool_id = ""
         try:
-            payload = _j.dumps(
-                {
-                    "event": event_type,
-                    "name": name or "",
-                    "preview": preview_text[:240],
-                    "technical": technical[:240],
-                },
-                ensure_ascii=False,
-            )
+            snap = _web_chat_live.snapshot(session_id)
+            if snap and name:
+                for row in reversed(snap.get("tool_calls") or []):
+                    if row.get("status") == "running" and str(row.get("name") or "") == str(name):
+                        tool_id = str(row.get("id") or row.get("server_id") or "")
+                        break
+            payload_obj: dict = {
+                "event": event_type,
+                "name": name or "",
+                "preview": preview_text[:240],
+                "technical": technical[:240],
+            }
+            if tool_id:
+                payload_obj["id"] = tool_id
+            payload = _j.dumps(payload_obj, ensure_ascii=False)
         except Exception:
             payload = f"{event_type}|{name or ''}|{preview_text[:240]}"
         _web_chat_live.tool_progress(
             session_id,
+            tool_id=tool_id,
             tool_name=str(name or ""),
             preview=preview_text,
             technical=technical,
         )
+        if str(event_type or "").strip().lower() == "reasoning.available" and preview_text:
+            _web_chat_live.set_thinking(session_id)
+            _send("REASONING", preview_text[:500])
         _send("TOOL_PROGRESS", payload)
 
     def on_thinking(text: str):
         if text:
             _web_chat_live.set_thinking(session_id)
             _send("THINKING", text[:500])
+
+    def on_reasoning(text: str):
+        if text:
+            _web_chat_live.set_thinking(session_id)
+            _send("REASONING", text)
 
     def on_approval_request(approval_data: dict):
         import json as _j
@@ -4278,6 +5500,17 @@ async def chat_send(request: Request):
             payload = "{}"
         _send("APPROVAL_REQUEST", payload)
 
+    def on_wiser_request(wiser_data: dict):
+        import json as _j
+
+        try:
+            payload_data = dict(wiser_data or {})
+            payload_data.setdefault("session_id", session_id)
+            payload = _j.dumps(payload_data, ensure_ascii=False)
+        except Exception:
+            payload = "{}"
+        _send("WISER_REQUEST", payload)
+
     def on_done():
         loop.call_soon_threadsafe(queue.put_nowait, None)
         loop.call_soon_threadsafe(_release_web_chat_turn, session_id)
@@ -4288,6 +5521,12 @@ async def chat_send(request: Request):
         nonlocal agent
         title_thread = None
         try:
+            # Clear any stale stop request left behind by a previous attempt
+            # for this session that never reached agent registration (e.g.
+            # "no model configured" or agent-init failure) — otherwise it
+            # would silently self-interrupt this brand new turn.
+            with _CHAT_AGENTS_LOCK:
+                _CHAT_STOP_REQUESTED.discard(session_id)
             try:
                 _ensure_web_runtime_paths_writable()
             except OSError as exc:
@@ -4301,7 +5540,12 @@ async def chat_send(request: Request):
             from run_agent import AIAgent
 
             agent = _CHAT_AGENTS.get(session_id)
-            if agent is not None and _web_chat_cached_agent_stale(agent, body):
+            if agent is not None and (
+                _web_chat_cached_agent_stale(agent, body)
+                or _web_chat_agent_lineage_stale(
+                    agent, session_id, _get_chat_session_db()
+                )
+            ):
                 with _CHAT_AGENTS_LOCK:
                     _CHAT_AGENTS.pop(session_id, None)
                 agent = None
@@ -4347,6 +5591,9 @@ async def chat_send(request: Request):
                             runtime = resolve_runtime_provider(
                                 requested=provider, target_model=model or None
                             )
+                            persist_session_id = _web_chat_history_session_id(
+                                _get_chat_session_db(), session_id
+                            )
                             try:
                                 agent = AIAgent(
                                     model=model,
@@ -4356,11 +5603,12 @@ async def chat_send(request: Request):
                                     api_mode=runtime.get("api_mode"),
                                     quiet_mode=True,
                                     platform="web",
-                                    session_id=session_id,
+                                    session_id=persist_session_id,
                                     tool_start_callback=on_tool_start,
                                     tool_complete_callback=on_tool_complete,
                                     tool_progress_callback=on_tool_progress,
                                     thinking_callback=on_thinking,
+                                    reasoning_callback=on_reasoning,
                                     status_callback=on_status,
                                     session_db=_get_chat_session_db(),
                                 )
@@ -4383,11 +5631,12 @@ async def chat_send(request: Request):
                                         api_mode=runtime.get("api_mode"),
                                         quiet_mode=True,
                                         platform="web",
-                                        session_id=session_id,
+                                        session_id=persist_session_id,
                                         tool_start_callback=on_tool_start,
                                         tool_complete_callback=on_tool_complete,
                                         tool_progress_callback=on_tool_progress,
                                         thinking_callback=on_thinking,
+                                        reasoning_callback=on_reasoning,
                                         status_callback=on_status,
                                         session_db=_get_chat_session_db(),
                                     )
@@ -4397,7 +5646,25 @@ async def chat_send(request: Request):
                             _send("TEXT", f"\n\n*Erro ao criar agente: {exc}*")
                             return
                         if agent is not None:
-                            _CHAT_AGENTS[session_id] = agent
+                            if _register_chat_agent_and_check_pending_stop(
+                                session_id, agent
+                            ):
+                                # Stop was pressed while this agent was still being
+                                # built (config load, model resolution, AIAgent
+                                # init) — honored now, before the first LLM call,
+                                # instead of silently running the turn to
+                                # completion while the UI already looks stopped.
+                                _send("STATUS", "Interrompido pelo usuário.")
+                                return
+                            try:
+                                from tools.agent_mode import get_session_agent_mode
+
+                                _apply_web_chat_agent_mode_to_agent(
+                                    session_id,
+                                    get_session_agent_mode(session_id),
+                                )
+                            except Exception:
+                                pass
                             try:
                                 from tools.terminal_tool import register_task_env_overrides
 
@@ -4415,6 +5682,7 @@ async def chat_send(request: Request):
             agent.tool_complete_callback = on_tool_complete
             agent.tool_progress_callback = on_tool_progress
             agent.thinking_callback = on_thinking
+            agent.reasoning_callback = on_reasoning
             agent.status_callback = on_status
             agent.stream_delta_callback = on_stream_delta
             from ector_cli.config import load_config
@@ -4430,8 +5698,29 @@ async def chat_send(request: Request):
                 on_interim_assistant if _interim_on else None
             )
 
-            with _web_chat_approval_context(session_id, on_approval_request):
-                _prime_web_session_cwd(session_id)
+            try:
+                from tools.agent_mode import get_session_agent_mode
+
+                _apply_web_chat_agent_mode_to_agent(
+                    session_id,
+                    get_session_agent_mode(session_id),
+                )
+            except Exception:
+                pass
+
+            def _wiser_touch_activity(state: dict, _label: str) -> None:
+                now = time.monotonic()
+                if now - state.get("last_touch", 0) < 8:
+                    return
+                state["last_touch"] = now
+                _send("PING", "")
+
+            with _web_chat_interactive_context(
+                session_id, on_approval_request, on_wiser_request
+            ):
+                _apply_web_agent_wiser_callback(
+                    agent, session_id, _wiser_touch_activity
+                )
                 try:
                     db = _get_chat_session_db()
                     model_name = (
@@ -4450,18 +5739,49 @@ async def chat_send(request: Request):
                             session_id,
                             exc_info=True,
                         )
+                # Bind UI project (landing / openProject) after the session row
+                # exists — prime-before-ensure used to overwrite with home.
+                try:
+                    from agent.session_cwd import path_is_web_workspace
+
+                    bound_cwd = _bind_web_session_cwd_after_ensure(session_id)
+                    if bound_cwd:
+                        from tools.terminal_tool import register_task_env_overrides
+
+                        register_task_env_overrides(
+                            session_id, {"cwd": bound_cwd}
+                        )
+                    # Always invalidate when a real project is bound: a stale
+                    # SQLite system_prompt may still say home even if cwd no
+                    # longer "changed" this turn (before == bound).
+                    if bound_cwd and path_is_web_workspace(bound_cwd):
+                        _invalidate_web_session_system_prompt(session_id)
+                except Exception:
+                    # Last resort: still prefer landing/project over home prime.
+                    try:
+                        from agent.session_cwd import path_is_web_workspace
+
+                        fallback = _resolve_web_chat_cwd(session_id)
+                        if path_is_web_workspace(fallback):
+                            _apply_web_session_cwd(session_id, fallback)
+                            _invalidate_web_session_system_prompt(session_id)
+                        else:
+                            _prime_web_session_cwd(session_id)
+                    except Exception:
+                        _prime_web_session_cwd(session_id)
                 conversation_history = None
                 try:
-                    history = _get_chat_session_db().get_messages_as_conversation(
-                        session_id
-                    )
+                    db = _get_chat_session_db()
+                    history_sid = _web_chat_history_session_id(db, session_id)
+                    history = db.get_messages_as_conversation(history_sid)
                     if history:
                         conversation_history = history
                     if _WEB_CHAT_DEBUG:
                         _log.info(
-                            "[web-chat] history loaded request_id=%s session=%s count=%d",
+                            "[web-chat] history loaded request_id=%s session=%s history_sid=%s count=%d",
                             request_id,
                             session_id,
+                            history_sid,
                             len(history or []),
                         )
                 except Exception:
@@ -4489,8 +5809,56 @@ async def chat_send(request: Request):
                     prompt,
                     conversation_history=conversation_history,
                     task_id=session_id,
+                    # Persist the clean user text — not vision/OCR/RAG enrichment.
+                    persist_user_message=message,
                 )
                 final = (result or {}).get("final_response") or ""
+                interrupted = bool((result or {}).get("interrupted"))
+                if interrupted:
+                    _send("STATUS", "interrupted")
+                if not final.strip():
+                    from agent.turn_closure import build_turn_closure_markdown
+
+                    closure = build_turn_closure_markdown(
+                        (result or {}).get("messages") or [],
+                        interrupted=interrupted,
+                    )
+                    if closure:
+                        _web_chat_live.append_text(session_id, closure)
+                        _send("TEXT", closure)
+                        final = closure
+                        try:
+                            db = _get_chat_session_db()
+                            persist_sid = _web_chat_history_session_id(db, session_id)
+                            db.append_message(
+                                persist_sid,
+                                "assistant",
+                                closure,
+                            )
+                        except Exception:
+                            if _WEB_CHAT_DEBUG:
+                                _log.debug(
+                                    "[web-chat] closure persist failed request_id=%s session=%s",
+                                    request_id,
+                                    session_id,
+                                    exc_info=True,
+                                )
+                    else:
+                        failure_text = _web_chat_assistant_failure_text(result)
+                        if failure_text:
+                            _web_chat_live.append_text(session_id, failure_text)
+                            _send("TEXT", failure_text)
+                            final = failure_text
+                            try:
+                                db = _get_chat_session_db()
+                                persist_sid = _web_chat_history_session_id(db, session_id)
+                                db.append_message(
+                                    persist_sid,
+                                    "assistant",
+                                    failure_text,
+                                )
+                            except Exception:
+                                pass
                 if _WEB_CHAT_DEBUG:
                     _log.info(
                         "[web-chat] run complete request_id=%s session=%s final_len=%d streamed_text=%s",
@@ -4512,11 +5880,9 @@ async def chat_send(request: Request):
 
                         history_after = None
                         try:
-                            history_after = (
-                                _get_chat_session_db().get_messages_as_conversation(
-                                    session_id
-                                )
-                            )
+                            db = _get_chat_session_db()
+                            history_sid = _web_chat_history_session_id(db, session_id)
+                            history_after = db.get_messages_as_conversation(history_sid)
                         except Exception:
                             history_after = conversation_history
 
@@ -4547,8 +5913,38 @@ async def chat_send(request: Request):
                                 session_id,
                                 exc_info=True,
                             )
+                try:
+                    from tools.agent_mode import get_session_agent_mode
+
+                    if get_session_agent_mode(session_id) == "plan":
+                        from agent.plan_store import (
+                            extract_plan_markdown_from_turn,
+                            save_session_plan,
+                        )
+
+                        plan_md = extract_plan_markdown_from_turn(result)
+                        if plan_md.strip():
+                            import json as _plan_json
+
+                            plan_info = save_session_plan(session_id, plan_md)
+                            if plan_info:
+                                _send(
+                                    "PLAN_READY",
+                                    _plan_json.dumps(plan_info, ensure_ascii=False),
+                                )
+                except Exception:
+                    if _WEB_CHAT_DEBUG:
+                        _log.debug(
+                            "[web-chat] plan save skipped request_id=%s session=%s",
+                            request_id,
+                            session_id,
+                            exc_info=True,
+                        )
         except Exception as exc:
-            _send("TEXT", f"\n\n*Erro: {exc}*")
+            from agent.network_errors import user_facing_failure_text
+
+            friendly = user_facing_failure_text(error=exc) or "Erro inesperado no chat."
+            _send("TEXT", f"\n\n*{friendly}*")
             if _WEB_CHAT_DEBUG:
                 _log.exception(
                     "[web-chat] run failed request_id=%s session=%s",
@@ -4556,7 +5952,7 @@ async def chat_send(request: Request):
                     session_id,
                 )
         finally:
-            _sync_web_session_cwd_from_env(session_id, allow_default_env=True)
+            _sync_web_session_cwd_from_env(session_id, allow_default_env=False)
             if title_thread is not None:
                 title_thread.join(timeout=2.5)
             on_done()
@@ -4567,12 +5963,14 @@ async def chat_send(request: Request):
     async def event_stream():
         stream_completed_normally = False
         try:
-            while True:
-                chunk = await queue.get()
+            async for chunk in _iter_web_chat_sse_chunks(queue):
                 if chunk is None:
                     stream_completed_normally = True
                     yield "data: DONE\n\n"
                     break
+                if chunk == "PING|":
+                    yield "data: PING|\n\n"
+                    continue
                 safe = chunk.replace("\n", "\\n")
                 yield f"data: {safe}\n\n"
         finally:
@@ -4854,14 +6252,10 @@ async def chat_interrupt(request: Request):
     session_id = (body.get("session_id") or "").strip()
     if not session_id:
         return JSONResponse({"error": "session_id is required"}, status_code=400)
-    with _CHAT_AGENTS_LOCK:
-        agent = _CHAT_AGENTS.get(session_id)
-    if agent is not None:
-        try:
-            agent.interrupt()
-        except Exception as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
-    _release_web_chat_turn(session_id)
+    try:
+        _user_stop_web_chat_turn(session_id)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
     return {"ok": True}
 
 
@@ -4876,22 +6270,19 @@ async def chat_status(request: Request, session_id: str = ""):
         "session_id": sid,
         "busy": _is_chat_inflight(sid),
         "pending_approval": _web_chat_pending_approval(sid),
+        "pending_wiser": _web_chat_pending_wiser(sid),
     }
 
 
-@app.get("/api/chat/turn")
-async def chat_turn(request: Request, session_id: str = ""):
+def _build_chat_turn_snapshot(sid: str) -> dict[str, Any]:
     """Authoritative chat view: persisted messages + optional live turn overlay."""
-    sid = str(session_id or "").strip()
-    if not sid:
-        return JSONResponse({"error": "session_id is required"}, status_code=400)
-
     from ector_cli.chat_message_media import prepare_session_messages_for_dashboard
     from ector_cli import web_chat_live as _web_chat_live
 
     _heal_chat_inflight(sid)
     busy = _is_chat_inflight(sid)
     pending_approval = _web_chat_pending_approval(sid)
+    pending_wiser = _web_chat_pending_wiser(sid)
     messages: list[dict[str, Any]] = []
     try:
         from ector_state import SessionDB
@@ -4899,7 +6290,8 @@ async def chat_turn(request: Request, session_id: str = ""):
         db = SessionDB()
         try:
             messages = prepare_session_messages_for_dashboard(
-                db.get_messages(sid), session_id=sid
+                db.get_messages(_web_chat_history_session_id(db, sid)),
+                session_id=sid,
             )
         finally:
             db.close()
@@ -4913,15 +6305,339 @@ async def chat_turn(request: Request, session_id: str = ""):
         "busy": busy,
         "revision": revision,
         "pending_approval": pending_approval,
+        "pending_wiser": pending_wiser,
         "messages": messages,
         "live": live,
     }
 
 
+@app.get("/api/chat/turn")
+async def chat_turn(request: Request, session_id: str = ""):
+    """Authoritative chat view: persisted messages + optional live turn overlay."""
+    sid = str(session_id or "").strip()
+    if not sid:
+        return JSONResponse({"error": "session_id is required"}, status_code=400)
+    return _build_chat_turn_snapshot(sid)
+
+
 @app.get("/api/chat/active")
 async def chat_active_sessions(request: Request):
     """Session ids with an in-flight web chat turn (for sidebar badges)."""
+    for sid in _list_chat_inflight_session_ids():
+        _heal_chat_inflight(sid)
     return {"sessions": _list_chat_inflight_session_ids()}
+
+
+@app.get("/api/chat/background-processes")
+async def chat_background_processes(request: Request, session_id: str = ""):
+    """Running/recent background terminal processes for a web chat session."""
+    _require_token(request)
+    sid = str(session_id or "").strip()
+    if not sid:
+        return JSONResponse({"error": "session_id is required"}, status_code=400)
+    try:
+        from tools.process_registry import process_registry
+
+        processes = process_registry.list_for_session_key(sid)
+        return {"session_id": sid, "processes": processes}
+    except Exception as exc:
+        _log.exception("GET /api/chat/background-processes failed")
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+def _is_loopback_preview_hostname(hostname: str) -> bool:
+    """True for localhost / 127.0.0.1 / ::1 / *.localhost (dashboard Browser only)."""
+    host = (hostname or "").strip().lower().rstrip(".")
+    if not host:
+        return False
+    if host in {"localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0"}:
+        return True
+    return host.endswith(".localhost")
+
+
+def _probe_live_preview_url(url: str, *, timeout: float = 2.0) -> dict:
+    """Server-side reachability check for a loopback preview URL (SSRF-safe).
+
+    Any HTTP response (including 4xx/5xx) counts as reachable — the Browser
+    iframe can show an app error page. Connection refused / timeout → not ok.
+    """
+    raw = str(url or "").strip()
+    if not raw:
+        return {"ok": False, "error": "url_required"}
+    try:
+        parsed = urllib.parse.urlparse(raw)
+    except Exception:
+        return {"ok": False, "error": "invalid_url"}
+    if parsed.scheme not in {"http", "https"}:
+        return {"ok": False, "error": "scheme_not_allowed"}
+    host = parsed.hostname or ""
+    if not _is_loopback_preview_hostname(host):
+        return {"ok": False, "error": "host_not_allowed"}
+
+    # Node's DNS resolution order for "localhost" varies by version/OS, so a
+    # dev server can end up bound to only one loopback stack (IPv4 127.0.0.1
+    # or IPv6 ::1) while its own "Local: http://localhost:PORT/" banner (and
+    # a real browser tab, via happy-eyeballs) still works fine either way.
+    # Try both before declaring it down — a single hardcoded family used to
+    # misreport a genuinely reachable server as "unreachable".
+    if host in {"0.0.0.0", "localhost"}:
+        connect_hosts = ["127.0.0.1", "::1"]
+    elif host in {"::1", "[::1]"}:
+        connect_hosts = ["::1", "127.0.0.1"]
+    else:
+        connect_hosts = [host]
+
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+            return None
+
+    opener = urllib.request.build_opener(_NoRedirect)
+    last_error: dict = {}
+    for connect_host in connect_hosts:
+        display_host = f"[{connect_host}]" if ":" in connect_host else connect_host
+        probe_url = f"{parsed.scheme}://{display_host}:{port}{path}"
+        req = urllib.request.Request(
+            probe_url,
+            method="GET",
+            headers={
+                "Accept": "*/*",
+                "User-Agent": "ector-preview-probe/1",
+                "Connection": "close",
+            },
+        )
+        try:
+            with opener.open(req, timeout=timeout) as resp:
+                status = int(getattr(resp, "status", None) or resp.getcode() or 0)
+                return {"ok": True, "status": status, "url": probe_url}
+        except urllib.error.HTTPError as exc:
+            # Server answered — reachable (iframe can still render the error body).
+            return {"ok": True, "status": int(exc.code), "url": probe_url}
+        except Exception as exc:
+            last_error = {
+                "ok": False,
+                "error": "unreachable",
+                "detail": str(exc)[:200],
+                "url": probe_url,
+            }
+    return last_error or {"ok": False, "error": "unreachable", "url": url}
+
+
+@app.get("/api/chat/preview-probe")
+async def chat_preview_probe(request: Request, url: str = "", proc_id: str = ""):
+    """Probe whether a loopback preview URL still accepts connections.
+
+    When proc_id is given (the preview URL is tied to a tracked background
+    process), this also marks that process as actively watched — see
+    ProcessRegistry.touch_preview(). Resets its idle-kill clock so a dev
+    server the user is currently looking at is never reaped for inactivity.
+    """
+    _require_token(request)
+    target = str(url or "").strip()
+    if not target:
+        return JSONResponse({"error": "url is required"}, status_code=400)
+
+    pid = str(proc_id or "").strip()
+    if pid:
+        try:
+            from tools.process_registry import process_registry
+
+            process_registry.touch_preview(pid)
+        except Exception:
+            _log.debug("touch_preview failed for proc_id=%s", pid, exc_info=True)
+
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(None, lambda: _probe_live_preview_url(target))
+    return result
+
+
+@app.post("/api/chat/background-processes/kill")
+async def chat_background_process_kill(request: Request):
+    """Kill one background process belonging to a web chat session."""
+    _require_token(request)
+    body = await request.json()
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "invalid body"}, status_code=400)
+
+    sid = str(body.get("session_id") or "").strip()
+    proc_id = str(body.get("proc_id") or "").strip()
+    if not sid:
+        return JSONResponse({"error": "session_id is required"}, status_code=400)
+    if not proc_id:
+        return JSONResponse({"error": "proc_id is required"}, status_code=400)
+
+    try:
+        from tools.process_registry import process_registry
+
+        session = process_registry.get(proc_id)
+        if session is None:
+            return JSONResponse({"error": "process not found"}, status_code=404)
+        owns = session.session_key == sid or session.task_id == sid
+        if not owns:
+            return JSONResponse({"error": "process not in session"}, status_code=403)
+
+        result = process_registry.kill_process(proc_id)
+        status = str(result.get("status") or "")
+        if status == "error":
+            return JSONResponse(result, status_code=500)
+
+        # Resolve the tool call in the live-turn view too — otherwise, while
+        # the turn is still busy, /api/chat/turn keeps reporting this
+        # background spawn as "running" and clobbers the frontend's
+        # optimistic "stopped" mark on the next poll.
+        try:
+            from ector_cli import web_chat_live as _web_chat_live
+
+            _web_chat_live.mark_background_killed(sid, proc_id)
+        except Exception:
+            _log.debug("mark_background_killed failed for %s/%s", sid, proc_id, exc_info=True)
+
+        return {"ok": True, **result}
+    except Exception as exc:
+        _log.exception("POST /api/chat/background-processes/kill failed")
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.get("/api/chat/project-preview-info")
+async def chat_project_preview_info(request: Request, session_id: str = ""):
+    """Detect the dev-server framework (Vite/Next/etc.) at a session's cwd.
+
+    Feeds the Browser panel's manual "Iniciar servidor" button so the user
+    can start their own dev server directly, without asking the agent.
+    """
+    _require_token(request)
+    sid = str(session_id or "").strip()
+    # No session yet (landing screen, before the first message) still
+    # resolves — _resolve_web_chat_cwd() falls back to the "landing" cwd the
+    # user picked via "Abrir pasta" when sid is empty.
+    cwd = _resolve_web_chat_cwd(sid)
+    # Manual start spawns the process on this host via process_registry — only
+    # meaningful when the terminal tool itself runs commands locally. Sandboxed
+    # backends (docker/ssh/modal/daytona) need per-task container config this
+    # endpoint doesn't have, so the button stays hidden and falls back to
+    # asking the agent.
+    manual_start_supported = os.getenv("TERMINAL_ENV", "local") == "local"
+    if not cwd or not os.path.isdir(cwd):
+        return {
+            "cwd": cwd,
+            "framework": "unknown",
+            "package_manager": "npm",
+            "command": None,
+            "port": None,
+            "manual_start_supported": manual_start_supported,
+        }
+
+    from tools.dev_project_detect import detect_dev_project
+
+    info = detect_dev_project(cwd)
+    info["manual_start_supported"] = manual_start_supported
+    return info
+
+
+@app.get("/api/chat/git-pr-status")
+async def chat_git_pr_status(
+    request: Request,
+    session_id: str = "",
+    refresh: str = "",
+):
+    """Repo/branch + PR-readiness summary for the composer's top git bar.
+
+    Separate from the cheap per-poll composer footer (_cwd_footer_fields) —
+    this does a couple of extra `git` calls (base-branch detection, diff
+    --shortstat against it) that are fine at a slower poll interval.
+
+    Pass ``refresh=1`` to bypass the short in-process cache (e.g. right after
+    an agent turn that may have switched branches).
+    """
+    _require_token(request)
+    from agent.git_footer import cwd_dir_name
+    from agent.session_cwd import path_is_web_workspace, web_workspace_defined
+
+    sid = str(session_id or "").strip()
+    cwd = _resolve_web_chat_cwd(sid)
+    workspace_defined = web_workspace_defined(sid) or (
+        path_is_web_workspace(cwd) if cwd else False
+    )
+    if not cwd or not os.path.isdir(cwd):
+        return {
+            "dir_name": "",
+            "workspace_defined": workspace_defined,
+            "repo_name": "",
+            "branch": None,
+            "base_branch": None,
+            "diff_insertions": 0,
+            "diff_deletions": 0,
+            "needs_attention": False,
+            "github_owner": None,
+            "github_repo": None,
+            "ahead": 0,
+            "behind": 0,
+            "modified": 0,
+            "untracked": 0,
+        }
+
+    from agent.git_pr_status import resolve_git_pr_status
+
+    force = str(refresh or "").strip().lower() in {"1", "true", "yes"}
+    payload = resolve_git_pr_status(cwd, force=force).as_payload()
+    payload["dir_name"] = cwd_dir_name(cwd)
+    payload["workspace_defined"] = workspace_defined
+    return payload
+
+
+@app.post("/api/chat/background-processes/start")
+async def chat_background_process_start(request: Request):
+    """Start a background dev-server process for a web chat session directly.
+
+    Bypasses the agent entirely — the frontend detects the framework via
+    /api/chat/project-preview-info and posts the (editable) command here.
+    Spawned with the same session_key/task_id the agent's own terminal tool
+    uses, so it shows up in the existing background-processes list/card UI.
+    """
+    _require_token(request)
+    body = await request.json()
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "invalid body"}, status_code=400)
+
+    sid = str(body.get("session_id") or "").strip()
+    command = str(body.get("command") or "").strip()
+    if not sid:
+        return JSONResponse({"error": "session_id is required"}, status_code=400)
+    if not command:
+        return JSONResponse({"error": "command is required"}, status_code=400)
+    if os.getenv("TERMINAL_ENV", "local") != "local":
+        return JSONResponse(
+            {"error": "manual start only supported for the local terminal backend"},
+            status_code=400,
+        )
+
+    cwd = _resolve_web_chat_cwd(sid)
+    if not cwd or not os.path.isdir(cwd):
+        return JSONResponse({"error": "workspace directory not found"}, status_code=400)
+
+    try:
+        from tools.process_registry import process_registry
+
+        proc_session = process_registry.spawn_local(
+            command=command,
+            cwd=cwd,
+            task_id=sid,
+            session_key=sid,
+        )
+        return {
+            "ok": True,
+            "session_id": proc_session.id,
+            "pid": proc_session.pid,
+            "command": command,
+            "cwd": cwd,
+        }
+    except Exception as exc:
+        _log.exception("POST /api/chat/background-processes/start failed")
+        return JSONResponse({"error": str(exc)}, status_code=500)
 
 
 @app.get("/api/chat/approval/pending")
@@ -4985,6 +6701,59 @@ async def chat_approval(request: Request):
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
+@app.get("/api/chat/wiser/pending")
+async def chat_wiser_pending(request: Request, session_id: str = ""):
+    """Return the oldest pending Wiser prompt for a web chat session."""
+    _require_token(request)
+    sid = str(session_id or "").strip()
+    if not sid:
+        return JSONResponse({"error": "session_id is required"}, status_code=400)
+    try:
+        from tools.wiser_gateway import peek_blocking_wiser
+
+        data = peek_blocking_wiser(sid)
+        if not data:
+            return {"pending": False}
+        return {
+            "pending": True,
+            "question": data.get("question") or "",
+            "choices": data.get("choices") or [],
+            "request_id": data.get("request_id") or "",
+        }
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.post("/api/chat/wiser")
+async def chat_wiser(request: Request):
+    """Resolve one pending Wiser prompt for a web chat session."""
+    _require_token(request)
+    body = await request.json()
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "invalid body"}, status_code=400)
+
+    session_id = str(body.get("session_id") or "").strip()
+    answer = str(body.get("answer") or "")
+    if not session_id:
+        return JSONResponse({"error": "session_id is required"}, status_code=400)
+
+    try:
+        from tools.wiser_gateway import (
+            parse_wiser_reply,
+            peek_blocking_wiser,
+            resolve_gateway_wiser,
+        )
+
+        pending = peek_blocking_wiser(session_id)
+        if pending:
+            choices = pending.get("choices")
+            answer = parse_wiser_reply(answer, choices)
+        resolved = resolve_gateway_wiser(session_id, answer)
+        return {"ok": True, "resolved": resolved}
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
 @app.post("/api/chat/yolo")
 async def chat_yolo(request: Request):
     """Toggle session-scoped YOLO (skip dangerous-command approvals) for web chat."""
@@ -5003,13 +6772,75 @@ async def chat_yolo(request: Request):
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
+@app.get("/api/chat/plan")
+def get_chat_plan(session_id: Optional[str] = None):
+    """Latest markdown plan for a web chat session (Modo Plano)."""
+    sid = (session_id or "").strip()
+    if not sid:
+        return JSONResponse({"error": "session_id is required"}, status_code=400)
+    try:
+        from agent.plan_store import read_session_plan
+
+        plan = read_session_plan(sid)
+        if not plan:
+            return {"ok": False, "session_id": sid, "content": "", "display_path": ""}
+        return {
+            "ok": True,
+            "session_id": sid,
+            "content": plan.get("content") or "",
+            "display_path": plan.get("display_path") or "",
+            "relative_path": plan.get("relative_path") or "",
+            "path": plan.get("path") or "",
+        }
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.post("/api/chat/mode")
+async def chat_mode(request: Request):
+    """Set session-scoped agent mode (agent vs plan) for web chat."""
+    body = await request.json()
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "invalid body"}, status_code=400)
+
+    session_id = str(body.get("session_id") or "").strip()
+    if not session_id:
+        return JSONResponse({"error": "session_id is required"}, status_code=400)
+
+    mode = str(body.get("mode") or "").strip()
+    if not mode:
+        return JSONResponse({"error": "mode is required"}, status_code=400)
+
+    try:
+        return _set_web_chat_agent_mode(session_id, mode)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+def _kill_background_processes_for_session(session_id: str) -> int:
+    """Encerra processos em segundo plano associados a uma sessão de chat web."""
+    sid = (session_id or "").strip()
+    if not sid:
+        return 0
+    try:
+        from tools.process_registry import process_registry
+
+        return process_registry.kill_all_for_session_key(sid)
+    except Exception:
+        _log.exception("Failed to kill background processes for session %s", sid)
+        return 0
+
+
 @app.delete("/api/sessions")
 async def delete_all_sessions_endpoint():
     from ector_state import SessionDB
+    from tools.process_registry import process_registry
+
     db = SessionDB()
     try:
         count = db.delete_all_sessions()
-        return {"ok": True, "deleted": count}
+        killed = process_registry.kill_all()
+        return {"ok": True, "deleted": count, "processes_killed": killed}
     finally:
         db.close()
 
@@ -5021,7 +6852,8 @@ async def delete_session_endpoint(session_id: str):
     try:
         if not db.delete_session(session_id):
             raise HTTPException(status_code=404, detail="Sessão não encontrada")
-        return {"ok": True}
+        killed = _kill_background_processes_for_session(session_id)
+        return {"ok": True, "processes_killed": killed}
     finally:
         db.close()
 
@@ -5269,6 +7101,23 @@ async def update_skill_content(name: str, body: SkillContentBody):
     if not result.get("success"):
         status = 403 if "external directory" in str(result.get("error", "")).lower() else 400
         raise HTTPException(status_code=status, detail=result.get("error", "Falha ao salvar skill"))
+    return result
+
+
+@app.delete("/api/skills/{name}")
+async def delete_skill(name: str):
+    import json as _json
+
+    from tools.skill_manager_tool import _find_skill, skill_manage
+
+    if not _find_skill(name):
+        raise HTTPException(status_code=404, detail=f"Skill não encontrada: {name}")
+    raw = skill_manage(action="delete", name=name)
+    result = _json.loads(raw)
+    if not result.get("success"):
+        err = str(result.get("error", "Falha ao excluir skill"))
+        status = 403 if "external directory" in err.lower() else 400
+        raise HTTPException(status_code=status, detail=err)
     return result
 
 
@@ -5520,7 +7369,7 @@ def mount_spa(application: FastAPI):
                 content={
                     "detail": (
                         "Rota API não encontrada ou backend desatualizado. "
-                        "Reinicie o painel (`ector localhost`) após atualizar o Ector."
+                        "Reinicie o painel (`ector`) após atualizar o Ector."
                     ),
                 },
             )
@@ -5817,7 +7666,10 @@ def start_server(
     # Web chat must not inherit the server's process cwd (repo checkout / ~/.ector).
     _apply_web_dashboard_terminal_cwd(reset_envs=True)
 
-    # Record PID so `ector localhost kill` can stop it later.
+    # Resume agent turns when background processes finish (notify_on_complete).
+    _ensure_web_chat_process_watcher()
+
+    # Record PID so `ector kill` can stop it later.
     write_dashboard_pid_file()
 
     if open_browser:

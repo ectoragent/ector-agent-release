@@ -2581,6 +2581,17 @@ def _existing_tool_names() -> List[str]:
     return names
 
 
+def get_registered_mcp_tool_names() -> frozenset[str]:
+    """All tool names currently registered from connected MCP servers.
+
+    Used by Plan mode (tools/agent_mode.py) to block MCP tools by default:
+    their names and side effects are defined by whatever server the user
+    connected and aren't known ahead of time, so they can't be enumerated in
+    a static blocklist the way Ector's own built-in mutating tools are.
+    """
+    return frozenset(_existing_tool_names())
+
+
 def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> List[str]:
     """Register tools from an already-connected server into the registry.
 

@@ -630,6 +630,12 @@ def clear_session(session_key: str) -> None:
         _pending.pop(session_key, None)
         _gateway_queues.pop(session_key, None)
         _managed_temp_artifacts.pop(session_key, None)
+    try:
+        from tools.agent_mode import clear_session_agent_mode
+
+        clear_session_agent_mode(session_key)
+    except Exception:
+        pass
 
 
 def is_session_yolo_enabled(session_key: str) -> bool:

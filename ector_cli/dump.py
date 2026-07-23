@@ -28,6 +28,8 @@ _API_KEYS = (
     ("GEMINI_API_KEY", "gemini"),
     ("GLM_API_KEY", "glm/zai"),
     ("ZAI_API_KEY", "zai"),
+    ("Z_AI_API_KEY", "zai"),
+    ("ZHIPU_API_KEY", "zai"),
     ("KIMI_API_KEY", "kimi"),
     ("MINIMAX_API_KEY", "minimax"),
     ("DEEPSEEK_API_KEY", "deepseek"),

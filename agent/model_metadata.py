@@ -136,6 +136,7 @@ DEFAULT_CONTEXT_LENGTHS = {
     # substring of "anthropic/claude-sonnet-4.6").
     # OpenRouter-prefixed models resolve via OpenRouter live API or models.dev.
     "claude-fable-5": 1000000,
+    "claude-sonnet-5": 1000000,
     "claude-opus-4-8": 1000000,
     "claude-opus-4.8": 1000000,
     "claude-opus-4-7": 1000000,
@@ -194,8 +195,27 @@ DEFAULT_CONTEXT_LENGTHS = {
     # https://platform.minimax.io/docs/api-reference/text-anthropic-api
     "minimax-m3": 1000000,
     "minimax": 204800,
-    # GLM
-    "glm": 202752,
+    # GLM (Z.AI / Zhipu AI) — the "zai" overlay resolves to these same
+    # api.z.ai / open.bigmodel.cn endpoints and model IDs regardless of
+    # region (global/cn) or plan (standard/coding). Per-model overrides
+    # before the catch-all — real windows range 64K-1M, a single flat
+    # value (the previous 202752 catch-all) misrepresented most of them.
+    # Source: models.dev "zai"/"zhipuai" providers (2026-07).
+    "glm-5.2": 1000000,       # 1M context — largest in the GLM-5 family
+    "glm-5.1": 200000,
+    "glm-5v-turbo": 200000,
+    "glm-5-turbo": 200000,
+    "glm-5": 204800,
+    "glm-4.7-flashx": 200000,
+    "glm-4.7-flash": 200000,
+    "glm-4.7": 204800,
+    "glm-4.6v": 128000,
+    "glm-4.6": 204800,
+    "glm-4.5v": 64000,
+    "glm-4.5-flash": 131072,
+    "glm-4.5-air": 131072,
+    "glm-4.5": 131072,
+    "glm": 131072,            # catch-all for unknown/older GLM ids
     # xAI Grok — xAI /v1/models does not return context_length metadata,
     # so these hardcoded fallbacks prevent Ector from probing-down to
     # the default 128k when the user points at https://api.x.ai/v1
@@ -222,23 +242,27 @@ DEFAULT_CONTEXT_LENGTHS = {
     "trinity": 262144,
     # OpenRouter
     "elephant": 262144,
-    # Hugging Face Inference Providers — model IDs use org/name format
-    "Qwen/Qwen3.5-397B-A17B": 131072,
-    "Qwen/Qwen3.5-35B-A3B": 131072,
-    "deepseek-ai/DeepSeek-V3.2": 65536,
-    "moonshotai/Kimi-K2.5": 262144,
-    "moonshotai/Kimi-K2.6": 262144,
-    "moonshotai/Kimi-K2-Thinking": 262144,
-    "MiniMaxAI/MiniMax-M2.7": 204800,
-    "MiniMaxAI/MiniMax-M2.5": 204800,
-    "MiniMaxAI/MiniMax-M3": 1000000,
-    "XiaomiMiMo/MiMo-V2-Flash": 262144,
+    # Hugging Face Inference Providers — model IDs use org/name format.
+    # Keys MUST stay lowercase: the lookup below compares against
+    # `model.lower()`, so a mixed-case key (as these org/name IDs are
+    # natively written) can never match — these 10 entries were dead code
+    # until this fix. Values refreshed against the `huggingface` provider
+    # entries in models.dev (2026-07).
+    "qwen/qwen3.5-397b-a17b": 262144,
+    "qwen/qwen3.5-35b-a3b": 262144,
+    "deepseek-ai/deepseek-v3.2": 163840,
+    "moonshotai/kimi-k2.5": 262144,
+    "moonshotai/kimi-k2.6": 262144,
+    "moonshotai/kimi-k2-thinking": 262144,
+    "minimaxai/minimax-m2.7": 204800,
+    "minimaxai/minimax-m2.5": 204800,
+    "minimaxai/minimax-m3": 1000000,
+    "xiaomimimo/mimo-v2-flash": 262144,
     "mimo-v2-pro": 1048576,
     "mimo-v2.5-pro": 1048576,
     "mimo-v2.5": 1048576,
     "mimo-v2-omni": 262144,
     "mimo-v2-flash": 262144,
-    "zai-org/GLM-5": 202752,
 }
 
 _CONTEXT_LENGTH_KEYS = (

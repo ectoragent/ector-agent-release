@@ -31,7 +31,19 @@ _TITLE_PROMPT = (
     "Prefer concrete nouns/tasks over vague words like 'help', 'question', or 'assistance'. "
     "Write the title in the same language as the user's messages. Do not translate to English. "
     "If the user writes in Portuguese, the title must be in Portuguese. "
-    "Return ONLY the title text: no quotes, no markdown, no trailing period, no 'Title:' prefix."
+    "Return ONLY the title text: no quotes, no markdown, no trailing period, no 'Title:' prefix. "
+    "Do not include dates, times, timestamps, or calendar references."
+)
+
+_DATE_LIKE_RE = re.compile(
+    r"\b(?:"
+    r"\d{1,2}[/.-]\d{1,2}(?:[/.-]\d{2,4})?"
+    r"|\d{4}[/.-]\d{1,2}[/.-]\d{1,2}"
+    r"|(?:\d{1,2}\s+de\s+)?(?:jan(?:eiro)?|fev(?:ereiro)?|mar(?:ço|co)?|abr(?:il)?|"
+    r"mai(?:o)?|jun(?:ho)?|jul(?:ho)?|ago(?:sto)?|set(?:embro)?|out(?:ubro)?|"
+    r"nov(?:embro)?|dez(?:embro)?)(?:\s+de)?\s+\d{2,4}"
+    r")\b",
+    re.IGNORECASE,
 )
 
 _TITLE_CONTEXT_MAX_CHARS = 2400
@@ -53,6 +65,8 @@ def _sanitize_title(raw: str) -> Optional[str]:
             title = title[len(prefix) :].strip()
     for _ in range(3):
         title = title.strip("\"'“”‘’").strip()
+    title = _WHITESPACE_RE.sub(" ", title).strip(" .…")
+    title = _DATE_LIKE_RE.sub("", title)
     title = _WHITESPACE_RE.sub(" ", title).strip(" .…")
     if not title:
         return None

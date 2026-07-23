@@ -995,7 +995,19 @@ atexit.register(_stop_browser_cleanup_thread)
 BROWSER_TOOL_SCHEMAS = [
     {
         "name": "browser_navigate",
-        "description": "Navigate to a URL in the browser. Initializes the session and loads the page. Must be called before other browser tools. For simple information retrieval, prefer web_search or web_extract (faster, cheaper). For plain-text endpoints — URLs ending in .md, .txt, .json, .yaml, .yml, .csv, .xml, raw.githubusercontent.com, or any documented API endpoint — prefer curl via the terminal tool or web_extract; the browser stack is overkill and much slower for these. Use browser tools when you need to interact with a page (click, fill forms, dynamic content). Returns a compact page snapshot with interactive elements and ref IDs — no need to call browser_snapshot separately after navigating.",
+        "description": (
+            "Navigate to a URL in the agent's browser (Chromium via agent-browser). "
+            "Initializes the session and loads the page. Must be called before other browser tools. "
+            "On the web dashboard, local apps (localhost) are already shown to the user in the "
+            "Browser side panel — do not call this only so the user can see a local preview. "
+            "Use browser tools when YOU need to inspect/interact (click, forms, snapshots). "
+            "For simple information retrieval, prefer web_search or web_extract (faster, cheaper). "
+            "For plain-text endpoints — URLs ending in .md, .txt, .json, .yaml, .yml, .csv, .xml, "
+            "raw.githubusercontent.com, or any documented API endpoint — prefer curl via the "
+            "terminal tool; the browser stack is overkill and much slower for these. "
+            "Returns a compact page snapshot with interactive elements and ref IDs — no need to "
+            "call browser_snapshot separately after navigating."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -1667,6 +1679,53 @@ def _truncate_snapshot(snapshot_text: str, max_chars: int = 8000) -> str:
 # Browser Tool Functions
 # ============================================================================
 
+def _browser_navigate_failure_payload(url: str, error: str) -> dict:
+    """Build a navigate failure payload with recovery hints for the model."""
+    err = (error or "Navigation failed").strip()
+    payload: dict = {
+        "success": False,
+        "error": err,
+        "url": url,
+    }
+    err_lower = err.lower()
+    chrome_missing = (
+        "chrome not found" in err_lower
+        or ("chromium" in err_lower and "not found" in err_lower)
+        or "auto-launch failed" in err_lower
+    )
+    loopback = False
+    try:
+        from urllib.parse import urlparse
+
+        host = (urlparse(url).hostname or "").lower()
+        loopback = host in ("localhost", "127.0.0.1", "::1", "0.0.0.0") or host.endswith(
+            ".localhost"
+        )
+    except Exception:
+        loopback = False
+
+    if chrome_missing:
+        payload["hint"] = (
+            "agent-browser Chromium is not installed. To use browser_* tools yourself, "
+            "run ONCE in the foreground (wait until it finishes; do not background; "
+            "do not loop): agent-browser install. "
+            "Prefer the global CLI (`agent-browser install`), not `npx agent-browser install` "
+            "in background."
+        )
+        if loopback:
+            payload["hint"] += (
+                " On the web dashboard the user can already preview this local URL in the "
+                "Browser side panel — tell them the app is ready at this URL; you do not need "
+                "browser_navigate just for them to see it."
+            )
+    elif loopback:
+        payload["hint"] = (
+            "Local URL: on the web dashboard the Browser panel can show this to the user "
+            "without agent-browser. Retry browser_* only if YOU need to inspect the page."
+        )
+    return payload
+
+
 def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     """
     Navigate to a URL in the browser.
@@ -1831,10 +1890,12 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
 
         return json.dumps(response, ensure_ascii=False)
     else:
-        return json.dumps({
-            "success": False,
-            "error": result.get("error", "Navigation failed")
-        }, ensure_ascii=False)
+        return json.dumps(
+            _browser_navigate_failure_payload(
+                url, result.get("error", "Navigation failed")
+            ),
+            ensure_ascii=False,
+        )
 
 
 def browser_snapshot(

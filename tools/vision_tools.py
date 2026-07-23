@@ -579,6 +579,21 @@ async def vision_analyze_tool(
         try:
             response = await async_call_llm(**call_kwargs)
         except Exception as _api_err:
+            err_lower = str(_api_err).lower()
+            no_provider = "no llm provider" in err_lower
+            if no_provider and temp_image_path is not None:
+                local = _local_image_analysis(Path(temp_image_path))
+                if local:
+                    logger.info(
+                        "Vision LLM unavailable — using local backend (%s)",
+                        local.get("backend"),
+                    )
+                    debug_call_data["success"] = True
+                    debug_call_data["analysis_length"] = len(local["analysis"])
+                    debug_call_data["backend"] = local.get("backend")
+                    _debug.log_call("vision_analyze_tool", debug_call_data)
+                    _debug.save()
+                    return json.dumps(local, indent=2, ensure_ascii=False)
             if (_is_image_size_error(_api_err)
                     and len(image_data_url) > _RESIZE_TARGET_BYTES):
                 logger.info(
@@ -625,7 +640,23 @@ async def vision_analyze_tool(
     except Exception as e:
         error_msg = f"Error analyzing image: {str(e)}"
         logger.error("%s", error_msg, exc_info=True)
-        
+
+        # Prefer local OCR/VLM when cloud vision is missing or rejected.
+        if temp_image_path is not None:
+            local = _local_image_analysis(Path(temp_image_path))
+            if local:
+                logger.info(
+                    "Vision LLM failed — using local backend (%s)",
+                    local.get("backend"),
+                )
+                debug_call_data["success"] = True
+                debug_call_data["analysis_length"] = len(local["analysis"])
+                debug_call_data["backend"] = local.get("backend")
+                debug_call_data["error"] = error_msg
+                _debug.log_call("vision_analyze_tool", debug_call_data)
+                _debug.save()
+                return json.dumps(local, indent=2, ensure_ascii=False)
+
         # Detect vision capability errors — give the model a clear message
         # so it can inform the user instead of a cryptic API error.
         err_str = str(e).lower()
@@ -635,6 +666,15 @@ async def vision_analyze_tool(
             analysis = (
                 "Insufficient credits or payment required. Please top up your "
                 f"API provider account and try again. Error: {e}"
+            )
+        elif "no llm provider" in err_str:
+            analysis = (
+                "Nenhum provedor de visão (LLM multimodal) configurado e o "
+                "fallback local (Tesseract/Florence) também falhou ou não está "
+                "instalado. Configure OpenRouter/um modelo com visão, um "
+                "endpoint local em auxiliary.vision, ou instale tesseract / "
+                "`pip install 'ector-agent[documents-vision]'`. "
+                f"Error: {e}"
             )
         elif any(hint in err_str for hint in (
             "does not support", "not support image",
@@ -684,14 +724,44 @@ async def vision_analyze_tool(
 
 
 def check_vision_requirements() -> bool:
-    """Check if the configured runtime vision path can resolve a client."""
+    """True when an LLM vision backend OR a local OCR/VLM backend is available."""
     try:
         from agent.auxiliary_client import resolve_vision_provider_client
 
         _provider, client, _model = resolve_vision_provider_client()
-        return client is not None
+        if client is not None:
+            return True
+    except Exception:
+        pass
+    try:
+        from agent.document_stack.florence import florence_available
+        from agent.document_stack.tesseract_ocr import tesseract_available
+
+        return bool(tesseract_available() or florence_available())
     except Exception:
         return False
+
+
+def _local_image_analysis(image_path: Path) -> Optional[dict]:
+    """Run Tesseract/Florence local understanding. Returns success payload or None."""
+    try:
+        from agent.document_stack.local_image import understand_image_local
+    except Exception:
+        return None
+    try:
+        local = understand_image_local(str(image_path))
+    except Exception as exc:
+        logger.debug("Local image understanding failed: %s", exc)
+        return None
+    markdown = (local.get("markdown") or "").strip()
+    if not local.get("success") or not markdown:
+        return None
+    backend = str(local.get("backend") or "local")
+    return {
+        "success": True,
+        "analysis": markdown,
+        "backend": backend,
+    }
 
 
 

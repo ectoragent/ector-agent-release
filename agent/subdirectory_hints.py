@@ -24,8 +24,7 @@ from agent.prompt_builder import _scan_context_content
 logger = logging.getLogger(__name__)
 
 # Context files to look for in subdirectories, in priority order.
-# Same filenames as prompt_builder.py but we load ALL found (not first-wins)
-# since different subdirectories may use different conventions.
+# First match wins *per directory* (same as startup loading).
 _HINT_FILENAMES = [
     "AGENTS.md", "agents.md",
     "CLAUDE.md", "claude.md",
@@ -168,44 +167,89 @@ class SubdirectoryHintTracker:
             return False
         return True
 
+    def _display_rel(self, path: Path) -> str:
+        """Best-effort path relative to working_dir or home."""
+        try:
+            return str(path.relative_to(self.working_dir))
+        except ValueError:
+            try:
+                return "~/" + str(path.relative_to(Path.home()))
+            except ValueError:
+                return str(path)
+
+    def _read_hint_file(self, hint_path: Path) -> Optional[tuple]:
+        """Read and sanitize one hint file. Returns (rel_path, content) or None."""
+        try:
+            if not hint_path.is_file():
+                return None
+            content = hint_path.read_text(encoding="utf-8").strip()
+            if not content:
+                return None
+            rel_path = self._display_rel(hint_path)
+            content = _scan_context_content(content, rel_path)
+            if len(content) > _MAX_HINT_CHARS:
+                content = (
+                    content[:_MAX_HINT_CHARS]
+                    + f"\n\n[...truncated {hint_path.name}: {len(content):,} chars total]"
+                )
+            return (rel_path, content)
+        except Exception as exc:
+            logger.debug("Could not read %s: %s", hint_path, exc)
+            return None
+
     def _load_hints_for_directory(self, directory: Path) -> Optional[str]:
         """Load hint files from a directory. Returns formatted text or None."""
         self._loaded_dirs.add(directory)
 
         found_hints = []
         for filename in _HINT_FILENAMES:
-            hint_path = directory / filename
-            try:
-                if not hint_path.is_file():
-                    continue
-            except OSError:
-                continue
-            try:
-                content = hint_path.read_text(encoding="utf-8").strip()
-                if not content:
-                    continue
-                # Same security scan as startup context loading
-                content = _scan_context_content(content, filename)
-                if len(content) > _MAX_HINT_CHARS:
-                    content = (
-                        content[:_MAX_HINT_CHARS]
-                        + f"\n\n[...truncated {filename}: {len(content):,} chars total]"
-                    )
-                # Best-effort relative path for display
-                rel_path = str(hint_path)
-                try:
-                    rel_path = str(hint_path.relative_to(self.working_dir))
-                except ValueError:
-                    try:
-                        rel_path = str(hint_path.relative_to(Path.home()))
-                        rel_path = "~/" + rel_path
-                    except ValueError:
-                        pass  # keep absolute
-                found_hints.append((rel_path, content))
+            loaded = self._read_hint_file(directory / filename)
+            if loaded:
+                found_hints.append(loaded)
                 # First match wins per directory (like startup loading)
                 break
+
+        # Also surface package-local Cursor rules even when AGENTS.md won above.
+        rules_dir = directory / ".cursor" / "rules"
+        if rules_dir.is_dir():
+            try:
+                mdc_files = sorted(rules_dir.glob("*.mdc"))
+            except OSError:
+                mdc_files = []
+            for mdc_file in mdc_files:
+                loaded = self._read_hint_file(mdc_file)
+                if loaded:
+                    found_hints.append(loaded)
+
+        # Package identity helps in monorepos when no AGENTS.md is present.
+        # Only for classic package roots (apps/foo, packages/bar) to avoid noise.
+        if not found_hints and directory.parent.name in {
+            "apps",
+            "packages",
+            "services",
+            "libs",
+            "crates",
+            "modules",
+        }:
+            package_json = directory / "package.json"
+            try:
+                if package_json.is_file():
+                    import json
+
+                    data = json.loads(package_json.read_text(encoding="utf-8"))
+                    name = data.get("name")
+                    if isinstance(name, str) and name.strip():
+                        rel = self._display_rel(directory)
+                        found_hints.append(
+                            (
+                                f"{rel}/package.json",
+                                f"Package workspace: `{name.strip()}` em `{rel}`. "
+                                "Use este package como alvo para install/build/test "
+                                "neste caminho (filter do monorepo quando aplicável).",
+                            )
+                        )
             except Exception as exc:
-                logger.debug("Could not read %s: %s", hint_path, exc)
+                logger.debug("Could not read package.json in %s: %s", directory, exc)
 
         if not found_hints:
             return None

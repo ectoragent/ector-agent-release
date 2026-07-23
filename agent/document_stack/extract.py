@@ -13,6 +13,7 @@ from ector_constants import get_ector_home
 
 from agent.document_stack.preprocess import preprocess_image_for_ocr
 from agent.document_stack.probe import probe_document_stack
+from agent.document_stack.tesseract_ocr import extract_with_tesseract as _extract_with_tesseract
 
 _TEXT_EXTS = {".txt", ".md", ".markdown", ".csv", ".json", ".yaml", ".yml", ".toml", ".log", ".xml", ".ini", ".cfg"}
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tiff", ".tif", ".svg", ".ico"}
@@ -288,6 +289,26 @@ def extract_document(
             return result
         except Exception as exc:
             last_error = str(exc)
+
+    # Last-resort local OCR: no Python extras needed, just the `tesseract`
+    # binary (already detected by probe_document_stack()["engines"]["tesseract"]
+    # but previously never consulted here). Images only for now.
+    if kind == "image" and probe.get("engines", {}).get("tesseract"):
+        tried.append("tesseract")
+        for candidate in try_paths:
+            try:
+                result = _extract_with_tesseract(Path(candidate))
+                if _markdown_text_len(result.get("markdown")) > 0:
+                    result["chunks"] = _build_chunks(result.get("markdown", ""))
+                    result["kind"] = kind
+                    result["cached_path"] = str(cache_path)
+                    cache_path.write_text(
+                        json.dumps(result, ensure_ascii=False), encoding="utf-8"
+                    )
+                    return result
+                last_error = "tesseract produced no text"
+            except Exception as exc:
+                last_error = str(exc)
 
     if last_thin_docling_result is not None:
         r = last_thin_docling_result

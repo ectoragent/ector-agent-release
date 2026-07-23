@@ -171,7 +171,7 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         name="Z.AI / GLM",
         auth_type="api_key",
         inference_base_url="https://api.z.ai/api/paas/v4",
-        api_key_env_vars=("GLM_API_KEY", "ZAI_API_KEY", "Z_AI_API_KEY"),
+        api_key_env_vars=("GLM_API_KEY", "ZAI_API_KEY", "Z_AI_API_KEY", "ZHIPU_API_KEY"),
         base_url_env_var="GLM_BASE_URL",
     ),
     "kimi-coding": ProviderConfig(
@@ -881,6 +881,55 @@ def is_source_suppressed(provider_id: str, source: str) -> bool:
         return False
 
 
+def _claude_code_credential_fingerprint(creds: Dict[str, Any]) -> str:
+    token = str(creds.get("accessToken") or "")
+    return f"{creds.get('expiresAt', '')}:{token[:32]}"
+
+
+def _record_claude_code_suppress_fingerprint(creds: Dict[str, Any]) -> None:
+    with _auth_store_lock():
+        auth_store = _load_auth_store()
+        auth_store["claude_code_suppress_fingerprint"] = _claude_code_credential_fingerprint(creds)
+        _save_auth_store(auth_store)
+
+
+def _clear_claude_code_suppress_fingerprint() -> None:
+    with _auth_store_lock():
+        auth_store = _load_auth_store()
+        if auth_store.pop("claude_code_suppress_fingerprint", None) is not None:
+            _save_auth_store(auth_store)
+
+
+def maybe_unsuppress_claude_code_on_fresh_credentials(creds: Dict[str, Any]) -> bool:
+    """Re-enable Claude Code when credentials changed since dashboard disconnect.
+
+    Returns True when Claude Code credentials should be treated as active.
+    """
+    if not is_source_suppressed("anthropic", "claude_code"):
+        return True
+    auth_store = _load_auth_store()
+    stored_fp = auth_store.get("claude_code_suppress_fingerprint")
+    if not stored_fp:
+        return False
+    if _claude_code_credential_fingerprint(creds) != stored_fp:
+        unsuppress_credential_source("anthropic", "claude_code")
+        _clear_claude_code_suppress_fingerprint()
+        return True
+    return False
+
+
+def connect_claude_code_auth() -> bool:
+    """Re-enable Claude Code credentials after a dashboard disconnect."""
+    from agent.anthropic_adapter import read_claude_code_credentials
+
+    creds = read_claude_code_credentials()
+    if not creds or not creds.get("accessToken"):
+        return False
+    unsuppress_credential_source("anthropic", "claude_code")
+    _clear_claude_code_suppress_fingerprint()
+    return True
+
+
 def unsuppress_credential_source(provider_id: str, source: str) -> bool:
     """Clear a suppression marker so the source will be re-seeded on the next load.
 
@@ -1004,6 +1053,49 @@ def clear_provider_auth(provider_id: Optional[str] = None) -> bool:
             return False
         _save_auth_store(auth_store)
     return True
+
+
+def disconnect_oauth_provider_auth(provider_id: str) -> bool:
+    """Disconnect a dashboard OAuth catalog provider.
+
+    Returns True when credentials were cleared or a source was suppressed so
+    Ector stops using it on the next resolve/load_pool cycle.
+    """
+    from agent.credential_pool import load_pool
+    from agent.credential_sources import _remove_ector_pkce
+    from ector_cli.config import remove_env_value
+
+    provider_id = (provider_id or "").strip().lower()
+
+    if provider_id == "anthropic":
+        _remove_ector_pkce("anthropic", None)
+        suppress_credential_source("anthropic", "ector_pkce")
+        remove_env_value("ANTHROPIC_TOKEN")
+        suppress_credential_source("anthropic", "env:ANTHROPIC_TOKEN")
+        clear_provider_auth("anthropic")
+        return True
+
+    if provider_id == "claude-code":
+        try:
+            from agent.anthropic_adapter import read_claude_code_credentials
+
+            creds = read_claude_code_credentials()
+            if creds:
+                _record_claude_code_suppress_fingerprint(creds)
+        except Exception:
+            pass
+        suppress_credential_source("anthropic", "claude_code")
+        try:
+            pool = load_pool("anthropic")
+            for index in range(len(pool.entries()), 0, -1):
+                entry = pool.entries()[index - 1]
+                if entry.source == "claude_code":
+                    pool.remove_index(index)
+        except Exception:
+            pass
+        return True
+
+    return False
 
 
 def deactivate_provider() -> None:

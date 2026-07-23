@@ -113,32 +113,47 @@ def _restore_auth_active_provider(value: Any) -> None:
 
 def cmd_fallback_list(args) -> None:  # noqa: ARG001
     """Print the current fallback chain."""
+    from rich.console import Console
+
     from ector_cli.config import load_config
+    from ector_cli.list_format import LIST_PRIMARY, ListColumn, render_list_page
 
     config = load_config()
     chain = _read_chain(config)
+    console = Console()
 
-    print()
     if not chain:
-        print("  Nenhum provedor de fallback configurado.")
-        print()
-        print("  Adicione com:  ector fallback add")
-        print()
+        render_list_page(
+            console,
+            title="Fallback de provedores",
+            sections=[],
+            empty_message="Nenhum provedor de fallback configurado.",
+            empty_hint="[dim]Adicione com[/] [bold]ector fallback add[/]",
+            primary=LIST_PRIMARY,
+        )
         return
 
     primary = _describe_primary(config)
-    if primary:
-        print(f"  Primário:  {primary}")
-        print()
-    n = len(chain)
-    entry_word = "entrada" if n == 1 else "entradas"
-    print(f"  Cadeia de fallback ({n} {entry_word}):")
-    for i, entry in enumerate(chain, 1):
-        print(f"    {i}. {_format_entry(entry)}")
-    print()
-    print("  Tentados em ordem quando o primário falha (rate-limit, 5xx, erros de conexão).")
-    print("  Docs: https://ector.cc/docs/user-guide/features/fallback-providers")
-    print()
+    rows = [(str(i), _format_entry(entry)) for i, entry in enumerate(chain, 1)]
+
+    render_list_page(
+        console,
+        title="Fallback de provedores",
+        subtitle=f"primário: {primary}" if primary else "",
+        sections=[
+            (
+                "Cadeia",
+                (
+                    ListColumn("#", justify="right", width=3, style="dim"),
+                    ListColumn("Provedor / modelo", style=f"bold {LIST_PRIMARY}", ratio=4),
+                ),
+                rows,
+            )
+        ],
+        summary=f"[dim]{len(chain)} entrada(s) — tentadas quando o primário falha[/]",
+        footer="[dim]Docs:[/] https://ector.cc/docs/user-guide/features/fallback-providers",
+        primary=LIST_PRIMARY,
+    )
 
 
 def _describe_primary(config: Dict[str, Any]) -> Optional[str]:

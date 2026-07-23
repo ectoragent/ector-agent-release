@@ -271,7 +271,7 @@ def tail_log(
     log_path = get_ector_home() / "logs" / filename
     if not log_path.exists():
         print(f"Arquivo de log não encontrado: {log_path}")
-        print(f"(Logs são criados quando o Ector é executado — tente 'ector chat' primeiro)")
+        print(f"(Logs são criados quando o Ector é executado — tente 'ector' primeiro)")
         sys.exit(1)
 
     # Parse --since into a datetime cutoff
@@ -474,7 +474,7 @@ def list_logs() -> None:
             f"[dim]Nenhum diretório de logs em {dhh}/logs/[/dim]"
         )
         console.print(
-            "[dim]Execute [bold]ector chat[/bold] para gerar logs.[/dim]"
+            "[dim]Execute [bold]ector[/bold] para gerar logs.[/dim]"
         )
         console.print()
         return
@@ -491,7 +491,7 @@ def list_logs() -> None:
             f"[dim]Nenhum arquivo .log em {dhh}/logs/ ainda.[/dim]"
         )
         console.print(
-            "[dim]Execute [bold]ector chat[/bold] para gerar logs.[/dim]"
+            "[dim]Execute [bold]ector[/bold] para gerar logs.[/dim]"
         )
         console.print()
         return
